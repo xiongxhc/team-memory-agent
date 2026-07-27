@@ -1,0 +1,346 @@
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+from teammem.cli import main, run_collect
+from teammem.config import Config
+from teammem.gitlab_collector import collect_gitlab
+from teammem.identity import IdentityMaps
+from teammem.store import open_db, stats
+
+NOW = datetime(2026, 7, 15, tzinfo=timezone.utc)
+# Hermetic fixture dir: only .example files, so IdentityMaps.load's fallback is
+# deterministic regardless of the operator's real config/roster.yaml.
+CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
+
+PROJECTS = [{"id": 1, "path_with_namespace": "team/project-alpha"}]
+COMMIT = {"id": "sha-abc", "author_email": "alex@example.com", "author_name": "Alex",
+          "committed_date": "2026-07-14T09:00:00Z", "title": "fix: JWT refresh race",
+          "web_url": "https://x/c/sha-abc"}
+
+
+def fetch(path, params):
+    if path == "/groups/42/projects":
+        return PROJECTS if params["page"] == 1 else []
+    if path == "/projects/1/repository/commits":
+        return [COMMIT] if params["page"] == 1 else []
+    return []
+
+
+def _cfg(tmp_path):
+    return Config.load(env={"TEAMMEM_DB": str(tmp_path / "ledger.db"),
+                            "TEAMMEM_GITLAB_GROUP": "42"})
+
+
+def test_dry_run_prints_and_writes_nothing(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    found, inserted = run_collect(cfg, ids, lambda: collect_gitlab(cfg, ids, fetch, NOW),
+                                  dry_run=True)
+    assert (found, inserted) == (1, 0)
+    assert "DRY" in capsys.readouterr().out
+    assert not cfg.db_path.exists()
+
+
+def test_live_run_inserts_then_rerun_inserts_zero(tmp_path):
+    cfg = _cfg(tmp_path)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    assert run_collect(cfg, ids, lambda: collect_gitlab(cfg, ids, fetch, NOW), dry_run=False) == (1, 1)
+    assert run_collect(cfg, ids, lambda: collect_gitlab(cfg, ids, fetch, NOW), dry_run=False) == (1, 0)  # idempotent
+    assert stats(open_db(cfg.db_path))["total"] == 1
+
+
+def test_main_guard_exits_2_without_credentials(tmp_path, monkeypatch, capsys):
+    for var in ("TEAMMEM_GITLAB_URL", "TEAMMEM_GITLAB_TOKEN", "TEAMMEM_GITLAB_GROUP"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TEAMMEM_DB", str(tmp_path / "ledger.db"))
+    assert main(["collect", "gitlab", "--dry-run"]) == 2
+    assert "TEAMMEM_GITLAB_URL" in capsys.readouterr().err
+
+
+def test_main_feishu_guard_exits_2_without_credentials(tmp_path, monkeypatch, capsys):
+    for var in ("TEAMMEM_FEISHU_APP_ID", "TEAMMEM_FEISHU_APP_SECRET"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TEAMMEM_DB", str(tmp_path / "l.db"))
+    assert main(["collect", "feishu", "--dry-run"]) == 2
+    assert "TEAMMEM_FEISHU_APP_ID" in capsys.readouterr().err
+
+
+def test_import_bundles_cli_dry_run_does_not_create_database(tmp_path, monkeypatch, capsys):
+    inbox = tmp_path / "inbox"
+    bundle = inbox / "alex" / "bundle-alex-2026-07-27.json"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text(json.dumps({
+        "schema": "teammem-bundle/v1",
+        "member": "alex",
+        "date": "2026-07-27",
+        "events": [],
+        "journal_md": "## 2026-07-27",
+    }))
+    db = tmp_path / "ledger.db"
+    monkeypatch.setenv("TEAMMEM_DB", str(db))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+
+    assert main([
+        "import-bundles",
+        "--inbox", str(inbox),
+        "--archive", str(tmp_path / "archive"),
+        "--quarantine", str(tmp_path / "quarantine"),
+        "--dry-run",
+    ]) == 0
+
+    assert not db.exists()
+    assert "accepted=1" in capsys.readouterr().out
+
+
+def test_main_stats_runs_without_credentials(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("TEAMMEM_GITLAB_URL", raising=False)
+    monkeypatch.setenv("TEAMMEM_DB", str(tmp_path / "ledger.db"))
+    assert main(["stats"]) == 0
+    assert "total: 0" in capsys.readouterr().out
+
+
+def test_main_reclaim_runs_without_credentials(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("TEAMMEM_GITLAB_URL", raising=False)
+    monkeypatch.setenv("TEAMMEM_DB", str(tmp_path / "l.db"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    assert main(["reclaim", "--dry-run"]) == 0
+    assert "reclaimed 0 rows" in capsys.readouterr().out
+
+
+def test_main_render_dry_run(tmp_path, monkeypatch, capsys):
+    from teammem.store import open_db, insert_events
+    from teammem.events import Event
+    db = tmp_path / "l.db"
+    insert_events(open_db(db), [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="x", hash="h1")])
+    monkeypatch.setenv("TEAMMEM_DB", str(db))
+    monkeypatch.setenv("TEAMMEM_VAULT", str(tmp_path / "vault"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    monkeypatch.delenv("TEAMMEM_PUSH", raising=False)
+    assert main(["render", "--today", "2026-07-16", "--dry-run"]) == 0
+    assert "Week 2026-07-13-17" in capsys.readouterr().out
+    assert not (tmp_path / "vault").exists()
+
+
+def test_main_render_push_failure_warns_but_exits_zero(tmp_path, monkeypatch, capsys):
+    # Push is best-effort delivery (VPN-only remote): a failed push must not fail
+    # the run — commits are retained and the next successful push carries them.
+    from teammem.store import open_db, insert_events
+    from teammem.events import Event
+    import subprocess
+    db = tmp_path / "l.db"
+    insert_events(open_db(db), [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="x", hash="h1")])
+    monkeypatch.setenv("TEAMMEM_DB", str(db))
+    monkeypatch.setenv("TEAMMEM_VAULT", str(tmp_path / "vault"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    monkeypatch.delenv("TEAMMEM_PUSH", raising=False)
+    assert main(["render", "--today", "2026-07-16", "--push"]) == 0  # no remote -> push fails
+    captured = capsys.readouterr()
+    assert "WARN" in captured.err and "push" in captured.err
+    log = subprocess.run(["git", "-C", str(tmp_path / "vault"), "log", "--oneline"],
+                         capture_output=True, text=True).stdout
+    assert "render: 2026-07-16" in log                             # render+commit still landed
+
+
+def test_main_render_commits(tmp_path, monkeypatch, capsys):
+    from teammem.store import open_db, insert_events
+    from teammem.events import Event
+    import subprocess
+    db = tmp_path / "l.db"
+    insert_events(open_db(db), [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="x", hash="h1")])
+    monkeypatch.setenv("TEAMMEM_DB", str(db))
+    monkeypatch.setenv("TEAMMEM_VAULT", str(tmp_path / "vault"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    monkeypatch.delenv("TEAMMEM_PUSH", raising=False)
+    assert main(["render", "--today", "2026-07-16"]) == 0
+    log = subprocess.run(["git", "-C", str(tmp_path / "vault"), "log", "--oneline"],
+                         capture_output=True, text=True).stdout
+    assert "render: 2026-07-16" in log
+    assert main(["render", "--today", "2026-07-16"]) == 0          # idempotent -> no 2nd commit
+    log2 = subprocess.run(["git", "-C", str(tmp_path / "vault"), "log", "--oneline"],
+                          capture_output=True, text=True).stdout
+    assert log2.count("render:") == 1
+
+
+def _journal_db(tmp_path, monkeypatch):
+    from teammem.store import open_db, insert_events
+    from teammem.events import Event
+    db = tmp_path / "l.db"
+    insert_events(open_db(db), [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", project="project-alpha", summary="fix: JWT race", hash="h1")])
+    monkeypatch.setenv("TEAMMEM_DB", str(db))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    return db
+
+
+def test_journal_guard_exits_2_without_api_key(tmp_path, monkeypatch, capsys):
+    _journal_db(tmp_path, monkeypatch)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")          # no claude CLI either
+    assert main(["journal", "--today", "2026-07-16"]) == 2
+    assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+
+
+def test_journal_falls_back_to_claude_cli_without_api_key(tmp_path, monkeypatch, capsys):
+    import os
+    db = _journal_db(tmp_path, monkeypatch)
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    stub = stub_dir / "claude"
+    stub.write_text("#!/bin/sh\ncat > /dev/null\nprintf -- '- **project-alpha** — **JWT race fixed**'\n")
+    stub.chmod(0o755)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("PATH", f"{stub_dir}:{os.environ['PATH']}")
+    assert main(["journal", "--today", "2026-07-16"]) == 0
+    assert "1 generated" in capsys.readouterr().out
+    from teammem.store import open_db
+    row = open_db(db).execute(
+        "SELECT text FROM summaries WHERE kind = 'daily-person'").fetchone()
+    assert row and "JWT race fixed" in row[0]
+
+
+def test_journal_dry_run_lists_pairs_no_writes(tmp_path, monkeypatch, capsys):
+    db = _journal_db(tmp_path, monkeypatch)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)   # dry-run needs no key
+    assert main(["journal", "--today", "2026-07-16", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "DRY" in out and "alex" in out and "2026-07-14" in out and "miss" in out
+    from teammem.store import open_db
+    assert open_db(db).execute("SELECT COUNT(*) FROM summaries").fetchone()[0] == 0
+
+
+def test_journal_live_generates_then_hits_cache(tmp_path, monkeypatch, capsys):
+    db = _journal_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.delenv("TEAMMEM_LLM_DAILY_MODEL", raising=False)
+    calls = []
+
+    def fake_http_llm(model, api_key, max_tokens):
+        def llm(system, user):
+            calls.append(model)
+            return "Alex fixed the JWT race."
+        return llm
+
+    import teammem.cli as cli_mod
+    monkeypatch.setattr(cli_mod, "http_llm", fake_http_llm)
+    assert main(["journal", "--today", "2026-07-16"]) == 0
+    assert "1 generated" in capsys.readouterr().out and calls == ["daily-summary-model"]
+    assert main(["journal", "--today", "2026-07-16"]) == 0   # rerun: all cached
+    assert "0 generated" in capsys.readouterr().out and len(calls) == 1
+
+
+def test_report_without_dailies_warns_and_exits_zero(tmp_path, monkeypatch, capsys):
+    _journal_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    assert main(["report", "--week-of", "2026-07-14"]) == 0
+    assert "no daily journals" in capsys.readouterr().err
+
+
+def test_report_generates_from_cached_dailies(tmp_path, monkeypatch, capsys):
+    db = _journal_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.delenv("TEAMMEM_LLM_REPORT_MODEL", raising=False)
+    from teammem.store import open_db
+    conn = open_db(db)
+    conn.execute("INSERT INTO summaries (kind, key, input_hash, text, model, created_ts)"
+                 " VALUES ('daily-person', 'alex|2026-07-14', 'h', 'Alex fixed X.', 'f', 't')")
+    conn.commit()
+    calls = []
+
+    def fake_http_llm(model, api_key, max_tokens):
+        def llm(system, user):
+            calls.append(model)
+            assert "Alex fixed X." in user
+            return "## Shipped\n- X"
+        return llm
+
+    import teammem.cli as cli_mod
+    monkeypatch.setattr(cli_mod, "http_llm", fake_http_llm)
+    assert main(["report", "--week-of", "2026-07-14"]) == 0
+    assert calls == ["weekly-summary-model"]
+    assert "report: generated" in capsys.readouterr().out
+    row = open_db(db).execute(
+        "SELECT text FROM summaries WHERE kind='weekly-team' AND key='team|2026-07-13'").fetchone()
+    assert row and "Shipped" in row[0]
+
+
+def test_report_no_key_no_dailies_still_exits_zero(tmp_path, monkeypatch, capsys):
+    _journal_db(tmp_path, monkeypatch)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert main(["report", "--week-of", "2026-07-14"]) == 0
+    assert "no daily journals" in capsys.readouterr().err
+
+
+def test_report_guard_exits_2_without_api_key(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")          # no claude CLI either
+    db = _journal_db(tmp_path, monkeypatch)
+    from teammem.store import open_db
+    conn = open_db(db)
+    conn.execute("INSERT INTO summaries (kind, key, input_hash, text, model, created_ts)"
+                 " VALUES ('daily-person', 'alex|2026-07-14', 'h', 'Alex fixed X.', 'f', 't')")
+    conn.commit()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert main(["report", "--week-of", "2026-07-14"]) == 2
+    assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+
+
+def test_report_dry_run_prints_state_no_llm_no_writes(tmp_path, monkeypatch, capsys):
+    db = _journal_db(tmp_path, monkeypatch)
+    from teammem.store import open_db
+    conn = open_db(db)
+    conn.execute("INSERT INTO summaries (kind, key, input_hash, text, model, created_ts)"
+                 " VALUES ('daily-person', 'alex|2026-07-14', 'h', 'Alex fixed X.', 'f', 't')")
+    conn.commit()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert main(["report", "--week-of", "2026-07-14", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "DRY report" in out and "1 dailies" in out and "miss" in out
+    row = open_db(db).execute(
+        "SELECT 1 FROM summaries WHERE kind='weekly-team' AND key='team|2026-07-13'").fetchone()
+    assert row is None
+
+
+def test_main_render_with_channel_names_file(tmp_path, monkeypatch):
+    import json as _json
+    from teammem.store import open_db, insert_events
+    from teammem.events import Event
+    db = tmp_path / "l.db"
+    insert_events(open_db(db), [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="x", hash="h1")])
+    cfgdir = tmp_path / "config"
+    cfgdir.mkdir()
+    (cfgdir / "roster.example.yaml").write_text((CONFIG_DIR / "roster.example.yaml").read_text())
+    (cfgdir / "projects.example.yaml").write_text((CONFIG_DIR / "projects.example.yaml").read_text())
+    (cfgdir / "channel_names.json").write_text(_json.dumps({"oc_x": "PM. Share"}))
+    monkeypatch.setenv("TEAMMEM_DB", str(db))
+    monkeypatch.setenv("TEAMMEM_VAULT", str(tmp_path / "vault"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(cfgdir))
+    monkeypatch.delenv("TEAMMEM_PUSH", raising=False)
+    assert main(["render", "--today", "2026-07-16"]) == 0     # names file must not crash render
+
+
+def test_main_docs_sync_guard_exits_2_without_source(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("TEAMMEM_OBSIDIAN_PROJECTS", raising=False)
+    monkeypatch.setenv("TEAMMEM_VAULT", str(tmp_path / "vault"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    assert main(["docs-sync"]) == 2
+
+
+def test_main_docs_sync_copies_docs(tmp_path, monkeypatch, capsys):
+    src = tmp_path / "obsidian"
+    (src / "Project Alpha").mkdir(parents=True)
+    (src / "Project Alpha" / "architecture.md").write_text("# arch\n")
+    monkeypatch.setenv("TEAMMEM_OBSIDIAN_PROJECTS", str(src))
+    monkeypatch.setenv("TEAMMEM_VAULT", str(tmp_path / "vault"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    assert main(["docs-sync"]) == 0
+    out = tmp_path / "vault" / "Docs" / "project-alpha" / "architecture.md"
+    assert out.read_text() == "# arch\n"

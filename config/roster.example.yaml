@@ -1,0 +1,13 @@
+# config/roster.example.yaml — copy to roster.yaml and fill with real identities.
+# One entry per member; slugs are the canonical `person` values in the ledger.
+members:
+  alex:
+    name: Alex Rivera
+    emails: [alex@example.com]
+    gitlab: [alexdev]
+    feishu: [ou_example_alex]
+  sam:
+    name: Sam Lee
+    emails: [sam@example.com, sam.li@example.com]
+    gitlab: [samdev]
+    feishu: [ou_example_sam]

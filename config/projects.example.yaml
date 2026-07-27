@@ -1,0 +1,8 @@
+# config/projects.example.yaml — copy to projects.yaml and fill with real repos.
+# Maps forge repos (path_with_namespace) to canonical project slugs.
+projects:
+  project-alpha:
+    gitlab_repos: [team/project-alpha, team/alpha-tools]
+    feishu_channels: [oc_example_alpha]
+  project-beta:
+    gitlab_repos: [team/project-beta-api, team/project-beta-web]
