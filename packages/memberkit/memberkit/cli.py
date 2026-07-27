@@ -5,7 +5,7 @@ import json
 from datetime import date as _date
 from pathlib import Path
 
-from . import bundle, config, push as push_mod
+from . import bundle, config
 from .schedule import (DEFAULT_TIME, install_schedule, remove_schedule,
                        schedule_status, scheduled_run)
 from .state import DraftState
@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="memberkit",
                                      description="Review and share local activity with team memory")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("draft", "review", "push"):
+    for name in ("draft", "review", "push", "dismiss"):
         p = sub.add_parser(name)
         p.add_argument("--date", default=_date.today().isoformat(),
                        help="YYYY-MM-DD (default: today)")
@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     p_setup = sub.add_parser("setup", help="configure MemberKit and its local reminder")
     p_setup.add_argument("--member")
     p_setup.add_argument("--inbox-url")
-    p_setup.add_argument("--time", default=DEFAULT_TIME)
+    p_setup.add_argument("--time")
     p_setup.add_argument("--no-schedule", action="store_true")
     p_setup.add_argument("--db", default="~/.claude-mem/claude-mem.db")
     p_setup.add_argument("--workdir", default="~/.memberkit")
@@ -55,11 +55,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         config.CONFIG_FILE.chmod(0o600)
         cfg = config.load({})
-        if not args.no_schedule:
-            path = install_schedule(cfg, time=args.time)
-            print(f"configured {config.CONFIG_FILE}; daily reminder {args.time} -> {path}")
-        else:
+        schedule_time = args.time
+        if not args.no_schedule and schedule_time is None:
+            choice = input(
+                f"Daily reminder time [{DEFAULT_TIME}], or 'no' to decline: "
+            ).strip()
+            if choice.lower() in {"n", "no", "none", "off", "decline"}:
+                args.no_schedule = True
+            else:
+                schedule_time = choice or DEFAULT_TIME
+        if args.no_schedule:
             print(f"configured {config.CONFIG_FILE}; schedule disabled")
+        else:
+            path = install_schedule(cfg, time=schedule_time)
+            print(
+                f"configured {config.CONFIG_FILE}; daily reminder "
+                f"{schedule_time} -> {path}"
+            )
         return 0
 
     cfg = config.load()
@@ -81,7 +93,10 @@ def main(argv: list[str] | None = None) -> int:
 
     out = cfg.workdir / "out" / f"bundle-{cfg.member}-{args.date}.json"
 
-    if args.cmd == "draft":
+    if args.cmd == "dismiss":
+        DraftState(cfg.workdir / "state.json").dismiss(args.date)
+        print(f"dismissed {args.date}; pending events excluded")
+    elif args.cmd == "draft":
         if not cfg.db.exists():
             raise SystemExit(f"no claude-mem db at {cfg.db} — is claude-mem installed?")
         if out.exists() and not args.force:
@@ -109,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n[{len(data['events'])} events — remove private items by deleting them from"
               f" the 'events' list in {out}; journal_md is regenerated from events at push]")
     else:
+        from . import push as push_mod
+
         dest = push_mod.push(cfg, args.date)
         print(f"pushed -> {dest}")
     return 0

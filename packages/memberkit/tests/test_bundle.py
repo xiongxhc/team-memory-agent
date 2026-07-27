@@ -74,3 +74,13 @@ def test_midnight_assigns_events_to_their_local_calendar_date(tmp_path):
 
     assert [event["summary"] for event in day_one["events"]] == ["Before midnight"]
     assert [event["summary"] for event in day_two["events"]] == ["After midnight"]
+
+
+def test_day_window_follows_dst_aware_local_midnights(monkeypatch):
+    monkeypatch.setenv("TZ", "America/New_York")
+
+    spring_start, spring_end = bundle._day_epochs("2026-03-08")
+    fall_start, fall_end = bundle._day_epochs("2026-11-01")
+
+    assert spring_end - spring_start == 23 * 60 * 60
+    assert fall_end - fall_start == 25 * 60 * 60

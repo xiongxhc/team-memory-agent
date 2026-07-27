@@ -1,24 +1,37 @@
 #!/bin/sh
 set -eu
 
-bad_files=$(find . -type f \
-  \( -name '*.db' -o -name '*.pem' -o -name '*.key' -o -name '.env' \) \
-  ! -path './.git/*' ! -path './.venv/*' ! -path '*/__pycache__/*')
+bad_files=$(git ls-files -- '*.db' '*.pem' '*.key' '.env' '*/.env')
 if [ -n "$bad_files" ]; then
   echo "runtime or credential-like files found:"
   echo "$bad_files"
   exit 1
 fi
 
-files=$(find . -type f \
-  ! -path './.git/*' ! -path './.venv/*' ! -path '*/__pycache__/*' \
-  ! -path '*/.pytest_cache/*' ! -path '*.egg-info/*')
-
-if grep -En \
-  '(/Users/[A-Za-z0-9._-]+/|10\.[0-9]+\.[0-9]+\.[0-9]+|gitlab\.company\.local|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|=[A-Za-z0-9_/-]{32,})' \
-  $files; then
-  echo "private path, infrastructure, or credential-like content found"
+matches=$(git grep -nI -E \
+  -e '(/Users/[A-Za-z0-9._-]+/)' \
+  -e '(^|[^0-9])(10\.[0-9]+\.[0-9]+\.[0-9]+|192\.168\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+)([^0-9]|$)' \
+  -e '(^|[^0-9A-Fa-f:])([Ff][CcDd][0-9A-Fa-f]{2}|[Ff][Ee][89AaBb][0-9A-Fa-f]):' \
+  -e 'gitlab\.company\.local' \
+  -e 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' \
+  -e '"(api[_-]?(key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|password|private[_-]?key|token|secret)"[[:space:]]*:[[:space:]]*"[A-Za-z0-9_./+=$:@-]{16,}"' \
+  -e '^[[:space:]]*(api[_-]?(key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|password|private[_-]?key|token|secret):[[:space:]]*[A-Za-z0-9_./+=$:@-]{16,}' \
+  -e '^[[:space:]]*[A-Z0-9_]*(API_KEY|API_TOKEN|TOKEN|SECRET|PASSWORD|PRIVATE_KEY)[A-Z0-9_]*[[:space:]]*=[[:space:]]*"?[A-Za-z0-9_./+=$:@-]{16,}' \
+  -- || test $? -eq 1)
+if [ -n "$matches" ]; then
+  printf '%s\n' "$matches"
+  echo "private identity, infrastructure, or credential-like content found"
   exit 1
+fi
+
+if [ -n "${TEAMMEM_PUBLIC_DENY_REGEX:-}" ]; then
+  private_matches=$(git grep -nI -E \
+    -e "$TEAMMEM_PUBLIC_DENY_REGEX" -- || test $? -eq 1)
+  if [ -n "$private_matches" ]; then
+    printf '%s\n' "$private_matches"
+    echo "operator-supplied private identifier found"
+    exit 1
+  fi
 fi
 
 echo "public-content scan passed"

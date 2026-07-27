@@ -26,13 +26,15 @@ scheduler.
 
 ## MemberKit
 
-`memberkit setup` writes `~/.config/teammem/memberkit.env` with mode `0600` and,
-unless declined, installs a macOS LaunchAgent at 17:30 local time. Manage it with:
+`memberkit setup` writes `~/.config/teammem/memberkit.env` with mode `0600`, then
+offers to install a macOS LaunchAgent at 17:30 local time. Press Enter to accept,
+enter another `HH:MM`, or enter `no` to decline. Manage it with:
 
 ```bash
 memberkit schedule status
 memberkit schedule install --time 17:30
 memberkit schedule remove
+memberkit dismiss --date YYYY-MM-DD
 ```
 
 Non-macOS users can schedule `memberkit scheduled-run`. Transmission is always the

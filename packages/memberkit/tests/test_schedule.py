@@ -95,3 +95,42 @@ def test_scheduled_run_catches_up_original_date_without_transmitting(tmp_path):
     assert "Monday late" in monday and "Monday early" not in monday
     assert "Tuesday" in tuesday
     assert not (cfg.workdir / "inbox").exists()
+
+
+def test_scheduled_run_keeps_reminding_for_older_pending_date(tmp_path):
+    cfg = _cfg(tmp_path)
+    old_date = "2026-07-20"
+    event = {
+        "ts": f"{old_date}T10:00:00",
+        "kind": "journal-highlight",
+        "summary": "Still needs review",
+        "project": "project-alpha",
+        "refs": None,
+    }
+    DraftState(cfg.workdir / "state.json").refresh(
+        old_date, [event], current=None
+    )
+
+    pending = scheduled_run(
+        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+    )
+
+    assert pending == [old_date]
+
+
+def test_scheduled_run_never_overwrites_invalid_member_edited_draft(tmp_path):
+    cfg = _cfg(
+        tmp_path,
+        [_row("Discovered", "2026-07-27T10:00:00")],
+    )
+    path = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    path.parent.mkdir(parents=True)
+    edited = b'{"events": [member edit in progress'
+    path.write_bytes(edited)
+
+    pending = scheduled_run(
+        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+    )
+
+    assert "2026-07-27" in pending
+    assert path.read_bytes() == edited

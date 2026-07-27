@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 from teammem.identity import IdentityMaps
@@ -106,3 +107,21 @@ def test_empty_bundle_archives_and_dry_run_writes_nothing(tmp_path):
     assert list(inbox.rglob("*.json"))
     assert not (tmp_path / "archive").exists()
     assert not (tmp_path / "quarantine").exists()
+
+
+def test_retry_repairs_partial_content_addressed_archive(tmp_path):
+    inbox = tmp_path / "inbox"
+    path = _write(inbox, _bundle(summaries=("recover me",)))
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    archived = (
+        tmp_path / "archive" / "alex" / path.name / f"{digest}.json"
+    )
+    archived.parent.mkdir(parents=True)
+    archived.write_bytes(raw[:10])
+
+    _, result = _run(tmp_path, inbox)
+
+    assert (result.accepted, result.inserted) == (1, 1)
+    assert archived.read_bytes() == raw
+    assert not path.exists()

@@ -17,9 +17,13 @@ share no runtime imports. Their integration seam is the frozen
 `teammem-bundle/v1` JSON file.
 
 The importer validates a complete bundle before inserting anything. Accepted
-input is archived by content hash, so multiple reviewed revisions for one date are
-preserved. Invalid input is quarantined with machine-readable error metadata.
+input is archived by content hash through a synced temporary file and atomic
+replacement, so interrupted archive writes are safely repairable and multiple
+reviewed revisions for one date are preserved. Invalid input is quarantined with
+machine-readable error metadata.
 
 Scheduling is member-side and local. The portable `memberkit scheduled-run`
-command prepares yesterday/today drafts. The first installer targets macOS
-launchd; other schedulers can invoke the same run-once command.
+command prepares yesterday/today drafts and continues reminding for every older
+pending date. Invalid member-edited drafts are never regenerated or overwritten.
+The first installer targets macOS launchd; other schedulers can invoke the same
+run-once command.

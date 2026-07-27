@@ -27,20 +27,23 @@ pipx install teammem-memberkit
 memberkit setup
 ```
 
-Setup proposes a daily 17:30 reminder in the member's local timezone. A scheduled
-run checks yesterday and today, preserving each event's original local calendar
-date. Late work from 17:30–23:59 is offered as a catch-up for that same day; work at
-or after midnight belongs to the next day.
+Setup proposes a daily 17:30 reminder in the member's local timezone; press Enter
+to accept, enter another `HH:MM`, or enter `no` to decline. A scheduled run checks
+yesterday and today, preserving each event's original local calendar date. Late
+work from 17:30–23:59 is offered as a catch-up for that same day; work at or after
+midnight belongs to the next day. Older unfinished dates remain in later reminders.
 
 The daily review remains:
 
 ```bash
 memberkit review --date YYYY-MM-DD
 memberkit push --date YYYY-MM-DD
+memberkit dismiss --date YYYY-MM-DD
 ```
 
 Removed events remain excluded from future catch-up drafts. MemberKit never
-auto-pushes.
+auto-pushes. If an edited draft becomes invalid JSON, scheduled runs leave it
+untouched and keep reminding the member to repair, review, or dismiss that date.
 
 ## Hub quick start
 
@@ -96,6 +99,14 @@ python3 -m venv .venv
 .venv/bin/pip install -e packages/memberkit
 .venv/bin/pytest -q tests packages/memberkit/tests
 ./scripts/check-public.sh
+```
+
+Before publication, the extracting operator should also provide a private regular
+expression containing origin-specific organization and member identifiers without
+committing it:
+
+```bash
+TEAMMEM_PUBLIC_DENY_REGEX='<private-regex>' ./scripts/check-public.sh
 ```
 
 Apache-2.0 is the proposed license. Publication additionally requires confirmation

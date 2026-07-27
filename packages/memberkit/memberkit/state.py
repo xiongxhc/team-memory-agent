@@ -44,6 +44,12 @@ class DraftState:
     def snapshot(self) -> dict:
         return json.loads(json.dumps(self._data))
 
+    def pending_dates(self) -> list[str]:
+        return sorted(
+            date for date, fingerprints in self._data["pending"].items()
+            if fingerprints
+        )
+
     def refresh(self, date: str, discovered: list[dict],
                 current: dict | None) -> list[dict]:
         approved = set(self._data["approved"])
