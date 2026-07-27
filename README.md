@@ -109,5 +109,5 @@ committing it:
 TEAMMEM_PUBLIC_DENY_REGEX='<private-regex>' ./scripts/check-public.sh
 ```
 
-Apache-2.0 is the proposed license. Publication additionally requires confirmation
-that the code owner authorizes that license.
+This project is licensed under Apache-2.0. The code owner authorized publication
+under that license on 2026-07-27.
