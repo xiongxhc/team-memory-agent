@@ -1,0 +1,19 @@
+[project]
+name = "teammem-memberkit"
+version = "0.1.0"
+description = "Draft, review, and share local activity with a team-memory hub"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+memberkit = "memberkit.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["memberkit*"]
