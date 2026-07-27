@@ -8,7 +8,34 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  hub:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e '.[dev]'
+      - run: pytest -q tests --ignore=tests/test_memberkit_integration.py
+      - run: ./scripts/check-public.sh
+
+  memberkit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e 'packages/memberkit[dev]'
+      - run: pytest -q packages/memberkit/tests
+
+  integration:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -20,5 +47,4 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e '.[dev]'
       - run: python -m pip install -e packages/memberkit
-      - run: pytest -q tests packages/memberkit/tests
-      - run: ./scripts/check-public.sh
+      - run: pytest -q tests/test_memberkit_integration.py

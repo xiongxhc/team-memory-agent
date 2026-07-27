@@ -118,6 +118,23 @@ def _notify_pending(dates: list[str]) -> None:
     subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
 
 
+def _valid_existing_draft(data: object, config: Config, date: str) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if (
+        data.get("schema") != bundle.SCHEMA
+        or data.get("member") != config.member
+        or data.get("date") != date
+        or not isinstance(data.get("events"), list)
+    ):
+        return False
+    required = {"ts", "kind", "summary", "project", "refs"}
+    return all(
+        isinstance(event, dict) and required <= event.keys()
+        for event in data["events"]
+    )
+
+
 def scheduled_run(config: Config, now: datetime | None = None,
                   notify: bool = True) -> list[str]:
     now = now or datetime.now().astimezone()
@@ -134,7 +151,11 @@ def scheduled_run(config: Config, now: datetime | None = None,
             try:
                 current = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
-                current = None
+                pending_dates.append(date_text)
+                continue
+            if not _valid_existing_draft(current, config, date_text):
+                pending_dates.append(date_text)
+                continue
         events = state.refresh(date_text, discovered["events"], current)
         if not events:
             continue
@@ -152,6 +173,7 @@ def scheduled_run(config: Config, now: datetime | None = None,
         )
         pending_dates.append(date_text)
 
+    pending_dates = sorted(set(pending_dates) | set(state.pending_dates()))
     if notify:
         _notify_pending(pending_dates)
     return pending_dates

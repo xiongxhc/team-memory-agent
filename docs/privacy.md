@@ -14,8 +14,9 @@ fingerprints so catch-up runs cannot silently restore a redacted event.
 ## Scheduling
 
 The optional schedule drafts and reminds. It never imports the push module, invokes
-Git, commits, or transmits. Repeated reminders continue until pending dates are
-reviewed or dismissed.
+Git, commits, or transmits. Repeated reminders continue for every pending date
+until it is reviewed or dismissed. A malformed or partially edited existing draft
+is left byte-for-byte untouched and remains in the reminder list.
 
 ## Central signals
 

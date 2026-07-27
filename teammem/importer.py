@@ -2,8 +2,10 @@
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,11 +26,25 @@ def _archive(path: Path, raw: bytes, member: str, archive: Path) -> None:
     digest = hashlib.sha256(raw).hexdigest()
     destination = archive / member / path.name / f"{digest}.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        if destination.read_bytes() != raw:
-            raise RuntimeError(f"archive digest collision at {destination}")
-    else:
-        destination.write_bytes(raw)
+    if destination.exists() and destination.read_bytes() == raw:
+        path.unlink()
+        return
+
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     path.unlink()
 
 

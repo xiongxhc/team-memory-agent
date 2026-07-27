@@ -1,8 +1,10 @@
 """Draft a teammem-bundle/v1 from the local claude-mem observations db (read-only)."""
 
+import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SCHEMA = "teammem-bundle/v1"
 
@@ -18,10 +20,29 @@ def render_journal(events: list[dict], date: str) -> str:
     return "\n".join(lines)
 
 
+def _local_timezone():
+    configured = os.environ.get("MEMBERKIT_TIMEZONE") or os.environ.get("TZ")
+    if configured:
+        try:
+            return ZoneInfo(configured.removeprefix(":"))
+        except ZoneInfoNotFoundError:
+            pass
+
+    try:
+        resolved = Path("/etc/localtime").resolve()
+        parts = resolved.parts
+        marker = parts.index("zoneinfo")
+        return ZoneInfo("/".join(parts[marker + 1:]))
+    except (OSError, ValueError, ZoneInfoNotFoundError):
+        return datetime.now().astimezone().tzinfo
+
+
 def _day_epochs(date: str) -> tuple[int, int]:
-    start = datetime.fromisoformat(date).astimezone()
-    # fixed-offset window: on DST-transition days (not UAE) the boundary hour may mis-bucket
-    return int(start.timestamp()), int((start + timedelta(days=1)).timestamp())
+    day = datetime.strptime(date, "%Y-%m-%d").date()
+    zone = _local_timezone()
+    start = datetime.combine(day, time.min, tzinfo=zone)
+    end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=zone)
+    return int(start.timestamp()), int(end.timestamp())
 
 
 def draft(db_path: Path, member: str, date: str) -> dict:
