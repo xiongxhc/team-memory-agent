@@ -2,8 +2,28 @@
 name = "teammem-memberkit"
 version = "0.1.0"
 description = "Draft, review, and share local activity with a team-memory hub"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{name = "Team Memory Agent contributors"}]
 requires-python = ">=3.11"
+keywords = ["agents", "local-first", "privacy", "team-memory"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/xiongxhc/team-memory-agent"
+Documentation = "https://github.com/xiongxhc/team-memory-agent#member-setup"
+Issues = "https://github.com/xiongxhc/team-memory-agent/issues"
+Repository = "https://github.com/xiongxhc/team-memory-agent"
 
 [project.optional-dependencies]
 dev = ["pytest"]
@@ -12,7 +32,7 @@ dev = ["pytest"]
 memberkit = "memberkit.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
