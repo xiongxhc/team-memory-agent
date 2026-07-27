@@ -11,12 +11,20 @@ MemberKit does not include raw observations, database rows, local files, direct
 messages, or credentials. Local review state remembers approved and excluded event
 fingerprints so catch-up runs cannot silently restore a redacted event.
 
+Member drafts, review state, and the inbox clone remain under the configured
+MemberKit work directory (`~/.memberkit` by default). Private configuration is
+stored separately at `~/.config/teammem/memberkit.env` with user-only permissions.
+Uninstalling the package does not delete these member-owned files.
+
 ## Scheduling
 
 The optional schedule drafts and reminds. It never imports the push module, invokes
 Git, commits, or transmits. Repeated reminders continue for every pending date
 until it is reviewed or dismissed. A malformed or partially edited existing draft
 is left byte-for-byte untouched and remains in the reminder list.
+
+Package installation alone does not create a schedule. `memberkit setup` asks the
+member to accept the proposed 17:30 local time, choose another time, or decline.
 
 ## Central signals
 
