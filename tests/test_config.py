@@ -5,21 +5,26 @@ import pytest
 from teammem.config import Config, read_env_file
 
 
-def test_defaults():
-    cfg = Config.load(env={})
+@pytest.fixture
+def empty_env_file(tmp_path):
+    return tmp_path / "missing-hub.env"
+
+
+def test_defaults(empty_env_file):
+    cfg = Config.load(env={}, env_file=empty_env_file)
     assert cfg.db_path == Path("ledger.db")
     assert cfg.since_days == 7
     assert cfg.gitlab_url == ""
 
 
-def test_env_overrides():
+def test_env_overrides(empty_env_file):
     cfg = Config.load(env={
         "TEAMMEM_DB": "/tmp/x.db",
         "TEAMMEM_GITLAB_URL": "https://gitlab.internal",
         "TEAMMEM_GITLAB_TOKEN": "tok",
         "TEAMMEM_GITLAB_GROUP": "42",
         "TEAMMEM_SINCE_DAYS": "14",
-    })
+    }, env_file=empty_env_file)
     assert cfg.db_path == Path("/tmp/x.db")
     assert cfg.gitlab_url == "https://gitlab.internal"
     assert cfg.gitlab_token == "tok"
@@ -27,20 +32,23 @@ def test_env_overrides():
     assert cfg.since_days == 14
 
 
-def test_gitlab_url_trailing_slash_stripped_and_config_dir_override():
+def test_gitlab_url_trailing_slash_stripped_and_config_dir_override(empty_env_file):
     cfg = Config.load(env={
         "TEAMMEM_GITLAB_URL": "https://gitlab.internal/",
         "TEAMMEM_CONFIG_DIR": "/etc/teammem",
-    })
+    }, env_file=empty_env_file)
     assert cfg.gitlab_url == "https://gitlab.internal"
     assert cfg.config_dir == Path("/etc/teammem")
-    assert Config.load(env={}).config_dir == Path("config")
+    assert Config.load(env={}, env_file=empty_env_file).config_dir == Path("config")
 
 
-def test_vault_and_push_config():
-    cfg = Config.load(env={"TEAMMEM_VAULT": "/tmp/v", "TEAMMEM_PUSH": "1"})
+def test_vault_and_push_config(empty_env_file):
+    cfg = Config.load(
+        env={"TEAMMEM_VAULT": "/tmp/v", "TEAMMEM_PUSH": "1"},
+        env_file=empty_env_file,
+    )
     assert cfg.vault_dir == Path("/tmp/v") and cfg.push is True
-    assert Config.load(env={}).push is False
+    assert Config.load(env={}, env_file=empty_env_file).push is False
 
 
 def test_process_environment_overrides_user_only_hub_env(tmp_path):
