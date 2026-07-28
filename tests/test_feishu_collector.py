@@ -24,7 +24,7 @@ IMG_MSG = {**MSG, "message_id": "om_3", "msg_type": "image",
 
 def fake_fetch(path, params):
     if path == "/im/v1/chats/oc_example_alpha":
-        return {"name": "Project Alpha"}
+        return {"name": "Project Alpha", "chat_mode": "group"}
     if path == "/im/v1/messages":
         assert params["container_id"] == "oc_example_alpha"
         assert params["start_time"].isdigit() and params["end_time"].isdigit()
@@ -51,7 +51,7 @@ def test_feishu_fetches_only_project_mapped_channels():
     def recording_fetch(path, params):
         calls.append((path, params))
         if path == "/im/v1/chats/oc_example_alpha":
-            return {"name": "Project Alpha"}
+            return {"name": "Project Alpha", "chat_mode": "group"}
         if path == "/im/v1/messages":
             return {"items": [MSG], "has_more": False, "page_token": ""}
         raise AssertionError(path)
@@ -67,13 +67,58 @@ def test_feishu_fetches_only_project_mapped_channels():
     assert all(event.source == "feishu-channel" for event in result.events)
 
 
+def test_feishu_never_fetches_messages_for_a_mapped_p2p_chat():
+    calls = []
+
+    def fetch(path, params):
+        calls.append((path, params))
+        if path == "/im/v1/chats/oc_example_alpha":
+            return {"name": "Alex", "chat_mode": "p2p"}
+        if path == "/im/v1/messages":
+            return {"items": [MSG], "has_more": False, "page_token": ""}
+        raise AssertionError(path)
+
+    result = FeishuConnector(fetch=fetch).collect(
+        Config.load(env={}),
+        IdentityMaps.load(CONFIG_DIR),
+        ConnectorSettings(name="feishu", enabled=True, options={}),
+        NOW,
+    )
+
+    assert not [path for path, _ in calls if path == "/im/v1/messages"]
+    assert result.events == ()
+    assert result.channel_names == {}
+
+
+def test_feishu_never_fetches_messages_when_chat_metadata_fails():
+    calls = []
+
+    def fetch(path, params):
+        calls.append((path, params))
+        if path == "/im/v1/chats/oc_example_alpha":
+            raise RuntimeError("metadata unavailable")
+        if path == "/im/v1/messages":
+            return {"items": [MSG], "has_more": False, "page_token": ""}
+        raise AssertionError(path)
+
+    result = FeishuConnector(fetch=fetch).collect(
+        Config.load(env={}),
+        IdentityMaps.load(CONFIG_DIR),
+        ConnectorSettings(name="feishu", enabled=True, options={}),
+        NOW,
+    )
+
+    assert not [path for path, _ in calls if path == "/im/v1/messages"]
+    assert result.events == ()
+
+
 def test_unknown_sender_is_unmapped(tmp_path):
     ghost = {**MSG, "message_id": "om_9",
              "sender": {"id": "ou_ghost", "id_type": "open_id",
                         "sender_type": "user"}}
     def fetch(path, params):
-        if path == "/im/v1/chats":
-            return CHATS
+        if path == "/im/v1/chats/oc_example_alpha":
+            return {"chat_mode": "group"}
         return {"items": [ghost], "has_more": False, "page_token": ""}
     events = collect_feishu(Config.load(env={"TEAMMEM_CONFIG_DIR": str(tmp_path)}),
                             IdentityMaps.load(CONFIG_DIR), fetch, NOW)
@@ -88,8 +133,8 @@ def test_pagination_via_page_token(tmp_path):
     pages = [{"items": [MSG], "has_more": True, "page_token": "tk"},
              {"items": [IMG_MSG], "has_more": False, "page_token": ""}]
     def fetch(path, params):
-        if path == "/im/v1/chats":
-            return CHATS
+        if path == "/im/v1/chats/oc_example_alpha":
+            return {"chat_mode": "group"}
         return pages[1] if params.get("page_token") == "tk" else pages[0]
     events = collect_feishu(Config.load(env={"TEAMMEM_CONFIG_DIR": str(tmp_path)}),
                             IdentityMaps.load(CONFIG_DIR), fetch, NOW)

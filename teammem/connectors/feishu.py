@@ -70,7 +70,9 @@ class FeishuConnector:
             try:
                 chat = fetch(f"/im/v1/chats/{chat_id}", {})
             except RuntimeError:
-                chat = {}
+                continue
+            if chat.get("chat_mode") != "group":
+                continue
             if name := chat.get("name"):
                 names[chat_id] = name
             for msg in self._paginate(fetch, "/im/v1/messages", {
