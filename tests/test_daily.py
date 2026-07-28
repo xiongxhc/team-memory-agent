@@ -9,7 +9,7 @@ from teammem.connectors.config import ConnectorSettings
 from teammem.daily import run_daily
 from teammem.events import Event
 from teammem.identity import IdentityMaps
-from teammem.store import open_db, stats
+from teammem.store import insert_events, open_db, stats
 
 
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
@@ -289,12 +289,41 @@ def test_daily_persists_channel_metadata_atomically_after_collection(
     assert not list(cfgdir.glob(".channel_names.json.*"))
 
 
-def test_daily_llm_failure_is_visible_but_render_still_runs(tmp_path, monkeypatch):
-    cfg = _cfg(tmp_path)
+def test_daily_journal_failure_skips_friday_report_but_keeps_local_projections(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(
+        tmp_path,
+        TEAMMEM_OBSIDIAN_PROJECTS=str(tmp_path / "obsidian-projects"),
+    )
+    conn = open_db(cfg.db_path)
+    insert_events(conn, [EVENT])
+    conn.execute(
+        "INSERT INTO summaries (kind, key, input_hash, text, model, created_ts)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "daily-person",
+            "alex|2026-07-17",
+            "cached",
+            "Cached journal remains available.",
+            "fake",
+            "2026-07-17T00:00:00",
+        ),
+    )
+    conn.commit()
+    calls = []
     monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: object())
     monkeypatch.setattr(
         "teammem.daily.run_journal",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("llm offline")),
+    )
+    monkeypatch.setattr(
+        "teammem.daily.run_report",
+        lambda *args, **kwargs: calls.append("report") or 0,
+    )
+    monkeypatch.setattr(
+        "teammem.daily.run_docs_sync",
+        lambda *args, **kwargs: calls.append("docs-sync") or 0,
     )
 
     result = run_daily(
@@ -303,7 +332,14 @@ def test_daily_llm_failure_is_visible_but_render_still_runs(tmp_path, monkeypatc
 
     assert result.exit_code == 1
     assert result.status("journal") == "failed"
+    assert result.status("report") == "skipped"
+    assert result.step("report").detail == "journal failed"
+    assert calls == ["docs-sync"]
+    assert result.status("docs-sync") == "ok"
     assert result.status("render") == "ok"
+    assert "Cached journal remains available." in (
+        cfg.vault_dir / "Person" / "Alex Rivera.md"
+    ).read_text()
 
 
 def test_daily_snapshot_uses_sqlite_backup_and_retains_fourteen(tmp_path, monkeypatch):

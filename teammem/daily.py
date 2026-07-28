@@ -258,10 +258,11 @@ def run_daily(
             steps.append(StepResult(name, "skipped", "reclaim failed"))
     else:
         daily_llm = resolve_llm_backend(cfg, cfg.llm_daily_model, 1024)
+        journal_failed = False
         if daily_llm is None:
             steps.append(StepResult("journal", "skipped", "no LLM backend"))
         else:
-            _service_step(
+            journal_failed = not _service_step(
                 steps,
                 "journal",
                 cfg,
@@ -276,6 +277,8 @@ def run_daily(
 
         if local_day.weekday() != 4:
             steps.append(StepResult("report", "skipped", "not Friday"))
+        elif journal_failed:
+            steps.append(StepResult("report", "skipped", "journal failed"))
         else:
             report_llm = resolve_llm_backend(cfg, cfg.llm_report_model, 8192)
             if report_llm is None:

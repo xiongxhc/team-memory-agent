@@ -138,3 +138,64 @@ def test_reclaim_channel_projects_matches_uppercase_slack_channel_ids(tmp_path):
 
     assert reclaim_channel_projects(conn, ids) == [("c0123", "slack-project", 1)]
     assert conn.execute("SELECT project FROM events WHERE hash='slack-uppercase'").fetchone()[0] == "slack-project"
+
+
+def test_reclaim_channel_projects_accepts_current_and_legacy_chat_refs(tmp_path):
+    """Manual/current channel_id rows and historical chat_id rows reclaim alike."""
+    import json as _json
+    from teammem.reclaim import reclaim_channel_projects
+
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        Event(
+            person="alex",
+            ts="2026-07-14T09:00:00+00:00",
+            source="slack-channel",
+            kind="message",
+            summary="manual slack",
+            refs=_json.dumps({"channel_id": "C0123"}),
+            hash="slack-current",
+        ),
+        Event(
+            person="alex",
+            ts="2026-07-14T09:01:00+00:00",
+            source="slack-channel",
+            kind="message",
+            summary="historical slack",
+            refs=_json.dumps({"chat_id": "C0123"}),
+            hash="slack-legacy",
+        ),
+        Event(
+            person="alex",
+            ts="2026-07-14T09:02:00+00:00",
+            source="discord-channel",
+            kind="message",
+            summary="manual discord",
+            refs=_json.dumps({"channel_id": "D0456"}),
+            hash="discord-current",
+        ),
+        Event(
+            person="alex",
+            ts="2026-07-14T09:03:00+00:00",
+            source="discord-channel",
+            kind="message",
+            summary="historical discord",
+            refs=_json.dumps({"chat_id": "D0456"}),
+            hash="discord-legacy",
+        ),
+    ])
+    ids = IdentityMaps(
+        {"members": {}},
+        {"projects": {
+            "slack-project": {"slack_channels": ["C0123"]},
+            "discord-project": {"discord_channels": ["D0456"]},
+        }},
+    )
+
+    assert reclaim_channel_projects(conn, ids) == [
+        ("d0456", "discord-project", 2),
+        ("c0123", "slack-project", 2),
+    ]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM events WHERE project IS NOT NULL"
+    ).fetchone()[0] == 4

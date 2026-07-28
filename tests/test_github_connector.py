@@ -95,7 +95,7 @@ def test_github_paginates_commits_and_excludes_stale_pull_requests():
         if path.endswith("/commits"):
             return commit_page if params["page"] == 1 else [COMMIT] if params["page"] == 2 else []
         if path.endswith("/pulls"):
-            return [stale_pr, PR] if params["page"] == 1 else []
+            return [PR, stale_pr] if params["page"] == 1 else []
         raise AssertionError(path)
 
     events = _collect(fixture_fetch).events
@@ -103,6 +103,56 @@ def test_github_paginates_commits_and_excludes_stale_pull_requests():
     assert len([event for event in events if event.kind == "commit"]) == 101
     assert [event.refs for event in events if event.kind == "pr"] == [
         '{"number": 7, "url": "https://github.test/pull/7"}'
+    ]
+
+
+def test_github_stops_sorted_pull_pagination_after_second_page_crosses_lookback():
+    """Sorted PR pages stop at the first stale item while retaining the boundary."""
+    calls = []
+    first_page = [
+        dict(PR, number=number, updated_at="2026-07-14T10:00:00Z")
+        for number in range(100, 200)
+    ]
+    second_page = [
+        dict(PR, number=200, updated_at="2026-07-09T10:00:00Z"),
+        dict(PR, number=201, updated_at="2026-07-08T00:00:00Z"),
+        *[
+            dict(PR, number=number, updated_at="2026-07-07T23:59:59Z")
+            for number in range(202, 300)
+        ],
+    ]
+
+    def fixture_fetch(path, params):
+        if path.endswith("/commits"):
+            return []
+        calls.append(params)
+        if params["page"] == 1:
+            return first_page
+        if params["page"] == 2:
+            return second_page
+        raise AssertionError("lookback crossing must prevent a third PR page")
+
+    pull_requests = [
+        event for event in _collect(fixture_fetch).events if event.kind == "pr"
+    ]
+
+    assert len(pull_requests) == 102
+    assert pull_requests[-1].ts == "2026-07-08T00:00:00Z"
+    assert calls == [
+        {
+            "state": "all",
+            "sort": "updated",
+            "direction": "desc",
+            "per_page": 100,
+            "page": 1,
+        },
+        {
+            "state": "all",
+            "sort": "updated",
+            "direction": "desc",
+            "per_page": 100,
+            "page": 2,
+        },
     ]
 
 
@@ -125,7 +175,11 @@ def test_github_uses_since_and_idempotent_event_hashes(tmp_path):
         "since": "2026-07-08T00:00:00Z", "per_page": 100, "page": 1
     }
     assert seen["/repos/team/project-alpha/pulls"][0] == {
-        "state": "all", "per_page": 100, "page": 1
+        "state": "all",
+        "sort": "updated",
+        "direction": "desc",
+        "per_page": 100,
+        "page": 1,
     }
     assert insert_events(conn, events) == 2
     assert insert_events(conn, events) == 0
