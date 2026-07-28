@@ -27,9 +27,13 @@ if [ -n "$matches" ]; then
   exit 1
 fi
 
-obsolete_schedule_claims=$(git grep -nI -E \
-  -e '(does not yet provide|has no) hub schedule' \
-  -e 'hub schedule installation (belongs to|is not part of)' \
+obsolete_schedule_claims=$(git grep -niI -E \
+  -e '(teammem|team memory agent|hub|package|command)[^.]*(has no|lacks)[^.]*(built-in[[:space:]]+)?(hub[[:space:]]+)?schedul(e|ing)' \
+  -e '(teammem|team memory agent|hub|package|command)[^.]*does not( yet)?[[:space:]]+(provide|include|support)[^.]*(built-in[[:space:]]+)?(hub[[:space:]]+)?schedul(e|ing)' \
+  -e '(teammem|team memory agent|hub|package|command)[^.]*(defers?|will defer)[^.]*(built-in[[:space:]]+)?(hub[[:space:]]+)?schedule installation' \
+  -e '(built-in[[:space:]]+)?hub[[:space:]]+schedule[[:space:]-]+installation[^.]*(will come|comes?)[^.]*(later|future)' \
+  -e '(built-in[[:space:]]+)?hub[[:space:]]+schedule[[:space:]-]+installation[^.]*(belongs to|is deferred to)[^.]*(later|future|external|separate|scheduler)' \
+  -e '(built-in[[:space:]]+)?hub[[:space:]]+schedule[[:space:]-]+installation[^.]*is not part of' \
   -- \
   README.md \
   docs/deployment.md \
