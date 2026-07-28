@@ -12,6 +12,34 @@ def test_registry_lists_official_connectors_without_network():
     assert connector_names() == ("discord", "feishu", "github", "gitlab", "slack")
 
 
+def test_registry_discovery_and_construction_keep_network_sentinel_armed():
+    """Registry import, enumeration, and connector construction must stay local."""
+    code = """
+import socket
+
+def network_forbidden(*args, **kwargs):
+    raise AssertionError("registry attempted network access")
+
+socket.create_connection = network_forbidden
+socket.socket.connect = network_forbidden
+
+from teammem.connectors.registry import connector_names, get_connector
+
+names = connector_names()
+for name in names:
+    assert get_connector(name).name == name
+print("network sentinel remained armed")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "network sentinel remained armed"
+
+
 @pytest.mark.parametrize(
     ("name", "missing"),
     [

@@ -2,7 +2,7 @@
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 
 from teammem.config import Config
@@ -93,13 +93,17 @@ class SlackConnector:
         for channel_id, project in resources.items():
             try:
                 metadata = fetch("conversations.info", {"channel": channel_id})
+                if not isinstance(metadata, Mapping):
+                    raise ValueError("malformed Slack metadata response")
+                channel = metadata.get("channel")
+                if not isinstance(channel, Mapping):
+                    raise ValueError("malformed Slack channel metadata")
             except Exception:
                 failed_channels += 1
                 warnings.append(
                     f"slack channel {channel_id} metadata request failed"
                 )
                 continue
-            channel = metadata.get("channel") or {}
             if not self._shared_channel(channel):
                 continue
             if name := channel.get("name"):
@@ -138,7 +142,7 @@ class SlackConnector:
         )
 
     @staticmethod
-    def _shared_channel(channel: dict) -> bool:
+    def _shared_channel(channel: Mapping) -> bool:
         return (
             bool(channel.get("is_channel") or channel.get("is_group"))
             and not channel.get("is_im")

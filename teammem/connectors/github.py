@@ -59,9 +59,20 @@ class GitHubConnector:
             base = f"/repos/{repository}"
             for commit in self._paginate(fetch, f"{base}/commits", {"since": since_text}):
                 events.append(self._commit_event(commit, ids, project))
-            for pull_request in self._paginate(fetch, f"{base}/pulls", {"state": "all"}):
-                if self._timestamp(pull_request["updated_at"]) >= since:
-                    events.append(self._pull_request_event(pull_request, ids, project, repository))
+            for pull_request in self._pull_requests(
+                fetch,
+                f"{base}/pulls",
+                {"state": "all", "sort": "updated", "direction": "desc"},
+                since,
+            ):
+                events.append(
+                    self._pull_request_event(
+                        pull_request,
+                        ids,
+                        project,
+                        repository,
+                    )
+                )
         return CollectionResult(events=tuple(events))
 
     @staticmethod
@@ -72,6 +83,25 @@ class GitHubConnector:
             events.extend(batch)
             if len(batch) < _PER_PAGE:
                 return events
+            page += 1
+
+    @classmethod
+    def _pull_requests(
+        cls,
+        fetch: FetchJson,
+        path: str,
+        params: dict,
+        since: datetime,
+    ) -> list:
+        pull_requests, page = [], 1
+        while True:
+            batch = fetch(path, {**params, "per_page": _PER_PAGE, "page": page})
+            for pull_request in batch:
+                if cls._timestamp(pull_request["updated_at"]) < since:
+                    return pull_requests
+                pull_requests.append(pull_request)
+            if len(batch) < _PER_PAGE:
+                return pull_requests
             page += 1
 
     @staticmethod

@@ -145,9 +145,115 @@ def test_slack_never_requests_history_when_metadata_fails():
     assert calls == [("conversations.info", {"channel": "C0123"})]
 
 
+def test_slack_isolates_malformed_metadata_and_keeps_other_channel_events():
+    """Malformed outer/channel shapes must not discard events from another channel."""
+    def slack_fixture(path, params):
+        channel_id = params["channel"]
+        if path == "conversations.info":
+            if channel_id == "C0123":
+                return []
+            if channel_id == "C0999":
+                return {"ok": True, "channel": []}
+            return _metadata(id=channel_id)
+        return {
+            "ok": True,
+            "response_metadata": {},
+            "messages": [{
+                "type": "message",
+                "ts": "1784077200.000001",
+                "user": "U0123",
+                "text": "survived",
+            }],
+        }
+
+    result = SlackConnector(
+        fetch=slack_fixture,
+        sleep=lambda _seconds: None,
+    ).collect(
+        _cfg(),
+        _ids_with_channels("C0123", "C0999", "C0777"),
+        _settings(),
+        NOW,
+    )
+
+    assert [event.summary for event in result.events] == ["survived"]
+    assert result.warnings == (
+        "slack channel C0123 metadata request failed",
+        "slack channel C0999 metadata request failed",
+    )
+
+
+def test_slack_raises_generic_failure_when_all_metadata_is_malformed_or_fails():
+    """Malformed metadata on every channel must retain the generic all-failed error."""
+    def slack_fixture(path, params):
+        assert path == "conversations.info"
+        if params["channel"] == "C0123":
+            return []
+        if params["channel"] == "C0999":
+            return {"ok": True, "channel": []}
+        raise RuntimeError("metadata failed with xoxb-secret-value")
+
+    with pytest.raises(
+        RuntimeError,
+        match="slack collection failed for every configured channel",
+    ):
+        SlackConnector(fetch=slack_fixture).collect(
+            _cfg(),
+            _ids_with_channels("C0123", "C0999", "C0777"),
+            _settings(),
+            NOW,
+        )
+
+
 def test_slack_validation_requires_only_the_bot_token():
     """Accepting a user token configuration would broaden collection beyond the bot's memberships."""
     assert SlackConnector().validate(Config(), _settings()) == ["TEAMMEM_SLACK_BOT_TOKEN"]
+    assert SlackConnector().validate(
+        Config(slack_bot_token="xoxp-user-token"), _settings()
+    ) == ["TEAMMEM_SLACK_BOT_TOKEN"]
+    assert SlackConnector().validate(_cfg(), _settings()) == []
+
+
+def test_slack_http_fetch_uses_the_configured_bot_bearer_token(monkeypatch):
+    """Production Slack requests must authenticate with the accepted xoxb bot token."""
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"ok": True, "channel": {}}
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.calls = []
+
+        def get(self, url, params, timeout):
+            self.calls.append((url, params, timeout))
+            return Response()
+
+    session = Session()
+    monkeypatch.setitem(
+        sys.modules,
+        "requests",
+        types.SimpleNamespace(Session=lambda: session),
+    )
+
+    fetch = SlackConnector().http_fetch(_cfg())
+
+    assert fetch("conversations.info", {"channel": "C0123"}) == {
+        "ok": True,
+        "channel": {},
+    }
+    assert session.headers["Authorization"] == "Bearer xoxb-test-token"
+    assert session.calls == [(
+        "https://slack.com/api/conversations.info",
+        {"channel": "C0123"},
+        30,
+    )]
 
 
 def test_slack_retries_a_rate_limited_cursor_page_without_losing_the_first_page():
