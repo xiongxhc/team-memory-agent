@@ -69,7 +69,10 @@ class GitLabConnector:
         since = (now - timedelta(days=cfg.since_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         events: list[Event] = []
         projects = self._paginate(fetch_json, f"/groups/{cfg.gitlab_group}/projects",
-                                  {"include_subgroups": "true"})
+                                  {
+                                      "include_subgroups": "true",
+                                      "with_shared": "false",
+                                  })
         for p in projects:
             project = ids.project_for_repo(p["path_with_namespace"])
             # Default-branch commits only (no all=true): branch work appears at merge via MRs.

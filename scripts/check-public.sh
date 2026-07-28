@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
 
-bad_files=$(git ls-files -- '*.db' '*.pem' '*.key' '.env' '*/.env' 'hub.env' '*/hub.env')
+bad_files=$(git ls-files -- \
+  '*.db' '*.pem' '*.key' '.env' '*/.env' \
+  'hub.env' '*/hub.env' 'memberkit.env' '*/memberkit.env')
 if [ -n "$bad_files" ]; then
   echo "runtime or credential-like files found:"
   echo "$bad_files"

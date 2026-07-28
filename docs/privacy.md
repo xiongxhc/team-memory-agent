@@ -17,21 +17,24 @@ snapshots, and rendered views.
 
 The operator must make the integration's collection boundary visible to the team.
 Forge tokens should be restricted at the provider. Chat apps must be visibly
-present in each collected shared project channel.
+present in each collected public/private project channel or group/guild channel.
 
 | Connector | Can see through Team Memory Agent | Deliberately excluded |
 |---|---|---|
 | GitHub | Default-branch commits and updated pull requests in explicitly mapped repositories | Unmapped repositories |
-| GitLab | Commits and merge requests in the operator-configured group and subgroups; known repositories receive project attribution | Projects outside the configured group |
-| Slack | Human top-level messages in explicitly mapped shared project channels containing the app | DMs, multi-person DMs, unlisted channels, thread replies, bot messages |
+| GitLab | Commits and merge requests in the operator-configured group hierarchy and subgroups; known repositories receive project attribution | Projects outside the configured hierarchy and projects merely shared into it |
+| Slack | Human top-level messages in explicitly mapped public or private project channels containing the app | DMs, multi-person DMs, unlisted channels, thread replies, bot messages |
 | Feishu | Human messages in explicitly mapped group chats containing the app | Direct chats, unlisted group chats, non-user senders |
 | Discord | Human content messages in explicitly mapped guild channels visible to the bot | DMs/group DMs, unlisted guild channels, bot and webhook messages |
 
 Slack uses a bot token, never a user token. It checks channel metadata before
 history, fails closed when metadata is unavailable, never calls
-`conversations.replies`, and polls history in 15-message pages with 60-second
-pacing between pages. The conservative page and pacing behavior covers the
-limits applicable to commercially distributed non-Marketplace apps.
+`conversations.replies`, and polls history in 15-message pages with global
+60-second pacing across pages and channels. Slack's tighter limit applies to
+affected commercially distributed apps outside Marketplace approval; Slack says
+internal customer-built apps are not affected. The adapter nevertheless uses
+the conservative behavior for portable deployments and treats `Retry-After` as
+authoritative.
 
 Discord checks channel metadata for a guild ID before requesting messages. An
 empty result is not proof that the channel is empty: missing
