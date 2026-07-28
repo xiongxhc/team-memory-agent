@@ -367,15 +367,18 @@ git commit -m "feat: add GitHub connector"
 def test_slack_queries_only_allowlisted_channels_and_skips_threads_and_bots():
     calls = []
     result = SlackConnector(fetch=slack_fixture(calls)).collect(cfg, ids, settings, NOW)
-    assert {params["channel"] for path, params in calls} == {"C0123"}
-    assert all(path == "conversations.history" for path, _ in calls)
+    assert {path for path, _ in calls} == {
+        "conversations.info", "conversations.history",
+    }
     assert [event.summary for event in result.events] == ["human top-level"]
     assert not any("conversations.replies" in path for path, _ in calls)
 ```
 
 Assert validation requires `TEAMMEM_SLACK_BOT_TOKEN`, not a user token. Use
 `oldest`, cursor pagination, and a conservative page size compatible with Slack's
-current non-Marketplace limits.
+current non-Marketplace limits. Add direct-message and metadata-failure fixtures
+that prove `conversations.history` is never called unless metadata identifies a
+shared channel containing the app.
 
 - [ ] **Step 2: Write Discord permission, allowlist, and bot exclusion tests**
 
@@ -383,9 +386,15 @@ current non-Marketplace limits.
 def test_discord_queries_only_mapped_channels_and_skips_bots_and_webhooks():
     calls = []
     result = DiscordConnector(fetch=discord_fixture(calls)).collect(cfg, ids, settings, NOW)
-    assert {path for path, _ in calls} == {"/channels/9876543210/messages"}
+    assert {path for path, _ in calls} == {
+        "/channels/9876543210",
+        "/channels/9876543210/messages",
+    }
     assert [event.person for event in result.events] == ["alex"]
 ```
+
+Add direct-message and metadata-failure fixtures that prove the messages endpoint
+is never called unless channel metadata includes a guild ID.
 
 - [ ] **Step 3: Run tests and confirm missing adapters**
 
@@ -395,10 +404,13 @@ Expected: both imports fail.
 
 - [ ] **Step 4: Implement Slack scheduled polling**
 
-Call `conversations.history` only for `slack_channels` in project configuration.
-Skip messages with `bot_id`, bot subtypes, missing `user`, or `thread_ts != ts`.
-Use `ts` as the stable hash and include `channel_id` in refs. Do not call
-`conversations.replies` and do not accept user tokens.
+For each mapped `slack_channels` ID, call `conversations.info` first. Require a
+shared channel (`is_channel` or `is_group`), reject `is_im` and `is_mpim`, require
+the app to be a member, and fail closed when metadata cannot be obtained. Only
+then call `conversations.history`. Skip messages with `bot_id`, bot subtypes,
+missing `user`, or `thread_ts != ts`. Use `ts` as the stable hash and include
+`channel_id` in refs. Do not call `conversations.replies` and do not accept user
+tokens.
 
 Official references:
 
@@ -407,10 +419,12 @@ Official references:
 
 - [ ] **Step 5: Implement Discord scheduled polling**
 
-Call `GET /channels/{channel_id}/messages?limit=100`, paging backward until the
-lookback boundary. Require `VIEW_CHANNEL`, `READ_MESSAGE_HISTORY`, and message
-content access. Skip `author.bot`, `webhook_id`, and non-content system messages.
-Use message snowflake ID as the hash.
+Call `GET /channels/{channel_id}` first and require a `guild_id`; reject DM/group-DM
+metadata and fail closed when metadata cannot be obtained. Only then call
+`GET /channels/{channel_id}/messages?limit=100`, paging backward until the lookback
+boundary. Require `VIEW_CHANNEL`, `READ_MESSAGE_HISTORY`, and message content
+access. Skip `author.bot`, `webhook_id`, and non-content system messages. Use
+message snowflake ID as the hash.
 
 Official reference:
 
