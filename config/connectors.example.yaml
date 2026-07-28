@@ -1,0 +1,11 @@
+connectors:
+  github:
+    enabled: false
+  gitlab:
+    enabled: false
+  slack:
+    enabled: false
+  feishu:
+    enabled: false
+  discord:
+    enabled: false
