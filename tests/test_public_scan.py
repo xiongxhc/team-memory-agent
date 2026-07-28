@@ -103,6 +103,55 @@ def test_public_scan_rejects_tracked_memberkit_environment_file_at_any_depth(
     assert result.returncode == 1
 
 
+def test_public_scan_ignores_obsolete_schedule_claim_in_historical_plan(
+    tmp_path,
+):
+    _tracked_repo(
+        tmp_path,
+        "docs/superpowers/plans/historical.md",
+        "The package does not yet provide hub schedule installation.\n",
+    )
+
+    result = subprocess.run(
+        [str(SCANNER)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "operator_doc",
+    [
+        "README.md",
+        "docs/deployment.md",
+        "docs/architecture.md",
+        "docs/privacy.md",
+    ],
+)
+def test_public_scan_rejects_obsolete_schedule_claim_in_operator_docs(
+    tmp_path,
+    operator_doc,
+):
+    _tracked_repo(
+        tmp_path,
+        operator_doc,
+        "The package does not yet provide hub schedule installation.\n",
+    )
+
+    result = subprocess.run(
+        [str(SCANNER)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "obsolete hub-scheduling claim found" in result.stdout
+
+
 @pytest.mark.parametrize(
     "credential",
     [
