@@ -119,3 +119,22 @@ def test_reclaim_channel_projects_uses_the_event_source_provider_kind(tmp_path):
     ]
     assert conn.execute("SELECT project FROM events WHERE hash='slack-1'").fetchone()[0] == "slack-project"
     assert conn.execute("SELECT project FROM events WHERE hash='feishu-1'").fetchone()[0] == "feishu-project"
+
+
+def test_reclaim_channel_projects_matches_uppercase_slack_channel_ids(tmp_path):
+    import json as _json
+    from teammem.reclaim import reclaim_channel_projects
+
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T09:00:00+00:00", source="slack-channel",
+              kind="message", summary="slack", refs=_json.dumps({"chat_id": "C0123"}),
+              hash="slack-uppercase"),
+    ])
+    ids = IdentityMaps(
+        {"members": {}},
+        {"projects": {"slack-project": {"slack_channels": ["C0123"]}}},
+    )
+
+    assert reclaim_channel_projects(conn, ids) == [("c0123", "slack-project", 1)]
+    assert conn.execute("SELECT project FROM events WHERE hash='slack-uppercase'").fetchone()[0] == "slack-project"
