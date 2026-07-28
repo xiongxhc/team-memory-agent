@@ -35,7 +35,11 @@ class RecordingRunner:
             self.before(command)
         default = (
             1
-            if command[:3] == ["systemctl", "--user", "is-enabled"]
+            if command[:3]
+            in (
+                ["systemctl", "--user", "is-enabled"],
+                ["systemctl", "--user", "is-active"],
+            )
             else 0
         )
         configured = self.returncodes.get(tuple(command), default)
@@ -74,6 +78,48 @@ def _old_systemd_pair(tmp_path):
     service.write_bytes(b"old service")
     timer.write_bytes(b"old timer")
     return directory, service, timer
+
+
+def _install_systemd(tmp_path, directory, runner):
+    return install_schedule(
+        _cfg(tmp_path),
+        platform="linux",
+        systemd_dir=directory,
+        executable="/opt/pipx/bin/teammem",
+        runner=runner,
+    )
+
+
+def _installed_systemd(tmp_path):
+    directory = tmp_path / "systemd" / "user"
+    _install_systemd(tmp_path, directory, RecordingRunner())
+    return (
+        directory,
+        directory / "teammem-daily.service",
+        directory / "teammem-daily.timer",
+    )
+
+
+def _manager_returncodes(enabled=False, active=False):
+    return {
+        tuple(_systemctl("is-enabled", "teammem-daily.timer")): 0 if enabled else 1,
+        tuple(_systemctl("is-active", "teammem-daily.timer")): 0 if active else 3,
+    }
+
+
+def _manager_queries():
+    return [
+        _systemctl("is-enabled", "teammem-daily.timer"),
+        _systemctl("is-active", "teammem-daily.timer"),
+    ]
+
+
+def _move_directive(text, prefix, section):
+    lines = text.splitlines()
+    line = next(line for line in lines if line.startswith(prefix))
+    lines.remove(line)
+    lines.insert(lines.index(f"[{section}]") + 1, line)
+    return "\n".join(lines) + "\n"
 
 
 @pytest.mark.parametrize("value", ["25:00", "18:99", "6:20", "18:2", "18:20:00"])
@@ -355,25 +401,23 @@ def test_systemd_timer_is_persistent_and_uses_local_1820(tmp_path):
     assert "Type=oneshot" in service
     assert "TOKEN" not in timer + service
     assert runner.commands == [
+        *_manager_queries(),
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", "teammem-daily.timer"],
     ]
-    assert all(
-        kwargs == {"check": True, "capture_output": True, "text": True}
-        for _, kwargs in runner.calls
-    )
+    assert [kwargs["check"] for _, kwargs in runner.calls] == [
+        False,
+        False,
+        True,
+        True,
+    ]
     assert sorted(item.name for item in systemd_dir.iterdir()) == [
         "teammem-daily.service",
         "teammem-daily.timer",
     ]
 
-    enabled = (
-        "systemctl",
-        "--user",
-        "is-enabled",
-        "teammem-daily.timer",
-    )
-    status_runner = RecordingRunner({enabled: 0})
+    manager = _manager_returncodes(enabled=True, active=True)
+    status_runner = RecordingRunner(manager)
     status = schedule_status(
         platform="linux", systemd_dir=systemd_dir, runner=status_runner
     )
@@ -381,21 +425,11 @@ def test_systemd_timer_is_persistent_and_uses_local_1820(tmp_path):
     assert status.time == "18:20"
     assert status.backend == "systemd"
     assert status.path == timer_path
-    assert status_runner.commands == [list(enabled)]
+    assert status_runner.commands == _manager_queries()
 
 
 def test_systemd_remove_is_idempotent_and_uses_explicit_user_commands(tmp_path):
-    systemd_dir = tmp_path / "systemd" / "user"
-    cfg = _cfg(tmp_path)
-    install_schedule(
-        cfg,
-        platform="linux",
-        systemd_dir=systemd_dir,
-        executable="/opt/pipx/bin/teammem",
-        runner=RecordingRunner(),
-    )
-    timer_path = systemd_dir / "teammem-daily.timer"
-    service_path = systemd_dir / "teammem-daily.service"
+    systemd_dir, service_path, timer_path = _installed_systemd(tmp_path)
 
     def inspect_order(command):
         if "disable" in command:
@@ -403,13 +437,11 @@ def test_systemd_remove_is_idempotent_and_uses_explicit_user_commands(tmp_path):
         if "daemon-reload" in command:
             assert not timer_path.exists() and not service_path.exists()
 
-    enabled = (
-        "systemctl",
-        "--user",
-        "is-enabled",
-        "teammem-daily.timer",
+    enabled = tuple(_systemctl("is-enabled", "teammem-daily.timer"))
+    active = tuple(_systemctl("is-active", "teammem-daily.timer"))
+    runner = RecordingRunner(
+        {enabled: [0, 1], active: [3, 3]}, before=inspect_order
     )
-    runner = RecordingRunner({enabled: 0}, before=inspect_order)
     assert remove_schedule(
         platform="linux", systemd_dir=systemd_dir, runner=runner
     ) is True
@@ -417,52 +449,37 @@ def test_systemd_remove_is_idempotent_and_uses_explicit_user_commands(tmp_path):
     assert remove_schedule(
         platform="linux", systemd_dir=systemd_dir, runner=runner
     ) is False
-    assert len(runner.calls) == call_count
     assert runner.commands == [
         list(enabled),
-        [
-            "systemctl",
-            "--user",
-            "disable",
-            "--now",
-            "teammem-daily.timer",
-        ],
+        list(active),
+        _systemctl("disable", "teammem-daily.timer"),
         ["systemctl", "--user", "daemon-reload"],
+        list(enabled),
+        list(active),
     ]
 
 
 def test_systemd_remove_failure_preserves_definitions(tmp_path):
-    systemd_dir = tmp_path / "systemd" / "user"
-    install_schedule(
-        _cfg(tmp_path),
-        platform="linux",
-        systemd_dir=systemd_dir,
-        executable="/opt/pipx/bin/teammem",
-        runner=RecordingRunner(),
-    )
-    disable = (
-        "systemctl",
-        "--user",
-        "disable",
-        "--now",
-        "teammem-daily.timer",
-    )
-    enabled = (
-        "systemctl",
-        "--user",
-        "is-enabled",
-        "teammem-daily.timer",
-    )
+    systemd_dir, service_path, timer_path = _installed_systemd(tmp_path)
+    disable = tuple(_systemctl("disable", "teammem-daily.timer"))
+    enabled = tuple(_systemctl("is-enabled", "teammem-daily.timer"))
+    active = tuple(_systemctl("is-active", "teammem-daily.timer"))
     runner = RecordingRunner({enabled: 0, disable: 1})
 
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(RuntimeError, match="previous state restored$"):
         remove_schedule(
             platform="linux", systemd_dir=systemd_dir, runner=runner
         )
 
-    assert (systemd_dir / "teammem-daily.timer").exists()
-    assert (systemd_dir / "teammem-daily.service").exists()
-    assert runner.commands == [list(enabled), list(disable)]
+    assert timer_path.exists() and service_path.exists()
+    assert runner.commands == [
+        list(enabled),
+        list(active),
+        list(disable),
+        _systemctl("daemon-reload"),
+        _systemctl("enable", "teammem-daily.timer"),
+        _systemctl("stop", "teammem-daily.timer"),
+    ]
 
 
 @pytest.mark.parametrize("failure_stage", ["write", "reload", "enable"])
@@ -471,6 +488,7 @@ def test_systemd_install_failure_restores_pair_and_enabled_state(
 ):
     systemd_dir, service_path, timer_path = _old_systemd_pair(tmp_path)
     enabled = tuple(_systemctl("is-enabled", "teammem-daily.timer"))
+    active = tuple(_systemctl("is-active", "teammem-daily.timer"))
     reload_command = tuple(_systemctl("daemon-reload"))
     enable = tuple(_systemctl("enable", "--now", "teammem-daily.timer"))
     returncodes = {enabled: 0}
@@ -493,64 +511,115 @@ def test_systemd_install_failure_restores_pair_and_enabled_state(
     runner = RecordingRunner(returncodes)
 
     with pytest.raises(RuntimeError, match="previous state restored$"):
-        install_schedule(
-            _cfg(tmp_path),
-            platform="linux",
-            systemd_dir=systemd_dir,
-            executable="/opt/pipx/bin/teammem",
-            runner=runner,
-        )
+        _install_systemd(tmp_path, systemd_dir, runner)
 
     assert service_path.read_bytes() == b"old service"
     assert timer_path.read_bytes() == b"old timer"
-    expected = [list(enabled)]
+    expected = [list(enabled), list(active)]
     if failure_stage != "write":
         expected.append(list(reload_command))
     if failure_stage == "enable":
         expected.append(list(enable))
-    expected.extend([list(reload_command), list(enable)])
+    expected.extend(
+        [
+            list(reload_command),
+            _systemctl("enable", "teammem-daily.timer"),
+            _systemctl("stop", "teammem-daily.timer"),
+        ]
+    )
     assert runner.commands == expected
 
 
-def test_systemd_failed_first_install_removes_definitions_and_disables_timer(
-    tmp_path,
+@pytest.mark.parametrize(
+    ("prior_files", "enabled", "active"),
+    [
+        ("service", True, False),
+        ("timer", False, True),
+        ("none", True, True),
+        ("none", False, False),
+    ],
+)
+def test_systemd_install_rollback_restores_partial_files_and_manager_state(
+    tmp_path, prior_files, enabled, active
 ):
     systemd_dir = tmp_path / "systemd" / "user"
-    enable = (
-        "systemctl",
-        "--user",
-        "enable",
-        "--now",
-        "teammem-daily.timer",
+    systemd_dir.mkdir(parents=True)
+    service = systemd_dir / "teammem-daily.service"
+    timer = systemd_dir / "teammem-daily.timer"
+    if prior_files == "service":
+        service.write_bytes(b"old service")
+    elif prior_files == "timer":
+        timer.write_bytes(b"old timer")
+    enable_now = tuple(
+        _systemctl("enable", "--now", "teammem-daily.timer")
     )
-    runner = RecordingRunner({enable: 9})
+    returncodes = _manager_returncodes(enabled, active)
+    returncodes[enable_now] = 9
+    runner = RecordingRunner(returncodes)
+
+    with pytest.raises(RuntimeError, match="previous state restored$"):
+        _install_systemd(tmp_path, systemd_dir, runner)
+
+    restored = {
+        path.suffix.removeprefix("."): path.read_bytes()
+        for path in (service, timer)
+        if path.exists()
+    }
+    assert restored == (
+        {prior_files: f"old {prior_files}".encode()}
+        if prior_files != "none"
+        else {}
+    )
+    assert runner.commands == [
+        *_manager_queries(),
+        _systemctl("daemon-reload"),
+        list(enable_now),
+        _systemctl("daemon-reload"),
+        _systemctl(
+            "enable" if enabled else "disable", "teammem-daily.timer"
+        ),
+        _systemctl("start" if active else "stop", "teammem-daily.timer"),
+    ]
+
+
+def test_systemd_remove_cleans_stale_active_manager_without_files(tmp_path):
+    systemd_dir = tmp_path / "systemd" / "user"
+    runner = RecordingRunner(_manager_returncodes(False, True))
+
+    assert remove_schedule(
+        platform="linux", systemd_dir=systemd_dir, runner=runner
+    ) is True
+
+    assert runner.commands == [
+        *_manager_queries(),
+        _systemctl("stop", "teammem-daily.timer"),
+        _systemctl("daemon-reload"),
+    ]
+
+
+def test_systemd_remove_reload_failure_restores_partial_state_for_retry(tmp_path):
+    systemd_dir = tmp_path / "systemd" / "user"
+    systemd_dir.mkdir(parents=True)
+    service = systemd_dir / "teammem-daily.service"
+    service.write_bytes(b"old service")
+    reload_command = tuple(_systemctl("daemon-reload"))
+    returncodes = _manager_returncodes(False, True)
+    returncodes[reload_command] = [8, 0]
+    runner = RecordingRunner(returncodes)
 
     with pytest.raises(
-        RuntimeError,
-        match="^systemd schedule installation failed; previous state restored$",
+        RuntimeError, match="systemd schedule removal failed; previous state restored"
     ):
-        install_schedule(
-            _cfg(tmp_path),
-            platform="linux",
-            systemd_dir=systemd_dir,
-            executable="/opt/pipx/bin/teammem",
-            runner=runner,
+        remove_schedule(
+            platform="linux", systemd_dir=systemd_dir, runner=runner
         )
 
-    assert not (systemd_dir / "teammem-daily.service").exists()
-    assert not (systemd_dir / "teammem-daily.timer").exists()
-    assert runner.commands == [
-        ["systemctl", "--user", "daemon-reload"],
-        list(enable),
-        ["systemctl", "--user", "daemon-reload"],
-        [
-            "systemctl",
-            "--user",
-            "disable",
-            "--now",
-            "teammem-daily.timer",
-        ],
-    ]
+    assert service.read_bytes() == b"old service"
+    retry = RecordingRunner(_manager_returncodes(False, True))
+    assert remove_schedule(
+        platform="linux", systemd_dir=systemd_dir, runner=retry
+    ) is True
+    assert not service.exists()
 
 
 @pytest.mark.parametrize("existing", ["service", "timer"])
@@ -568,18 +637,10 @@ def test_systemd_remove_cleans_partial_definition_without_false_failure(
     ) is True
 
     assert not path.exists()
-    expected = []
-    if existing == "timer":
-        expected.append(
-            [
-                "systemctl",
-                "--user",
-                "is-enabled",
-                "teammem-daily.timer",
-            ]
-        )
-    expected.append(["systemctl", "--user", "daemon-reload"])
-    assert runner.commands == expected
+    assert runner.commands == [
+        *_manager_queries(),
+        _systemctl("daemon-reload"),
+    ]
 
 
 def test_missing_schedule_status_is_backend_specific(tmp_path):
@@ -627,36 +688,27 @@ def test_complete_launchd_definition_reports_time_but_not_installed_when_unloade
 
 
 @pytest.mark.parametrize(
-    ("state", "expected_time", "expected_commands"),
+    ("state", "enabled", "active", "expected_time", "query_manager"),
     [
-        (
-            "disabled",
-            "18:20",
-            [_systemctl("is-enabled", "teammem-daily.timer")],
-        ),
-        ("service-only", None, []),
-        ("timer-only", "18:20", []),
-        ("malformed", "18:20", []),
+        ("disabled", False, False, "18:20", True),
+        ("enabled-inactive", True, False, "18:20", True),
+        ("disabled-active", False, True, "18:20", True),
+        ("service-only", False, False, None, False),
+        ("timer-only", False, False, "18:20", False),
+        ("malformed", False, False, "18:20", False),
     ],
 )
-def test_systemd_status_requires_complete_valid_enabled_definition(
-    tmp_path, state, expected_time, expected_commands
+def test_systemd_status_requires_complete_valid_enabled_and_active_definition(
+    tmp_path, state, enabled, active, expected_time, query_manager
 ):
-    systemd_dir = tmp_path / "systemd" / "user"
-    install_schedule(
-        _cfg(tmp_path),
-        platform="linux",
-        systemd_dir=systemd_dir,
-        executable="/opt/pipx/bin/teammem",
-        runner=RecordingRunner(),
-    )
+    systemd_dir, service, timer = _installed_systemd(tmp_path)
     if state == "service-only":
-        (systemd_dir / "teammem-daily.timer").unlink()
+        timer.unlink()
     elif state == "timer-only":
-        (systemd_dir / "teammem-daily.service").unlink()
+        service.unlink()
     elif state == "malformed":
-        (systemd_dir / "teammem-daily.service").write_text("malformed")
-    runner = RecordingRunner()
+        service.write_text("malformed")
+    runner = RecordingRunner(_manager_returncodes(enabled, active))
 
     status = schedule_status(
         platform="linux", systemd_dir=systemd_dir, runner=runner
@@ -664,7 +716,52 @@ def test_systemd_status_requires_complete_valid_enabled_definition(
 
     assert status.installed is False
     assert status.time == expected_time
-    assert runner.commands == expected_commands
+    assert runner.commands == (_manager_queries() if query_manager else [])
+
+
+@pytest.mark.parametrize(
+    ("filename", "prefix", "wrong_section"),
+    [
+        ("teammem-daily.service", "ExecStart=", "Unit"),
+        ("teammem-daily.timer", "OnCalendar=", "Unit"),
+        ("teammem-daily.timer", "Persistent=", "Install"),
+        ("teammem-daily.timer", "Unit=", "Unit"),
+        ("teammem-daily.timer", "WantedBy=", "Timer"),
+    ],
+)
+def test_systemd_status_rejects_misplaced_directives(
+    tmp_path, filename, prefix, wrong_section
+):
+    systemd_dir, _, _ = _installed_systemd(tmp_path)
+    path = systemd_dir / filename
+    path.write_text(_move_directive(path.read_text(), prefix, wrong_section))
+    runner = RecordingRunner(_manager_returncodes(True, True))
+
+    status = schedule_status(
+        platform="linux", systemd_dir=systemd_dir, runner=runner
+    )
+
+    assert status.installed is False
+    assert runner.calls == []
+
+
+def test_systemd_status_reads_each_definition_once(tmp_path, monkeypatch):
+    systemd_dir, service, timer = _installed_systemd(tmp_path)
+    reads = {}
+    real_read = Path.read_bytes
+
+    def count_reads(path):
+        reads[path] = reads.get(path, 0) + 1
+        return real_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", count_reads)
+    schedule_status(
+        platform="linux",
+        systemd_dir=systemd_dir,
+        runner=RecordingRunner(_manager_returncodes(True, True)),
+    )
+
+    assert reads == {service: 1, timer: 1}
 
 
 def test_status_does_not_report_invalid_definition_time(tmp_path):
@@ -706,6 +803,82 @@ def test_launchd_install_corrects_private_state_and_definition_modes(
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+@pytest.mark.parametrize("unsafe_directory", ["agents", "state"])
+def test_launchd_rejects_symlinked_directories_before_bootout(
+    tmp_path, monkeypatch, unsafe_directory
+):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    target = tmp_path / "target"
+    target.mkdir()
+    agents_dir = tmp_path / "Library" / "LaunchAgents"
+    state_dir = tmp_path / ".local" / "state" / "teammem"
+    if unsafe_directory == "agents":
+        agents_dir.parent.mkdir(parents=True)
+        agents_dir.symlink_to(target, target_is_directory=True)
+    else:
+        agents_dir.mkdir(parents=True)
+        state_dir.parent.mkdir(parents=True)
+        state_dir.symlink_to(target, target_is_directory=True)
+    path = agents_dir / f"{LABEL}.plist"
+    path.write_bytes(b"old definition")
+    runner = RecordingRunner()
+
+    with pytest.raises(ValueError, match="symlink"):
+        install_schedule(
+            _cfg(tmp_path),
+            platform="darwin",
+            executable="/opt/pipx/bin/teammem",
+            runner=runner,
+        )
+
+    assert runner.calls == []
+    assert path.read_bytes() == b"old definition"
+
+
+@pytest.mark.parametrize(
+    ("platform", "operation"),
+    [("linux", "install"), ("linux", "status"), ("linux", "remove"),
+     ("darwin", "status")],
+)
+def test_schedule_operations_reject_symlinked_definitions(
+    tmp_path, platform, operation
+):
+    directory = (
+        tmp_path / "systemd" / "user"
+        if platform == "linux"
+        else tmp_path / "LaunchAgents"
+    )
+    directory.mkdir(parents=True)
+    target = tmp_path / "outside"
+    target.write_bytes(b"outside")
+    filename = (
+        "teammem-daily.service"
+        if platform == "linux"
+        else f"{LABEL}.plist"
+    )
+    (directory / filename).symlink_to(target)
+    runner = RecordingRunner()
+
+    with pytest.raises(ValueError, match="symlink"):
+        if operation == "install":
+            _install_systemd(tmp_path, directory, runner)
+        elif platform == "linux" and operation == "remove":
+            remove_schedule(
+                platform=platform, systemd_dir=directory, runner=runner
+            )
+        elif platform == "linux":
+            schedule_status(
+                platform=platform, systemd_dir=directory, runner=runner
+            )
+        else:
+            schedule_status(
+                platform=platform, agents_dir=directory, runner=runner
+            )
+
+    assert target.read_bytes() == b"outside"
+    assert runner.calls == []
+
+
 def test_systemd_definitions_are_private_and_parent_replacements_are_fsynced(
     tmp_path, monkeypatch
 ):
@@ -719,13 +892,7 @@ def test_systemd_definitions_are_private_and_parent_replacements_are_fsynced(
 
     monkeypatch.setattr("teammem.schedule.os.fsync", record_fsync)
 
-    install_schedule(
-        _cfg(tmp_path),
-        platform="linux",
-        systemd_dir=systemd_dir,
-        executable="/opt/pipx/bin/teammem",
-        runner=RecordingRunner(),
-    )
+    _install_systemd(tmp_path, systemd_dir, RecordingRunner())
 
     assert stat.S_IMODE(
         (systemd_dir / "teammem-daily.service").stat().st_mode
