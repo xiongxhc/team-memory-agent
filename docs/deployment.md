@@ -339,12 +339,24 @@ macOS. Remove the timer before uninstalling `teammem`.
 ### Local-filesystem requirement
 
 Schedule lifecycle operations serialize changes with a directory lock. That
-locking has been verified on local macOS filesystems and normal local Linux
-filesystem semantics. NFS and SMB locking behavior varies by server, client, and
-mount configuration. If the operator's home is network-mounted, place the
-schedule-definition directories on a local filesystem or use an external
-trusted scheduler with equivalent lifecycle controls; do not assume the built-in
-schedule is safe on an unverified network home.
+definition and scheduler-command behavior is hermetically tested for both
+backends. The recorded separate-process live lock probe ran on macOS only. Linux
+guidance follows the documented local semantics of
+[`flock(2)`](https://man7.org/linux/man-pages/man2/flock.2.html) and the official
+systemd manuals linked above; it is not a claim of a live Linux lock probe.
+
+The built-in scheduler uses the fixed home-relative definition paths shown above
+and rejects symlink traversal. It has no directory override. NFS and SMB locking
+behavior varies by server, client, and mount configuration. If the operator's
+home uses NFS, SMB, or another filesystem with uncertain `flock` semantics,
+either run `teammem` under a local home or use an externally managed scheduler
+that invokes:
+
+```bash
+teammem --env-file /absolute/path/to/hub.env run-daily
+```
+
+Do not assume the built-in schedule is safe on an unverified network home.
 
 ## Safe MemberKit inbox import
 

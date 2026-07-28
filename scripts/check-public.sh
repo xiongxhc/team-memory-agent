@@ -30,7 +30,12 @@ fi
 obsolete_schedule_claims=$(git grep -nI -E \
   -e '(does not yet provide|has no) hub schedule' \
   -e 'hub schedule installation (belongs to|is not part of)' \
-  -- README.md docs || test $? -eq 1)
+  -- \
+  README.md \
+  docs/deployment.md \
+  docs/architecture.md \
+  docs/privacy.md \
+  || test $? -eq 1)
 if [ -n "$obsolete_schedule_claims" ]; then
   printf '%s\n' "$obsolete_schedule_claims"
   echo "obsolete hub-scheduling claim found"
