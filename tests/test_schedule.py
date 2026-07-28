@@ -327,13 +327,18 @@ def test_launchd_remove_is_idempotent_and_preserves_file_on_bootout_failure(
         {("launchctl", "bootout", service_target): 5}
     )
 
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(RuntimeError, match="previous state restored$"):
         remove_schedule(
             platform="darwin", agents_dir=agents_dir, runner=failing
         )
     assert path.exists()
+    assert failing.commands == [
+        _launchctl_print(),
+        ["launchctl", "bootout", service_target],
+        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(path)],
+    ]
 
-    runner = RecordingRunner()
+    runner = RecordingRunner({tuple(_launchctl_print()): [0, 1]})
     assert remove_schedule(
         platform="darwin", agents_dir=agents_dir, runner=runner
     ) is True
@@ -341,11 +346,144 @@ def test_launchd_remove_is_idempotent_and_preserves_file_on_bootout_failure(
     assert remove_schedule(
         platform="darwin", agents_dir=agents_dir, runner=runner
     ) is False
-    assert len(runner.calls) == call_count
+    assert len(runner.calls) == call_count + 1
     assert runner.commands == [
         _launchctl_print(),
         ["launchctl", "bootout", service_target],
+        _launchctl_print(),
     ]
+
+
+@pytest.mark.parametrize(
+    ("has_file", "loaded", "expected", "expected_commands"),
+    [
+        (False, False, False, [_launchctl_print()]),
+        (
+            False,
+            True,
+            True,
+            [
+                _launchctl_print(),
+                _launchctl("bootout", f"gui/{os.getuid()}/{LABEL}"),
+            ],
+        ),
+        (True, False, True, [_launchctl_print()]),
+    ],
+)
+def test_launchd_remove_reconciles_definition_and_loaded_state(
+    tmp_path, has_file, loaded, expected, expected_commands
+):
+    agents_dir = tmp_path / "LaunchAgents"
+    agents_dir.mkdir()
+    path = agents_dir / f"{LABEL}.plist"
+    if has_file:
+        path.write_bytes(b"existing definition")
+    runner = RecordingRunner(
+        {tuple(_launchctl_print()): 0 if loaded else 1}
+    )
+
+    result = remove_schedule(
+        platform="darwin", agents_dir=agents_dir, runner=runner
+    )
+
+    assert result is expected
+    assert not path.exists()
+    assert runner.commands == expected_commands
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "loaded"),
+    [("unlink", True), ("fsync", False), ("fsync", True)],
+)
+def test_launchd_remove_failure_restores_exact_definition_and_loaded_state(
+    tmp_path, monkeypatch, failure_stage, loaded
+):
+    agents_dir = tmp_path / "LaunchAgents"
+    agents_dir.mkdir()
+    path = agents_dir / f"{LABEL}.plist"
+    original = b"exact prior definition"
+    path.write_bytes(original)
+    original_failure = OSError(f"simulated {failure_stage} failure")
+    if failure_stage == "unlink":
+        real_unlink = os.unlink
+
+        def fail_target_unlink(name, *args, **kwargs):
+            if name == path.name:
+                raise original_failure
+            return real_unlink(name, *args, **kwargs)
+
+        monkeypatch.setattr(schedule_module.os, "unlink", fail_target_unlink)
+    else:
+        real_fsync = os.fsync
+        failed = False
+
+        def fail_first_fsync(descriptor):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise original_failure
+            return real_fsync(descriptor)
+
+        monkeypatch.setattr(schedule_module.os, "fsync", fail_first_fsync)
+    runner = RecordingRunner(
+        {tuple(_launchctl_print()): 0 if loaded else 1}
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^launchd schedule removal failed; previous state restored$",
+    ) as error:
+        remove_schedule(
+            platform="darwin", agents_dir=agents_dir, runner=runner
+        )
+
+    assert error.value.__cause__ is original_failure
+    assert path.read_bytes() == original
+    expected = [_launchctl_print()]
+    if loaded:
+        expected.extend(
+            [
+                _launchctl("bootout", f"gui/{os.getuid()}/{LABEL}"),
+                _launchctl("bootstrap", f"gui/{os.getuid()}", str(path)),
+            ]
+        )
+    assert runner.commands == expected
+
+
+def test_launchd_remove_rollback_failure_is_sanitized_and_chained(
+    tmp_path, monkeypatch
+):
+    agents_dir = tmp_path / "LaunchAgents"
+    agents_dir.mkdir()
+    path = agents_dir / f"{LABEL}.plist"
+    path.write_bytes(b"prior definition")
+    original_failure = OSError("sensitive unlink failure")
+    rollback_failure = OSError("sensitive restore failure")
+    real_unlink = os.unlink
+
+    def fail_target_unlink(name, *args, **kwargs):
+        if name == path.name:
+            raise original_failure
+        return real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(schedule_module.os, "unlink", fail_target_unlink)
+    monkeypatch.setattr(
+        schedule_module.os,
+        "replace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(rollback_failure),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^launchd schedule removal failed and rollback failed$",
+    ) as error:
+        remove_schedule(
+            platform="darwin", agents_dir=agents_dir, runner=RecordingRunner()
+        )
+
+    assert error.value.__cause__ is rollback_failure
+    assert rollback_failure.__context__ is original_failure
+    assert "sensitive" not in str(error.value)
 
 
 def test_systemd_timer_is_persistent_and_uses_local_1820(tmp_path):
@@ -707,6 +845,51 @@ def test_complete_launchd_definition_reports_time_but_not_installed_when_unloade
 
 
 @pytest.mark.parametrize(
+    ("location", "value"),
+    [
+        pytest.param(("StartInterval",), 60, id="start-interval"),
+        pytest.param(
+            ("EnvironmentVariables",), {"TOKEN": "secret"}, id="environment"
+        ),
+        pytest.param(("UnexpectedTrigger",), True, id="extra-key"),
+        pytest.param(
+            ("ProgramArguments", 0), "teammem", id="relative-executable"
+        ),
+        pytest.param(("ProgramArguments", 2), "hub.env", id="relative-env"),
+        pytest.param(
+            ("StartCalendarInterval", "Weekday"), 1, id="calendar-extra"
+        ),
+        pytest.param(
+            ("StandardOutPath",), "/tmp/teammem.log", id="wrong-log"
+        ),
+    ],
+)
+def test_launchd_status_rejects_noncanonical_or_unsafe_definition(
+    tmp_path, location, value
+):
+    agents_dir = tmp_path / "LaunchAgents"
+    path = _install_launchd(
+        tmp_path,
+        agents_dir,
+        RecordingRunner({tuple(_launchctl_print()): 1}),
+    )
+    data = plistlib.loads(path.read_bytes())
+    target = data
+    for part in location[:-1]:
+        target = target[part]
+    target[location[-1]] = value
+    path.write_bytes(plistlib.dumps(data))
+    runner = RecordingRunner()
+
+    status = schedule_status(
+        platform="darwin", agents_dir=agents_dir, runner=runner
+    )
+
+    assert status.installed is False
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
     ("state", "enabled", "active", "expected_time", "query_manager"),
     [
         ("disabled", False, False, "18:20", True),
@@ -754,6 +937,78 @@ def test_systemd_status_rejects_misplaced_directives(
     systemd_dir, _, _ = _installed_systemd(tmp_path)
     path = systemd_dir / filename
     path.write_text(_move_directive(path.read_text(), prefix, wrong_section))
+    runner = RecordingRunner(_manager_returncodes(True, True))
+
+    status = schedule_status(
+        platform="linux", systemd_dir=systemd_dir, runner=runner
+    )
+
+    assert status.installed is False
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "old", "new"),
+    [
+        pytest.param(
+            "service", None, "\n[Socket]\nListenStream=1234\n",
+            id="service-section",
+        ),
+        pytest.param(
+            "timer", None, "\n[Path]\nPathExists=/tmp/trigger\n",
+            id="timer-section",
+        ),
+        pytest.param(
+            "service", "[Service]\n", "[Service]\nEnvironment=TOKEN=secret\n",
+            id="environment",
+        ),
+        pytest.param(
+            "service", "[Service]\n",
+            "[Service]\nEnvironmentFile=/tmp/hub.env\n",
+            id="environment-file",
+        ),
+        pytest.param(
+            "service", "[Service]\n", "[Service]\nExecStartPre=/bin/true\n",
+            id="exec-pre",
+        ),
+        pytest.param(
+            "service", "[Service]\n", "[Service]\nExecStartPost=/bin/true\n",
+            id="exec-post",
+        ),
+        pytest.param(
+            "service", "Type=oneshot\n",
+            "Type=oneshot\nExecStart=/bin/true\n",
+            id="duplicate-exec",
+        ),
+        pytest.param(
+            "service", None, "\n[Service]\n", id="duplicate-service"
+        ),
+        pytest.param(
+            "timer", "[Timer]\n", "[Timer]\nOnBootSec=1min\n", id="on-boot"
+        ),
+        pytest.param("timer", None, "\n[Timer]\n", id="duplicate-timer"),
+        pytest.param(
+            "service", "ExecStart=/opt/pipx/bin/teammem",
+            "ExecStart=teammem", id="relative-executable",
+        ),
+        pytest.param(
+            "service", "{env_file}", "hub.env", id="relative-env"
+        ),
+    ],
+)
+def test_systemd_status_rejects_noncanonical_or_unsafe_definition(
+    tmp_path, filename, old, new
+):
+    systemd_dir, service_path, timer_path = _installed_systemd(tmp_path)
+    path = service_path if filename == "service" else timer_path
+    definition = path.read_text()
+    if old is None:
+        definition += new
+    else:
+        old = old.format(env_file=tmp_path / "hub.env")
+        assert old in definition
+        definition = definition.replace(old, new, 1)
+    path.write_text(definition)
     runner = RecordingRunner(_manager_returncodes(True, True))
 
     status = schedule_status(
