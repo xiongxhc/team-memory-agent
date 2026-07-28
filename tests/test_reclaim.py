@@ -59,6 +59,16 @@ def test_reclaim_conflict_is_reported_and_untouched(tmp_path):
     assert stats(conn)["unmapped"] == ["_unmapped/dup"]
 
 
+def test_reclaim_resolves_github_identity(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [_ev("_unmapped/alex-gh", "s1")])
+
+    got = reclaim(conn, IdentityMaps.load(CONFIG_DIR))
+
+    assert got == [("alex-gh", "alex", 1)]
+    assert stats(conn)["by_person"]["alex"] == 1
+
+
 def test_reclaim_channel_projects_updates_only_unmapped_rows(tmp_path):
     import json as _json
     from teammem.reclaim import reclaim_channel_projects
@@ -80,3 +90,32 @@ def test_reclaim_channel_projects_updates_only_unmapped_rows(tmp_path):
     assert live == [("oc_new", "project-alpha", 1)]
     assert conn.execute("SELECT project FROM events WHERE hash='m1'").fetchone()[0] == "project-alpha"
     assert conn.execute("SELECT project FROM events WHERE hash='m2'").fetchone()[0] == "already"
+
+
+def test_reclaim_channel_projects_uses_the_event_source_provider_kind(tmp_path):
+    import json as _json
+    from teammem.reclaim import reclaim_channel_projects
+
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T09:00:00+00:00", source="slack-channel",
+              kind="message", summary="slack", refs=_json.dumps({"chat_id": "shared"}),
+              hash="slack-1"),
+        Event(person="alex", ts="2026-07-14T09:01:00+00:00", source="feishu-channel",
+              kind="message", summary="feishu", refs=_json.dumps({"chat_id": "shared"}),
+              hash="feishu-1"),
+    ])
+    ids = IdentityMaps(
+        {"members": {}},
+        {"projects": {
+            "slack-project": {"slack_channels": ["shared"]},
+            "feishu-project": {"feishu_channels": ["shared"]},
+        }},
+    )
+
+    assert reclaim_channel_projects(conn, ids) == [
+        ("shared", "feishu-project", 1),
+        ("shared", "slack-project", 1),
+    ]
+    assert conn.execute("SELECT project FROM events WHERE hash='slack-1'").fetchone()[0] == "slack-project"
+    assert conn.execute("SELECT project FROM events WHERE hash='feishu-1'").fetchone()[0] == "feishu-project"

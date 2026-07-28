@@ -6,6 +6,16 @@ from pathlib import Path
 import yaml
 
 
+RESOURCE_FIELDS = {
+    "github_repos": "github-repo",
+    "gitlab_repos": "gitlab-repo",
+    "slack_channels": "slack-channel",
+    "feishu_channels": "feishu-channel",
+    "discord_channels": "discord-channel",
+}
+IDENTITY_FIELDS = ("email", "github", "gitlab", "slack", "feishu", "discord")
+
+
 def _read(config_dir: Path, name: str) -> dict:
     real, example = config_dir / f"{name}.yaml", config_dir / f"{name}.example.yaml"
     path = real if real.exists() else example
@@ -16,18 +26,15 @@ class IdentityMaps:
     def __init__(self, roster: dict, projects: dict):
         self._person_by_key: dict[tuple[str, str], str] = {}
         for slug, m in (roster.get("members") or {}).items():
-            for email in m.get("emails") or []:
-                self._check_and_insert_person(("email", email.lower()), slug, email)
-            for username in m.get("gitlab") or []:
-                self._check_and_insert_person(("gitlab", username.lower()), slug, username)
-            for oid in m.get("feishu") or []:
-                self._check_and_insert_person(("feishu", oid.lower()), slug, oid)
-        self._project_by_repo: dict[str, str] = {}
+            for kind in IDENTITY_FIELDS:
+                field = "emails" if kind == "email" else kind
+                for value in m.get(field) or []:
+                    self._check_and_insert_person((kind, value.lower()), slug, value)
+        self._project_by_resource: dict[tuple[str, str], str] = {}
         for slug, p in (projects.get("projects") or {}).items():
-            for repo in p.get("gitlab_repos") or []:
-                self._check_and_insert_repo(repo.lower(), slug, repo)
-            for chan in p.get("feishu_channels") or []:
-                self._check_and_insert_repo(chan.lower(), slug, chan)
+            for field, kind in RESOURCE_FIELDS.items():
+                for value in p.get(field) or []:
+                    self._check_and_insert_resource((kind, value.lower()), slug, value)
         self._names = {slug: (m.get("name") or slug) for slug, m in (roster.get("members") or {}).items()}
 
     def _check_and_insert_person(self, key: tuple[str, str], slug: str, raw_value: str) -> None:
@@ -35,10 +42,10 @@ class IdentityMaps:
             raise ValueError(f"identity collision: {raw_value!r} claimed by both {self._person_by_key[key]!r} and {slug!r}")
         self._person_by_key[key] = slug
 
-    def _check_and_insert_repo(self, repo: str, slug: str, raw_repo: str) -> None:
-        if repo in self._project_by_repo and self._project_by_repo[repo] != slug:
-            raise ValueError(f"repo/channel collision: {raw_repo!r} claimed by both {self._project_by_repo[repo]!r} and {slug!r}")
-        self._project_by_repo[repo] = slug
+    def _check_and_insert_resource(self, key: tuple[str, str], slug: str, raw_value: str) -> None:
+        if key in self._project_by_resource and self._project_by_resource[key] != slug:
+            raise ValueError(f"resource collision: {raw_value!r} claimed by both {self._project_by_resource[key]!r} and {slug!r}")
+        self._project_by_resource[key] = slug
 
     @classmethod
     def load(cls, config_dir: Path) -> "IdentityMaps":
@@ -49,14 +56,21 @@ class IdentityMaps:
             return "_unmapped/(none)"
         return self._person_by_key.get((kind, value.lower()), f"_unmapped/{value}")
 
+    def project(self, kind: str, value: str) -> str | None:
+        return self._project_by_resource.get((kind, value.lower()))
+
+    def resources(self, kind: str) -> dict[str, str]:
+        return {value: slug for (resource_kind, value), slug in self._project_by_resource.items()
+                if resource_kind == kind}
+
     def project_for_repo(self, path_with_namespace: str) -> str | None:
-        return self._project_by_repo.get(path_with_namespace.lower())
+        return self.project("gitlab-repo", path_with_namespace)
 
     def project_for_channel(self, chat_id: str) -> str | None:
-        return self._project_by_repo.get(chat_id.lower())
+        return self.project("feishu-channel", chat_id)
 
     def mapped_channels(self) -> dict[str, str]:
-        return {k: v for k, v in self._project_by_repo.items() if k.startswith("oc_")}
+        return self.resources("feishu-channel")
 
     def display_name(self, slug: str) -> str:
         return self._names.get(slug, slug)

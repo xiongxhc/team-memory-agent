@@ -2,7 +2,10 @@
 # Maps forge repos (path_with_namespace) to canonical project slugs.
 projects:
   project-alpha:
+    github_repos: [team/project-alpha]
     gitlab_repos: [team/project-alpha, team/alpha-tools]
+    slack_channels: [C0123]
     feishu_channels: [oc_example_alpha]
+    discord_channels: ["9876543210"]
   project-beta:
     gitlab_repos: [team/project-beta-api, team/project-beta-web]

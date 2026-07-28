@@ -8,9 +8,9 @@ sanctioned fix: UPDATE in place, then the collector's next run inserts 0.
 
 import sqlite3
 
-from .identity import IdentityMaps
+from .identity import IDENTITY_FIELDS, IdentityMaps, RESOURCE_FIELDS
 
-_KINDS = ("email", "gitlab", "feishu")
+_KINDS = IDENTITY_FIELDS
 
 
 def reclaim(conn: sqlite3.Connection, ids: IdentityMaps,
@@ -41,19 +41,20 @@ def reclaim(conn: sqlite3.Connection, ids: IdentityMaps,
 
 def reclaim_channel_projects(conn: sqlite3.Connection, ids: IdentityMaps,
                              dry_run: bool = False) -> list[tuple[str, str, int]]:
-    """Re-attribute project on feishu events whose channel got mapped in
-    projects.yaml AFTER ingest (same rationale as reclaim: UPDATE in place)."""
+    """Re-attribute project on mapped chat events AFTER ingest in place."""
     out = []
-    for chat_id, project in sorted(ids.mapped_channels().items()):
-        where = ("source = 'feishu-channel' AND project IS NULL"
-                 " AND json_extract(refs, '$.chat_id') = ?")
-        if dry_run:
-            n = conn.execute(f"SELECT COUNT(*) FROM events WHERE {where}",
-                             (chat_id,)).fetchone()[0]
-        else:
-            with conn:
-                n = conn.execute(f"UPDATE events SET project = ? WHERE {where}",
-                                 (project, chat_id)).rowcount
-        if n:
-            out.append((chat_id, project, n))
+    channel_kinds = sorted(kind for kind in RESOURCE_FIELDS.values() if kind.endswith("-channel"))
+    for kind in channel_kinds:
+        for chat_id, project in sorted(ids.resources(kind).items()):
+            where = ("source = ? AND project IS NULL"
+                     " AND json_extract(refs, '$.chat_id') = ?")
+            if dry_run:
+                n = conn.execute(f"SELECT COUNT(*) FROM events WHERE {where}",
+                                 (kind, chat_id)).fetchone()[0]
+            else:
+                with conn:
+                    n = conn.execute(f"UPDATE events SET project = ? WHERE {where}",
+                                     (project, kind, chat_id)).rowcount
+            if n:
+                out.append((chat_id, project, n))
     return out
