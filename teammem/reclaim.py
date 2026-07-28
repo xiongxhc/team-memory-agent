@@ -47,7 +47,7 @@ def reclaim_channel_projects(conn: sqlite3.Connection, ids: IdentityMaps,
     for kind in channel_kinds:
         for chat_id, project in sorted(ids.resources(kind).items()):
             where = ("source = ? AND project IS NULL"
-                     " AND json_extract(refs, '$.chat_id') = ?")
+                     " AND lower(json_extract(refs, '$.chat_id')) = ?")
             if dry_run:
                 n = conn.execute(f"SELECT COUNT(*) FROM events WHERE {where}",
                                  (kind, chat_id)).fetchone()[0]
