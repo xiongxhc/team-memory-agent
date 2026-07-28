@@ -85,7 +85,7 @@ def test_resources_return_only_the_requested_provider_kind():
         }},
     )
     assert ids.resources("github-repo") == {"team/one": "one"}
-    assert ids.resources("slack-channel") == {"c0123": "two"}
+    assert ids.resources("slack-channel") == {"C0123": "two"}
 
 
 def test_existing_gitlab_and_feishu_helpers_remain_compatible():

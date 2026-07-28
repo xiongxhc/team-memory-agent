@@ -122,3 +122,22 @@ def test_discord_never_requests_messages_when_metadata_fails():
 def test_discord_validation_requires_the_bot_token():
     """Running Discord collection without the bot credential would not satisfy its permission boundary."""
     assert DiscordConnector().validate(Config(), _settings()) == ["TEAMMEM_DISCORD_BOT_TOKEN"]
+
+
+def test_discord_warns_when_empty_history_cannot_verify_read_or_content_permissions():
+    """Treating an empty response as proof of an empty channel hides missing history or content access."""
+    def discord_fixture(path, params):
+        if path == "/channels/9876543210":
+            return _channel()
+        if path == "/channels/9876543210/messages":
+            return []
+        raise AssertionError(path)
+
+    result = DiscordConnector(fetch=discord_fixture).collect(
+        _cfg(), IdentityMaps.load(CONFIG_DIR), _settings(), NOW
+    )
+
+    assert result.events == ()
+    assert result.warnings == (
+        "discord channel 9876543210 returned no messages; verify READ_MESSAGE_HISTORY and MESSAGE_CONTENT access",
+    )

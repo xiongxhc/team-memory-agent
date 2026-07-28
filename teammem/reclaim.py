@@ -46,15 +46,16 @@ def reclaim_channel_projects(conn: sqlite3.Connection, ids: IdentityMaps,
     channel_kinds = sorted(kind for kind in RESOURCE_FIELDS.values() if kind.endswith("-channel"))
     for kind in channel_kinds:
         for chat_id, project in sorted(ids.resources(kind).items()):
+            normalized_chat_id = chat_id.lower()
             where = ("source = ? AND project IS NULL"
                      " AND lower(json_extract(refs, '$.chat_id')) = ?")
             if dry_run:
                 n = conn.execute(f"SELECT COUNT(*) FROM events WHERE {where}",
-                                 (kind, chat_id)).fetchone()[0]
+                                 (kind, normalized_chat_id)).fetchone()[0]
             else:
                 with conn:
                     n = conn.execute(f"UPDATE events SET project = ? WHERE {where}",
-                                     (project, kind, chat_id)).rowcount
+                                     (project, kind, normalized_chat_id)).rowcount
             if n:
-                out.append((chat_id, project, n))
+                out.append((normalized_chat_id, project, n))
     return out

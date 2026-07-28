@@ -1,6 +1,7 @@
 """Slack bot polling restricted to mapped shared channels."""
 
 import json
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
@@ -14,14 +15,26 @@ from .config import ConnectorSettings
 
 SLACK_API_URL = "https://slack.com/api"
 _HISTORY_LIMIT = 15
+_HISTORY_INTERVAL_SECONDS = 60
 SlackFetch = Callable[[str, dict], dict]
+
+
+class SlackRateLimited(RuntimeError):
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f"Slack rate limited; retry after {retry_after} seconds")
 
 
 class SlackConnector:
     name = "slack"
 
-    def __init__(self, fetch: SlackFetch | None = None):
+    def __init__(
+        self,
+        fetch: SlackFetch | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
         self._fetch = fetch
+        self._sleep = sleep
 
     def validate(self, cfg: Config, settings: ConnectorSettings) -> list[str]:
         if cfg.slack_bot_token.startswith("xoxb-"):
@@ -36,6 +49,12 @@ class SlackConnector:
 
         def fetch(path: str, params: dict) -> dict:
             response = session.get(f"{SLACK_API_URL}/{path}", params=params, timeout=30)
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After", _HISTORY_INTERVAL_SECONDS)
+                try:
+                    raise SlackRateLimited(float(retry_after))
+                except ValueError:
+                    raise SlackRateLimited(_HISTORY_INTERVAL_SECONDS) from None
             response.raise_for_status()
             body = response.json()
             if not body.get("ok"):
@@ -105,16 +124,20 @@ class SlackConnector:
             and message.get("thread_ts", message.get("ts")) == message.get("ts")
         )
 
-    @staticmethod
-    def _history(fetch: SlackFetch, channel_id: str, oldest: str) -> list[dict]:
+    def _history(self, fetch: SlackFetch, channel_id: str, oldest: str) -> list[dict]:
         messages: list[dict] = []
         cursor = ""
         while True:
             params = {"channel": channel_id, "oldest": oldest, "limit": _HISTORY_LIMIT}
             if cursor:
                 params["cursor"] = cursor
-            page = fetch("conversations.history", params)
+            try:
+                page = fetch("conversations.history", params)
+            except SlackRateLimited as error:
+                self._sleep(error.retry_after)
+                continue
             messages.extend(page.get("messages") or [])
             cursor = (page.get("response_metadata") or {}).get("next_cursor") or ""
             if not cursor:
                 return messages
+            self._sleep(_HISTORY_INTERVAL_SECONDS)
