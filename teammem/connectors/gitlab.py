@@ -1,0 +1,103 @@
+"""GitLab connector adapter with legacy event identities preserved."""
+
+import json
+from collections.abc import Callable
+from datetime import datetime, timedelta
+
+from teammem.config import Config
+from teammem.events import Event, event_hash
+from teammem.identity import IdentityMaps
+
+from .base import CollectionResult
+from .config import ConnectorSettings
+
+
+_PER_PAGE = 100
+FetchJson = Callable[[str, dict], list]
+
+
+class GitLabConnector:
+    name = "gitlab"
+
+    def __init__(self, fetch_json: FetchJson | None = None):
+        self._fetch_json = fetch_json
+
+    def validate(self, cfg: Config, settings: ConnectorSettings) -> list[str]:
+        fields = (
+            ("TEAMMEM_GITLAB_URL", cfg.gitlab_url),
+            ("TEAMMEM_GITLAB_TOKEN", cfg.gitlab_token),
+            ("TEAMMEM_GITLAB_GROUP", cfg.gitlab_group),
+        )
+        return [name for name, value in fields if not value]
+
+    def http_fetch_json(self, cfg: Config) -> FetchJson:
+        import requests
+
+        session = requests.Session()
+        session.headers["PRIVATE-TOKEN"] = cfg.gitlab_token
+
+        def fetch(path: str, params: dict) -> list:
+            response = session.get(f"{cfg.gitlab_url}/api/v4{path}", params=params, timeout=30)
+            response.raise_for_status()
+            return response.json()
+
+        return fetch
+
+    def collect(
+        self,
+        cfg: Config,
+        ids: IdentityMaps,
+        settings: ConnectorSettings,
+        now: datetime,
+    ) -> CollectionResult:
+        fetch_json = self._fetch_json or self.http_fetch_json(cfg)
+        return CollectionResult(events=tuple(self._collect_events(cfg, ids, fetch_json, now)))
+
+    @staticmethod
+    def _paginate(fetch_json: FetchJson, path: str, params: dict) -> list:
+        out, page = [], 1
+        while True:
+            batch = fetch_json(path, {**params, "per_page": _PER_PAGE, "page": page})
+            out.extend(batch)
+            if len(batch) < _PER_PAGE:
+                return out
+            page += 1
+
+    def _collect_events(
+        self, cfg: Config, ids: IdentityMaps, fetch_json: FetchJson, now: datetime
+    ) -> list[Event]:
+        since = (now - timedelta(days=cfg.since_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        events: list[Event] = []
+        projects = self._paginate(fetch_json, f"/groups/{cfg.gitlab_group}/projects",
+                                  {"include_subgroups": "true"})
+        for p in projects:
+            project = ids.project_for_repo(p["path_with_namespace"])
+            # Default-branch commits only (no all=true): branch work appears at merge via MRs.
+            # Revisit during live dry-run / M2 gap logic if branch-level visibility is needed.
+            for c in self._paginate(fetch_json, f"/projects/{p['id']}/repository/commits",
+                                    {"since": since}):
+                events.append(Event(
+                    person=ids.person("email", c.get("author_email", "")),
+                    project=project,
+                    ts=c["committed_date"],
+                    source="gitlab",
+                    kind="commit",
+                    summary=c["title"],
+                    refs=json.dumps({"sha": c["id"], "url": c.get("web_url")}),
+                    raw=json.dumps(c),
+                    hash=c["id"],
+                ))
+            for mr in self._paginate(fetch_json, f"/projects/{p['id']}/merge_requests",
+                                     {"updated_after": since}):
+                events.append(Event(
+                    person=ids.person("gitlab", (mr.get("author") or {}).get("username", "")),
+                    project=project,
+                    ts=mr.get("merged_at") or mr["updated_at"],
+                    source="gitlab",
+                    kind="mr",
+                    summary=f"[{mr['state']}] {mr['title']}",
+                    refs=json.dumps({"iid": mr["iid"], "url": mr.get("web_url")}),
+                    raw=json.dumps(mr),
+                    hash=event_hash("mr", str(p["id"]), str(mr["iid"]), mr["state"]),
+                ))
+        return events
