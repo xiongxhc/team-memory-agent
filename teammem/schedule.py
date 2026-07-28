@@ -134,28 +134,15 @@ def _open_directory(path: Path, *, create: bool, private: bool = False) -> int |
 
 
 @contextmanager
-def _locked_directory(path: Path, backend: str, write: bool):
+def _locked_directory(path: Path, write: bool):
     directory_fd = _open_directory(path, create=write)
     if directory_fd is None:
         yield None
         return
     try:
-        lock_fd = os.open(
-            f".teammem-{backend}.lock", os.O_RDWR | os.O_CREAT | _FILE_FLAGS,
-            0o600, dir_fd=directory_fd,
-        )
-    except OSError as failure:
-        os.close(directory_fd)
-        raise ValueError(f"unsafe {backend} schedule lock") from failure
-    try:
-        lock_stat = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.getuid():
-            raise ValueError(f"unsafe {backend} schedule lock")
-        os.fchmod(lock_fd, 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
+        fcntl.flock(directory_fd, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
         yield directory_fd
     finally:
-        os.close(lock_fd)
         os.close(directory_fd)
 
 
@@ -184,6 +171,7 @@ def _write_atomic(directory_fd: int, name: str, data: bytes) -> None:
             temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_FLAGS,
             0o600, dir_fd=directory_fd
         )
+        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
             handle.flush()
@@ -242,7 +230,7 @@ def _install_launchd(
         state_fd = _open_directory(state_dir, create=True, private=True)
         assert state_fd is not None
         os.close(state_fd)
-    with _locked_directory(path.parent, "launchd", True) as directory_fd:
+    with _locked_directory(path.parent, True) as directory_fd:
         assert directory_fd is not None
         previous = _read_definition(directory_fd, path.name)
         payload = {
@@ -353,7 +341,7 @@ Unit={SYSTEMD_SERVICE}
 [Install]
 WantedBy=timers.target
 """
-    with _locked_directory(service_path.parent, "systemd", True) as directory_fd:
+    with _locked_directory(service_path.parent, True) as directory_fd:
         assert directory_fd is not None
         previous = _snapshot_files(directory_fd, [SYSTEMD_SERVICE, SYSTEMD_TIMER])
         previous_state = _systemd_state(runner)
@@ -512,11 +500,11 @@ def schedule_status(
     systemd_dir: Path | None = None,
     runner: Runner | None = None,
 ) -> ScheduleStatus:
-    """Read valid definition and active user-scheduler state without mutation."""
+    """Read status without creating artifacts or changing scheduler state."""
     backend = _backend(platform)
     if backend == "launchd":
         path = _launchd_path(agents_dir)
-        with _locked_directory(path.parent, backend, False) as directory_fd:
+        with _locked_directory(path.parent, False) as directory_fd:
             if directory_fd is None:
                 return ScheduleStatus(False, None, backend, path)
             valid, time = _parse_launchd(_read_definition(directory_fd, path.name))
@@ -524,7 +512,7 @@ def schedule_status(
             return ScheduleStatus(valid and loaded, time, backend, path)
 
     service_path, timer_path = _systemd_paths(systemd_dir)
-    with _locked_directory(service_path.parent, backend, False) as directory_fd:
+    with _locked_directory(service_path.parent, False) as directory_fd:
         if directory_fd is None:
             return ScheduleStatus(False, None, backend, timer_path)
         snapshot = _snapshot_files(directory_fd, [SYSTEMD_SERVICE, SYSTEMD_TIMER])
@@ -545,7 +533,7 @@ def remove_schedule(
     backend = _backend(platform)
     if backend == "launchd":
         path = _launchd_path(agents_dir)
-        with _locked_directory(path.parent, backend, True) as directory_fd:
+        with _locked_directory(path.parent, True) as directory_fd:
             assert directory_fd is not None
             previous = _read_definition(directory_fd, path.name)
             if previous is None:
@@ -556,7 +544,7 @@ def remove_schedule(
             return True
 
     service_path, timer_path = _systemd_paths(systemd_dir)
-    with _locked_directory(service_path.parent, backend, True) as directory_fd:
+    with _locked_directory(service_path.parent, True) as directory_fd:
         assert directory_fd is not None
         previous = _snapshot_files(directory_fd, [SYSTEMD_SERVICE, SYSTEMD_TIMER])
         previous_state = _systemd_state(runner)

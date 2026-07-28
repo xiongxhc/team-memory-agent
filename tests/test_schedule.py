@@ -4,11 +4,13 @@ import plistlib
 import queue
 import stat
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
 import pytest
 
+import teammem.schedule as schedule_module
 from teammem.config import Config
 from teammem.schedule import (
     LABEL,
@@ -218,10 +220,7 @@ def test_launchd_loaded_job_is_booted_out_before_atomic_replacement(tmp_path):
         agents_dir=agents_dir,
         runner=RecordingRunner(),
     ).time == "07:05"
-    assert sorted(item.name for item in agents_dir.iterdir()) == [
-        ".teammem-launchd.lock",
-        path.name,
-    ]
+    assert sorted(item.name for item in agents_dir.iterdir()) == [path.name]
 
 
 def test_launchd_replacement_failure_preserves_loaded_definition(tmp_path):
@@ -388,7 +387,6 @@ def test_systemd_timer_is_persistent_and_uses_local_1820(tmp_path):
         True,
     ]
     assert sorted(item.name for item in systemd_dir.iterdir()) == [
-        ".teammem-systemd.lock",
         "teammem-daily.service",
         "teammem-daily.timer",
     ]
@@ -642,6 +640,52 @@ def test_missing_schedule_status_is_backend_specific(tmp_path):
     assert systemd.path.name == "teammem-daily.timer"
 
 
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_status_on_existing_empty_directory_creates_no_artifact(
+    tmp_path, platform
+):
+    directory = tmp_path / platform
+    directory.mkdir()
+
+    status = schedule_status(
+        platform=platform,
+        agents_dir=directory,
+        systemd_dir=directory,
+        runner=RecordingRunner(),
+    )
+
+    assert status.installed is False
+    assert list(directory.iterdir()) == []
+
+
+def test_backend_directory_lock_blocks_a_separate_process(tmp_path):
+    directory = tmp_path / "schedule"
+    directory.mkdir()
+    probe = """
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("blocked")
+else:
+    print("acquired")
+finally:
+    os.close(fd)
+"""
+
+    with schedule_module._locked_directory(directory, True):
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(directory)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    assert result.stdout == "blocked\n"
+    assert list(directory.iterdir()) == []
+
+
 def test_complete_launchd_definition_reports_time_but_not_installed_when_unloaded(
     tmp_path,
 ):
@@ -853,42 +897,58 @@ def test_schedule_operations_reject_symlinked_definitions(
     assert runner.calls == []
 
 
-def test_systemd_status_cannot_substitute_bytes_after_path_validation(
+def test_systemd_status_pins_bytes_when_path_swaps_after_descriptor_open(
     tmp_path, monkeypatch
 ):
     systemd_dir, _, timer = _installed_systemd(tmp_path)
     outside = tmp_path / "outside.timer"
     outside.write_text(timer.read_text().replace("18:20", "23:59"))
     original = timer.with_suffix(".original")
-    real_lstat = Path.lstat
     real_open = os.open
     swapped = False
     opens = {}
 
-    def swap_after_lstat(path):
+    def swap_after_open(path, flags, *args, **kwargs):
         nonlocal swapped
-        result = real_lstat(path)
-        if path == timer and not swapped:
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if path == "teammem-daily.timer" and not swapped:
             swapped = True
             timer.rename(original)
             timer.symlink_to(outside)
-        return result
-
-    def count_opens(path, flags, *args, **kwargs):
         if path in {"teammem-daily.service", "teammem-daily.timer"}:
             opens[path] = opens.get(path, 0) + 1
-        return real_open(path, flags, *args, **kwargs)
+        return descriptor
 
-    monkeypatch.setattr(Path, "lstat", swap_after_lstat)
-    monkeypatch.setattr("teammem.schedule.os.open", count_opens)
+    outside_bytes = outside.read_bytes()
+    outside_mode = stat.S_IMODE(outside.stat().st_mode)
+    monkeypatch.setattr("teammem.schedule.os.open", swap_after_open)
     runner = RecordingRunner(_manager_returncodes(True, True))
     status = schedule_status(
         platform="linux", systemd_dir=systemd_dir, runner=runner
     )
 
     assert status.time == "18:20"
+    assert swapped is True
     assert opens == {"teammem-daily.service": 1, "teammem-daily.timer": 1}
-    assert outside.read_text().endswith("WantedBy=timers.target\n")
+    assert outside.read_bytes() == outside_bytes
+    assert stat.S_IMODE(outside.stat().st_mode) == outside_mode
+
+
+def test_definition_modes_are_independent_of_restrictive_umask(tmp_path):
+    systemd_dir = tmp_path / "systemd" / "user"
+    systemd_dir.mkdir(parents=True)
+    previous_umask = os.umask(0o777)
+    try:
+        _install_systemd(tmp_path, systemd_dir, RecordingRunner())
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(
+        (systemd_dir / "teammem-daily.service").stat().st_mode
+    ) == 0o600
+    assert stat.S_IMODE(
+        (systemd_dir / "teammem-daily.timer").stat().st_mode
+    ) == 0o600
 
 
 def test_atomic_write_never_chmods_a_replaced_definition_path(
