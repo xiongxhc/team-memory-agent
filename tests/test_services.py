@@ -1,4 +1,5 @@
 import json
+import subprocess
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -151,3 +152,34 @@ def test_collect_connector_returns_provider_warnings(tmp_path):
     assert result.fetched == 1
     assert result.inserted == 1
     assert result.warnings == ("history may be incomplete",)
+
+
+def test_render_push_warning_keeps_sanitized_final_git_stderr_line(
+    tmp_path, monkeypatch, capsys
+):
+    cfg = _cfg(tmp_path, TEAMMEM_GITHUB_TOKEN="secret-token")
+    _seed(cfg)
+
+    def fail_push(_path):
+        raise subprocess.CalledProcessError(
+            128,
+            ["git", "push"],
+            stderr="remote: authentication rejected\n"
+            "fatal: push failed for secret-token",
+        )
+
+    monkeypatch.setattr("teammem.services.push", fail_push)
+
+    assert run_render(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        today=date(2026, 7, 16),
+        push_requested=True,
+    ) == 0
+
+    captured = capsys.readouterr()
+    assert (
+        "WARN: vault push failed (fatal: push failed for [REDACTED]); "
+        "commits retained for next push"
+    ) in captured.err
+    assert "secret-token" not in captured.out + captured.err

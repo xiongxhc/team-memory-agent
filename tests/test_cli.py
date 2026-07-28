@@ -228,8 +228,8 @@ def test_journal_live_generates_then_hits_cache(tmp_path, monkeypatch, capsys):
             return "Alex fixed the JWT race."
         return llm
 
-    import teammem.cli as cli_mod
-    monkeypatch.setattr(cli_mod, "http_llm", fake_http_llm)
+    import teammem.services as services_mod
+    monkeypatch.setattr(services_mod, "http_llm", fake_http_llm)
     assert main(["journal", "--today", "2026-07-16"]) == 0
     assert "1 generated" in capsys.readouterr().out and calls == ["daily-summary-model"]
     assert main(["journal", "--today", "2026-07-16"]) == 0   # rerun: all cached
@@ -261,8 +261,8 @@ def test_report_generates_from_cached_dailies(tmp_path, monkeypatch, capsys):
             return "## Shipped\n- X"
         return llm
 
-    import teammem.cli as cli_mod
-    monkeypatch.setattr(cli_mod, "http_llm", fake_http_llm)
+    import teammem.services as services_mod
+    monkeypatch.setattr(services_mod, "http_llm", fake_http_llm)
     assert main(["report", "--week-of", "2026-07-14"]) == 0
     assert calls == ["weekly-summary-model"]
     assert "report: generated" in capsys.readouterr().out
@@ -346,7 +346,7 @@ def test_main_docs_sync_copies_docs(tmp_path, monkeypatch, capsys):
     assert out.read_text() == "# arch\n"
 
 
-def test_connectors_list_is_static_and_needs_no_credentials(monkeypatch, capsys):
+def test_connectors_list_reports_disabled_without_credentials(monkeypatch, capsys):
     for name in (
         "TEAMMEM_GITHUB_TOKEN",
         "TEAMMEM_GITLAB_TOKEN",
@@ -355,15 +355,53 @@ def test_connectors_list_is_static_and_needs_no_credentials(monkeypatch, capsys)
         "TEAMMEM_DISCORD_BOT_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
 
     assert main(["connectors", "list"]) == 0
     assert capsys.readouterr().out.splitlines() == [
-        "discord",
-        "feishu",
-        "github",
-        "gitlab",
-        "slack",
+        "discord: disabled",
+        "feishu: disabled",
+        "github: disabled",
+        "gitlab: disabled",
+        "slack: disabled",
     ]
+
+
+def test_connectors_list_reports_enabled_ok_and_missing_without_values(
+    tmp_path, monkeypatch, capsys
+):
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  github:\n    enabled: true\n"
+        "  slack:\n    enabled: true\n"
+    )
+    secret = "secret-value-that-must-not-print"
+    for name in (
+        "TEAMMEM_GITLAB_URL",
+        "TEAMMEM_GITLAB_TOKEN",
+        "TEAMMEM_GITLAB_GROUP",
+        "TEAMMEM_SLACK_BOT_TOKEN",
+        "TEAMMEM_FEISHU_APP_ID",
+        "TEAMMEM_FEISHU_APP_SECRET",
+        "TEAMMEM_DISCORD_BOT_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(config))
+    monkeypatch.setenv("TEAMMEM_GITHUB_TOKEN", secret)
+
+    assert main(["connectors", "list"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.splitlines() == [
+        "discord: disabled",
+        "feishu: disabled",
+        "github: enabled/ok",
+        "gitlab: disabled",
+        "slack: enabled/missing TEAMMEM_SLACK_BOT_TOKEN",
+    ]
+    assert secret not in captured.out
 
 
 def test_connectors_check_reports_variable_names_not_values(
@@ -477,3 +515,54 @@ def test_run_daily_prints_step_warnings_and_returns_result_exit_code(
     assert "discord: ok" in captured.out
     assert "WARN discord: MESSAGE_CONTENT may be disabled" in captured.err
     assert "render: failed" in captured.err
+
+
+def test_run_daily_passes_a_local_aware_clock(tmp_path, monkeypatch):
+    from datetime import timedelta
+    from teammem.daily import DailyResult
+
+    local_now = datetime(
+        2026, 7, 17, 18, 20, tzinfo=timezone(timedelta(hours=-7))
+    )
+
+    class FixedLocalClock:
+        def astimezone(self):
+            return local_now
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is None
+            return FixedLocalClock()
+
+    seen = {}
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    monkeypatch.setattr("teammem.cli.datetime", FixedDateTime)
+    monkeypatch.setattr(
+        "teammem.cli.run_daily",
+        lambda cfg, ids, settings, now: seen.setdefault("now", now)
+        and DailyResult(steps=(), exit_code=0),
+    )
+
+    assert main(["run-daily"]) == 0
+    assert seen["now"].utcoffset() == timedelta(hours=-7)
+    assert (seen["now"].date(), seen["now"].hour) == (local_now.date(), 18)
+
+
+def test_cli_journal_uses_shared_llm_backend_resolver(
+    tmp_path, monkeypatch, capsys
+):
+    _journal_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    import teammem.cli as cli_mod
+
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_llm_backend",
+        lambda cfg, model, max_tokens: (
+            lambda system, user: "- **project-alpha** — fixed"
+        ),
+    )
+
+    assert main(["journal", "--today", "2026-07-16"]) == 0
+    assert "1 generated" in capsys.readouterr().out
