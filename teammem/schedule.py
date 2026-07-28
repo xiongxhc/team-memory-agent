@@ -391,7 +391,21 @@ def _parse_launchd(definition: bytes | None) -> tuple[bool, str | None]:
         return False, None
     try:
         data = plistlib.loads(definition)
+        if not isinstance(data, dict):
+            return False, None
+        expected_keys = {
+            "Label",
+            "ProgramArguments",
+            "RunAtLoad",
+            "StandardErrorPath",
+            "StandardOutPath",
+            "StartCalendarInterval",
+        }
+        if set(data) != expected_keys:
+            return False, None
         interval = data["StartCalendarInterval"]
+        if not isinstance(interval, dict) or set(interval) != {"Hour", "Minute"}:
+            return False, None
         hour = interval["Hour"]
         minute = interval["Minute"]
         if (
@@ -410,12 +424,16 @@ def _parse_launchd(definition: bytes | None) -> tuple[bool, str | None]:
             and len(arguments) == 4
             and isinstance(arguments[0], str)
             and bool(arguments[0])
+            and Path(arguments[0]).is_absolute()
             and arguments[1] == "--env-file"
             and isinstance(arguments[2], str)
             and bool(arguments[2])
+            and Path(arguments[2]).is_absolute()
             and arguments[3] == "run-daily"
-            and isinstance(data["StandardOutPath"], str)
-            and isinstance(data["StandardErrorPath"], str)
+            and data["StandardOutPath"]
+            == str(Path.home() / ".local" / "state" / "teammem" / "schedule.log")
+            and data["StandardErrorPath"]
+            == str(Path.home() / ".local" / "state" / "teammem" / "schedule.err")
         )
         return valid, time
     except (KeyError, TypeError, ValueError):
@@ -424,15 +442,14 @@ def _parse_launchd(definition: bytes | None) -> tuple[bool, str | None]:
 
 def _parse_unit(
     definition: bytes | None,
-) -> tuple[set[str], dict[str, list[tuple[str, str]]]] | None:
+) -> dict[str, dict[str, str]] | None:
     if definition is None:
         return None
     try:
         text = definition.decode()
     except UnicodeDecodeError:
         return None
-    sections: set[str] = set()
-    directives: dict[str, list[tuple[str, str]]] = {}
+    sections: dict[str, dict[str, str]] = {}
     current: str | None = None
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -440,24 +457,17 @@ def _parse_unit(
             continue
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1]
-            sections.add(current)
+            if not current or current in sections:
+                return None
+            sections[current] = {}
             continue
         if current is None or "=" not in line:
             return None
         key, value = line.split("=", 1)
-        directives.setdefault(key, []).append((current, value))
-    return sections, directives
-
-
-def _unit_value(
-    unit: tuple[set[str], dict[str, list[tuple[str, str]]]] | None,
-    section: str,
-    key: str,
-) -> str | None:
-    if unit is None:
-        return None
-    values = unit[1].get(key, [])
-    return values[0][1] if len(values) == 1 and values[0][0] == section else None
+        if not key or key in sections[current]:
+            return None
+        sections[current][key] = value
+    return sections
 
 
 def _parse_systemd(
@@ -465,7 +475,7 @@ def _parse_systemd(
 ) -> tuple[bool, str | None]:
     service = _parse_unit(service_definition)
     timer = _parse_unit(timer_definition)
-    calendar = _unit_value(timer, "Timer", "OnCalendar")
+    calendar = timer.get("Timer", {}).get("OnCalendar") if timer else None
     match = re.fullmatch(
         r"\*-\*-\* ([0-9]{2}):([0-9]{2}):00", calendar or ""
     )
@@ -474,26 +484,35 @@ def _parse_systemd(
         hour, minute = (int(part) for part in match.groups())
         if hour <= 23 and minute <= 59:
             time = f"{hour:02d}:{minute:02d}"
-    command = _unit_value(service, "Service", "ExecStart")
+    command = service.get("Service", {}).get("ExecStart") if service else None
     try:
         arguments = shlex.split(command) if command is not None else []
     except ValueError:
         arguments = []
+    expected_service = {
+        "Unit": {"Description": "Run Team Memory Agent daily workflow"},
+        "Service": {"Type": "oneshot", "ExecStart": command},
+    }
+    expected_timer = {
+        "Unit": {"Description": "Run Team Memory Agent daily"},
+        "Timer": {
+            "OnCalendar": calendar,
+            "Persistent": "true",
+            "Unit": SYSTEMD_SERVICE,
+        },
+        "Install": {"WantedBy": "timers.target"},
+    }
     valid = (
-        service is not None
-        and timer is not None
-        and "Unit" in service[0]
-        and "Unit" in timer[0]
-        and _unit_value(service, "Service", "Type") == "oneshot"
+        service == expected_service
+        and timer == expected_timer
         and len(arguments) == 4
         and bool(arguments[0])
+        and Path(arguments[0]).is_absolute()
         and arguments[1] == "--env-file"
         and bool(arguments[2])
+        and Path(arguments[2]).is_absolute()
         and arguments[3] == "run-daily"
         and time is not None
-        and _unit_value(timer, "Timer", "Persistent") == "true"
-        and _unit_value(timer, "Timer", "Unit") == SYSTEMD_SERVICE
-        and _unit_value(timer, "Install", "WantedBy") == "timers.target"
     )
     return valid, time
 
@@ -540,11 +559,35 @@ def remove_schedule(
         with _locked_directory(path.parent, True) as directory_fd:
             assert directory_fd is not None
             previous = _read_definition(directory_fd, path.name)
+            was_loaded = _launchd_loaded(runner)
             if previous is None:
-                return False
-            if _launchd_loaded(runner):
+                if not was_loaded:
+                    return False
                 _launchctl(runner, "bootout", _launchd_target(), check=True)
-            _unlink_durable(directory_fd, path.name)
+                return True
+            try:
+                if was_loaded:
+                    _launchctl(runner, "bootout", _launchd_target(), check=True)
+                _unlink_durable(directory_fd, path.name)
+            except Exception as failure:
+                try:
+                    _write_atomic(directory_fd, path.name, previous)
+                    if was_loaded:
+                        _launchctl(
+                            runner,
+                            "bootstrap",
+                            _launchd_domain(),
+                            str(path),
+                            check=True,
+                        )
+                except Exception as rollback_failure:
+                    rollback_failure.__context__ = failure
+                    raise RuntimeError(
+                        "launchd schedule removal failed and rollback failed"
+                    ) from rollback_failure
+                raise RuntimeError(
+                    "launchd schedule removal failed; previous state restored"
+                ) from failure
             return True
 
     service_path, timer_path = _systemd_paths(systemd_dir)
