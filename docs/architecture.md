@@ -14,7 +14,8 @@ MemberKit -> reviewed v1 bundle -> inbox importer
 
 The hub and MemberKit solve different parts of the data boundary:
 
-- `teammem` runs on an operator-controlled, normally available machine. It polls
+- `teammem` runs on an always-on, operator-controlled Mac mini, Linux server, or
+  VPS. It polls
   explicitly enabled central providers, imports reviewed bundles, owns the
   ledger, and regenerates shared views.
 - `teammem-memberkit` runs on each participating member's workstation. It drafts
@@ -67,7 +68,8 @@ empty history carries a warning because it can mean missing
 
 Feishu remains a first-class official adapter. The existing private deployment
 continues to use Feishu and is not reconfigured, migrated, or replaced by the
-GitHub + Slack public quick start.
+GitHub + Slack public quick start. Public Slack remains an optional,
+top-level-message-only adapter.
 
 ## Ledger and importer
 
@@ -109,10 +111,19 @@ but deterministic rendering may continue from ledger evidence and cached
 summaries. The command prints one result per stage and exits non-zero when a
 configured connector or required stage fails.
 
-The package does not yet provide hub schedule installation. An operator can run
-the command manually or invoke the run-once command from an independently managed
-trusted scheduler. Explicit built-in hub schedule management belongs to the
-separate operator-scheduling work.
+Hub scheduling is a separate, explicit lifecycle around the one-shot command.
+`teammem schedule install --time 18:20` writes a macOS user LaunchAgent or Linux
+systemd user service/timer and enables it; `schedule status` inspects it and
+`schedule remove` disables and removes it. Package installation and every other
+CLI command leave scheduler state unchanged.
+
+The scheduled process is exactly the resolved executable plus `--env-file`, the
+private environment-file path, and `run-daily`. Credential values are not copied
+into scheduler definitions. The default calendar time is 18:20 in the host's
+local timezone. The scheduler provides process activation only: it does not
+pull the private MemberKit Git inbox or produce a disposable export. When bundle
+paths are configured, the operator refreshes that staging export separately
+before the run or omits the paths.
 
 ## Unsupported-source fallback
 

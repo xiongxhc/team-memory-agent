@@ -118,10 +118,9 @@ for upgrades, troubleshooting, files created locally, and safe removal.
 
 ## Hub quick start
 
-The hub runs on an operator-controlled, normally available machine: an always-on
-Mac mini, a Linux server, or a VPS. It collects central sources, imports reviewed
-MemberKit bundles, owns the SQLite ledger, and renders the shared Markdown views.
-Members do not install it.
+The hub runs on an always-on, operator-controlled Mac mini, Linux server, or VPS.
+It collects central sources, imports reviewed MemberKit bundles, owns the SQLite
+ledger, and renders the shared Markdown views. Members do not install it.
 
 The public quick start uses GitHub and Slack. GitLab, Feishu, and Discord are
 equally supported built-in options. Every network connector is disabled by
@@ -129,14 +128,16 @@ default; package installation makes no provider request and creates no schedule.
 
 ### 1. Install the connector-capable source checkout
 
-The five-connector hub is version 0.2.0. Until that release is published, use a
-reviewed source checkout:
+The five-connector hub is version 0.2.0. That connector-capable release is not
+yet published on PyPI, so the current pre-release path is a reviewed source
+checkout:
 
 ```bash
 git clone https://github.com/xiongxhc/team-memory-agent.git
 cd team-memory-agent
 python3 -m venv .venv
 .venv/bin/pip install -e .
+source .venv/bin/activate
 mkdir -p ~/.config/teammem
 chmod 700 ~/.config/teammem
 cp config/roster.example.yaml ~/.config/teammem/roster.yaml
@@ -144,10 +145,11 @@ cp config/projects.example.yaml ~/.config/teammem/projects.yaml
 cp config/connectors.example.yaml ~/.config/teammem/connectors.yaml
 touch ~/.config/teammem/hub.env
 chmod 600 ~/.config/teammem/hub.env
+$EDITOR ~/.config/teammem/hub.env
 ```
 
-Requires Python 3.11 or newer and Git. The commands below use
-`.venv/bin/teammem`.
+Requires Python 3.11 or newer and Git. Keep the virtual environment activated
+for the commands below, including schedule installation.
 
 ### 2. Configure GitHub and Slack
 
@@ -200,21 +202,34 @@ These two commands inspect local configuration only; they do not authenticate or
 make network requests:
 
 ```bash
-.venv/bin/teammem connectors list
-.venv/bin/teammem connectors check
+teammem connectors list
+teammem connectors check
 ```
 
 Then perform one operator-observed run:
 
 ```bash
-.venv/bin/teammem run-daily
+teammem run-daily
 ```
 
 `teammem run-daily` executes one idempotent run on the operator machine and
 returns a per-step result. It does not remain resident and does not create,
-change, or remove a schedule. Hub schedule installation belongs to a later
-operator-scheduling release; package installation alone never schedules this
-command.
+change, or remove a schedule. Package installation alone never creates a
+background job.
+
+Only after the observed run succeeds, explicitly install the daily job. The
+default and example below are 18:20 in the operator machine's local timezone:
+
+```bash
+teammem schedule install --time 18:20
+teammem schedule status
+```
+
+The built-in schedule invokes only `teammem run-daily`; it does not pull or
+export a private MemberKit inbox. See the
+[deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md)
+for macOS/Linux paths, logs, missed-run behavior, safe inbox staging, upgrades,
+and removal.
 
 ### What the built-in connectors can see
 
@@ -235,8 +250,8 @@ return empty content or history when `READ_MESSAGE_HISTORY` or
 `MESSAGE_CONTENT` access is missing.
 
 Feishu remains a first-class official connector. The existing private deployment
-continues to use Feishu unchanged; the GitHub + Slack public path is an additional
-configuration, not a migration or replacement.
+continues to use Feishu unchanged. Public Slack is an optional,
+top-level-message-only connector, not a migration or replacement.
 
 ### Reviewed bundle inbox
 
@@ -249,22 +264,34 @@ for the safe export and `run-daily` workflow.
 
 ### Published-package path after release
 
-Once a connector-capable release is confirmed on the package index, install it
-with an explicit minimum version:
+After a connector-capable release is confirmed on PyPI, the package path will
+be:
 
 ```bash
 pipx install 'teammem>=0.2.0'
 ```
 
-Then use `teammem ...` in place of `.venv/bin/teammem ...`. Upgrade or uninstall
-an installed 0.2.0-or-newer package with `pipx upgrade teammem` or
-`pipx uninstall teammem`. Uninstalling the command does not remove
-operator-owned configuration or runtime data.
+Do not use that command as evidence that 0.2.0 is already published. For a
+scheduled package installation, remove the schedule before upgrading, test one
+manual run, and explicitly reinstall it:
+
+```bash
+teammem schedule remove
+pipx upgrade teammem
+teammem connectors check
+teammem run-daily
+teammem schedule install --time 18:20
+```
+
+Run `teammem schedule remove` before `pipx uninstall teammem`. Uninstalling the
+command does not remove operator-owned configuration or runtime data.
 
 To upgrade a source checkout, review the target
-revision, update the checkout with `git pull --ff-only`, then run
-`.venv/bin/pip install --upgrade -e .`. To uninstall the checkout installation,
-run `.venv/bin/pip uninstall teammem`; preserve runtime data outside the checkout
+revision, first run `teammem schedule remove`, update with
+`git pull --ff-only`, reinstall with `.venv/bin/pip install --upgrade -e .`,
+reactivate the environment, check connectors, perform one manual `run-daily`,
+and explicitly reinstall the schedule. Remove the schedule before
+`.venv/bin/pip uninstall teammem`; preserve runtime data outside the checkout
 before deleting the virtual environment or checkout.
 
 LLM-backed synthesis is optional. Without a configured backend, journal and
