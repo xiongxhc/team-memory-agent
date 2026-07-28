@@ -6,6 +6,27 @@ import pytest
 
 
 SCANNER = Path(__file__).parents[1] / "scripts" / "check-public.sh"
+OPERATOR_DOCS = (
+    "README.md",
+    "docs/deployment.md",
+    "docs/architecture.md",
+    "docs/privacy.md",
+)
+STALE_SCHEDULE_CLAIMS = (
+    "The package has no built-in schedule.",
+    "The hub has no schedule installation.",
+    "TeamMem does not provide hub scheduling.",
+    "Built-in hub schedule installation will come later.",
+    "Hub schedule installation belongs to an external scheduler.",
+)
+LEGITIMATE_SCHEDULE_BOUNDARIES = (
+    "Package installation alone creates no schedule.",
+    "run-daily does not install a schedule.",
+    (
+        "On a network home, use an external scheduler to invoke "
+        "teammem --env-file /absolute/path/to/hub.env run-daily."
+    ),
+)
 
 
 def _tracked_repo(tmp_path, name, content):
@@ -124,21 +145,21 @@ def test_public_scan_ignores_obsolete_schedule_claim_in_historical_plan(
 
 @pytest.mark.parametrize(
     "operator_doc",
-    [
-        "README.md",
-        "docs/deployment.md",
-        "docs/architecture.md",
-        "docs/privacy.md",
-    ],
+    OPERATOR_DOCS,
+)
+@pytest.mark.parametrize(
+    "claim",
+    STALE_SCHEDULE_CLAIMS,
 )
 def test_public_scan_rejects_obsolete_schedule_claim_in_operator_docs(
     tmp_path,
     operator_doc,
+    claim,
 ):
     _tracked_repo(
         tmp_path,
         operator_doc,
-        "The package does not yet provide hub schedule installation.\n",
+        f"{claim}\n",
     )
 
     result = subprocess.run(
@@ -150,6 +171,31 @@ def test_public_scan_rejects_obsolete_schedule_claim_in_operator_docs(
 
     assert result.returncode == 1
     assert "obsolete hub-scheduling claim found" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "operator_doc",
+    OPERATOR_DOCS,
+)
+@pytest.mark.parametrize(
+    "boundary",
+    LEGITIMATE_SCHEDULE_BOUNDARIES,
+)
+def test_public_scan_allows_legitimate_schedule_boundary_in_operator_docs(
+    tmp_path,
+    operator_doc,
+    boundary,
+):
+    _tracked_repo(tmp_path, operator_doc, f"{boundary}\n")
+
+    result = subprocess.run(
+        [str(SCANNER)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(
