@@ -951,6 +951,39 @@ def test_definition_modes_are_independent_of_restrictive_umask(tmp_path):
     ) == 0o600
 
 
+def test_atomic_write_closes_temporary_descriptor_when_fchmod_fails(
+    tmp_path, monkeypatch
+):
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    real_open = os.open
+    temporary_descriptors = []
+
+    def record_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if str(path).startswith(".teammem-daily.timer."):
+            temporary_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(schedule_module.os, "open", record_open)
+    monkeypatch.setattr(
+        schedule_module.os,
+        "fchmod",
+        lambda descriptor, mode: (_ for _ in ()).throw(OSError("fchmod failed")),
+    )
+    try:
+        with pytest.raises(OSError, match="fchmod failed"):
+            schedule_module._write_atomic(
+                directory_fd, "teammem-daily.timer", b"timer"
+            )
+        assert len(temporary_descriptors) == 1
+        with pytest.raises(OSError) as error:
+            os.fstat(temporary_descriptors[0])
+        assert error.value.errno == 9
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        os.close(directory_fd)
+
+
 def test_atomic_write_never_chmods_a_replaced_definition_path(
     tmp_path, monkeypatch
 ):

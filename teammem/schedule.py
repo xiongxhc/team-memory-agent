@@ -171,7 +171,11 @@ def _write_atomic(directory_fd: int, name: str, data: bytes) -> None:
             temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_FLAGS,
             0o600, dir_fd=directory_fd
         )
-        os.fchmod(descriptor, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+        except Exception:
+            os.close(descriptor)
+            raise
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
             handle.flush()
