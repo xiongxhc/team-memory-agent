@@ -1,11 +1,15 @@
 import json
 import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import teammem.cli as cli_module
+import teammem.config as config_module
 from teammem.cli import main, run_collect
 from teammem.config import Config
 from teammem.gitlab_collector import collect_gitlab
@@ -613,19 +617,21 @@ def test_global_env_file_is_loaded_before_run_daily_and_process_env_wins(
 
 
 @pytest.mark.parametrize("mode", [0o400, 0o640])
-def test_global_env_file_requires_exact_0600_mode(tmp_path, mode):
+def test_global_env_file_requires_exact_0600_mode(tmp_path, mode, capsys):
     env_file = tmp_path / "hub.env"
     env_file.write_text("TEAMMEM_GITHUB_TOKEN=secret-must-not-print\n")
     env_file.chmod(mode)
 
-    with pytest.raises(ValueError, match="exactly 0600") as error:
-        main(["--env-file", str(env_file), "connectors", "list"])
+    assert main(["--env-file", str(env_file), "connectors", "list"]) == 2
 
-    assert "secret-must-not-print" not in str(error.value)
+    captured = capsys.readouterr()
+    assert "exactly 0600" in captured.err
+    assert "secret-must-not-print" not in captured.out + captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_global_env_file_rejects_symlink_without_reading_target(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     target = tmp_path / "target.env"
     target.write_text("TEAMMEM_CONFIG_DIR=/must-not-load\n")
@@ -634,30 +640,80 @@ def test_global_env_file_rejects_symlink_without_reading_target(
     env_file.symlink_to(target)
     monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
 
-    with pytest.raises(ValueError, match="non-symlink"):
-        main(["--env-file", str(env_file), "connectors", "list"])
+    assert main(["--env-file", str(env_file), "connectors", "list"]) == 2
+    captured = capsys.readouterr()
+    assert "non-symlink" in captured.err
+    assert "Traceback" not in captured.err
 
 
-def test_global_env_file_requires_a_regular_file(tmp_path):
+def test_global_env_file_requires_a_regular_file(tmp_path, capsys):
     env_file = tmp_path / "hub.env"
     env_file.mkdir()
     env_file.chmod(0o600)
 
-    with pytest.raises(ValueError, match="regular"):
-        main(["--env-file", str(env_file), "connectors", "list"])
+    assert main(["--env-file", str(env_file), "connectors", "list"]) == 2
+    captured = capsys.readouterr()
+    assert "regular" in captured.err
+    assert "Traceback" not in captured.err
 
 
-def test_global_env_file_requires_current_user_ownership(tmp_path, monkeypatch):
+def test_global_env_file_requires_current_user_ownership(
+    tmp_path, monkeypatch, capsys
+):
     env_file = tmp_path / "hub.env"
     env_file.write_text("TEAMMEM_GITHUB_TOKEN=secret-must-not-print\n")
     env_file.chmod(0o600)
     different_uid = os.getuid() + 1
     monkeypatch.setattr("teammem.config.os.getuid", lambda: different_uid)
 
-    with pytest.raises(ValueError, match="user-owned") as error:
-        main(["--env-file", str(env_file), "connectors", "list"])
+    assert main(["--env-file", str(env_file), "connectors", "list"]) == 2
 
-    assert "secret-must-not-print" not in str(error.value)
+    captured = capsys.readouterr()
+    assert "user-owned" in captured.err
+    assert "secret-must-not-print" not in captured.out + captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_env_file_open_without_o_nofollow_keeps_descriptor_identity_checks(
+    tmp_path, monkeypatch
+):
+    env_file = tmp_path / "hub.env"
+    env_file.write_text("TEAMMEM_SINCE_DAYS=11\n")
+    env_file.chmod(0o600)
+    monkeypatch.delattr(config_module.os, "O_NOFOLLOW")
+
+    cfg = Config.load(env={}, env_file=env_file)
+
+    assert cfg.since_days == 11
+
+
+def test_env_file_rejects_substitution_between_lstat_and_open(
+    tmp_path, monkeypatch
+):
+    env_file = tmp_path / "hub.env"
+    env_file.write_text("TEAMMEM_SINCE_DAYS=11\n")
+    env_file.chmod(0o600)
+    replacement = tmp_path / "replacement.env"
+    replacement.write_text("TEAMMEM_SINCE_DAYS=22\n")
+    replacement.chmod(0o600)
+    original = tmp_path / "original.env"
+    real_open = os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == env_file and not swapped:
+            swapped = True
+            env_file.rename(original)
+            replacement.rename(env_file)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(config_module.os, "open", swap_before_open)
+
+    with pytest.raises(ValueError, match="changed during validation"):
+        Config.load(env={}, env_file=env_file)
+
+    assert swapped is True
 
 
 @pytest.mark.parametrize(
@@ -673,12 +729,11 @@ def test_non_schedule_commands_never_install_a_schedule(
 ):
     from teammem.daily import DailyResult
 
-    calls = []
     monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
     monkeypatch.setattr(
         cli_module,
-        "install_schedule",
-        lambda *args, **kwargs: calls.append((args, kwargs)),
+        "_schedule_api",
+        lambda: pytest.fail("non-schedule commands must not load scheduling"),
         raising=False,
     )
     monkeypatch.setattr(
@@ -688,15 +743,13 @@ def test_non_schedule_commands_never_install_a_schedule(
     )
 
     assert main(["--env-file", str(tmp_path / "missing.env"), *argv]) == 0
-    assert calls == []
 
 
 def test_help_never_loads_config_or_installs_a_schedule(monkeypatch):
-    calls = []
     monkeypatch.setattr(
         cli_module,
-        "install_schedule",
-        lambda *args, **kwargs: calls.append((args, kwargs)),
+        "_schedule_api",
+        lambda: pytest.fail("help must not load scheduling"),
         raising=False,
     )
     monkeypatch.setattr(
@@ -708,27 +761,31 @@ def test_help_never_loads_config_or_installs_a_schedule(monkeypatch):
     with pytest.raises(SystemExit, match="0"):
         main(["--help"])
 
-    assert calls == []
-
 
 def test_schedule_install_defaults_to_1820_and_prints_backend_path_time(
     tmp_path, monkeypatch, capsys
 ):
+    env_file = tmp_path / "hub.env"
+    env_file.write_text("# configured\n")
+    env_file.chmod(0o600)
     seen = []
     monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+    schedule_api = SimpleNamespace(
+        install_schedule=lambda cfg, time: seen.append((cfg.env_file, time))
+        or Path("/tmp/operator.plist")
+    )
     monkeypatch.setattr(
         cli_module,
-        "install_schedule",
-        lambda cfg, time: seen.append((cfg.env_file, time))
-        or Path("/tmp/operator.plist"),
+        "_schedule_api",
+        lambda: schedule_api,
         raising=False,
     )
 
     assert main([
-        "--env-file", str(tmp_path / "missing.env"), "schedule", "install"
+        "--env-file", str(env_file), "schedule", "install"
     ]) == 0
 
-    assert seen == [(tmp_path / "missing.env", "18:20")]
+    assert seen == [(env_file, "18:20")]
     assert capsys.readouterr().out == (
         "installed: backend=launchd path=/tmp/operator.plist time=18:20\n"
     )
@@ -743,8 +800,9 @@ def test_schedule_status_prints_exact_backend_path_and_time(
         backend="systemd",
         path=Path("/tmp/teammem-daily.timer"),
     )
+    schedule_api = SimpleNamespace(schedule_status=lambda: status)
     monkeypatch.setattr(
-        cli_module, "schedule_status", lambda: status, raising=False
+        cli_module, "_schedule_api", lambda: schedule_api, raising=False
     )
 
     assert main([
@@ -758,8 +816,9 @@ def test_schedule_status_prints_exact_backend_path_and_time(
 def test_schedule_remove_is_idempotent_and_reports_absence(
     tmp_path, monkeypatch, capsys
 ):
+    schedule_api = SimpleNamespace(remove_schedule=lambda: False)
     monkeypatch.setattr(
-        cli_module, "remove_schedule", lambda: False, raising=False
+        cli_module, "_schedule_api", lambda: schedule_api, raising=False
     )
 
     assert main([
@@ -772,6 +831,12 @@ def test_schedule_unsupported_platform_returns_2_with_direct_message(
     tmp_path, monkeypatch, capsys
 ):
     monkeypatch.setattr(cli_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        cli_module,
+        "_schedule_api",
+        lambda: pytest.fail("unsupported platforms must not import scheduling"),
+        raising=False,
+    )
 
     assert main([
         "--env-file", str(tmp_path / "missing.env"), "schedule", "status"
@@ -779,3 +844,151 @@ def test_schedule_unsupported_platform_returns_2_with_direct_message(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "unsupported scheduling platform: win32\n"
+
+
+def test_schedule_install_requires_existing_valid_env_before_loading_scheduler(
+    tmp_path, monkeypatch, capsys
+):
+    scheduler_loads = []
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        cli_module,
+        "_schedule_api",
+        lambda: scheduler_loads.append(1),
+        raising=False,
+    )
+
+    assert main([
+        "--env-file", str(tmp_path / "missing.env"), "schedule", "install"
+    ]) == 2
+
+    captured = capsys.readouterr()
+    assert scheduler_loads == []
+    assert "environment file does not exist" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("command", ["status", "remove"])
+def test_schedule_inspection_and_removal_ignore_broken_env_file(
+    tmp_path, monkeypatch, capsys, command
+):
+    env_file = tmp_path / "hub.env"
+    env_file.write_text("TEAMMEM_SINCE_DAYS=private-invalid-value\n")
+    env_file.chmod(0o644)
+    status = ScheduleStatus(
+        installed=False,
+        time=None,
+        backend="launchd",
+        path=Path("/tmp/operator.plist"),
+    )
+    calls = []
+    schedule_api = SimpleNamespace(
+        schedule_status=lambda: calls.append("status") or status,
+        remove_schedule=lambda: calls.append("remove") or False,
+    )
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        cli_module, "_schedule_api", lambda: schedule_api, raising=False
+    )
+
+    assert main([
+        "--env-file", str(env_file), "schedule", command
+    ]) == 0
+
+    captured = capsys.readouterr()
+    assert calls == [command]
+    assert captured.err == ""
+    assert (
+        captured.out
+        == "not installed: backend=launchd path=/tmp/operator.plist time=unknown\n"
+        if command == "status"
+        else captured.out == "not installed\n"
+    )
+
+
+def test_invalid_integer_config_is_secret_free_and_has_no_traceback(
+    tmp_path, capsys
+):
+    sensitive_value = "private-value-9847234987234987"
+    env_file = tmp_path / "hub.env"
+    env_file.write_text(f"TEAMMEM_SINCE_DAYS={sensitive_value}\n")
+    env_file.chmod(0o600)
+
+    assert main([
+        "--env-file", str(env_file), "connectors", "list"
+    ]) == 2
+
+    captured = capsys.readouterr()
+    assert "TEAMMEM_SINCE_DAYS" in captured.err
+    assert sensitive_value not in captured.out + captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_invalid_schedule_time_returns_2_without_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    from teammem.schedule import install_schedule
+
+    env_file = tmp_path / "hub.env"
+    env_file.write_text("# configured\n")
+    env_file.chmod(0o600)
+    schedule_api = SimpleNamespace(install_schedule=install_schedule)
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        cli_module, "_schedule_api", lambda: schedule_api, raising=False
+    )
+
+    assert main([
+        "--env-file", str(env_file), "schedule", "install", "--time", "6:20"
+    ]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: schedule time must be HH:MM\n"
+    assert "Traceback" not in captured.err
+
+
+def test_windows_cli_imports_without_unix_scheduler_modules(tmp_path):
+    missing_env = tmp_path / "missing.env"
+    script = f"""
+import builtins
+import os
+import subprocess
+import sys
+
+real_import = builtins.__import__
+sys.modules.pop("fcntl", None)
+
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "fcntl" or name == "teammem.schedule" or (
+        name == "schedule" and level == 1
+    ):
+        raise AssertionError("Unix scheduler imported")
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = guarded_import
+for attribute in ("O_DIRECTORY", "O_NOFOLLOW"):
+    if hasattr(os, attribute):
+        delattr(os, attribute)
+
+from teammem.cli import main
+
+first = main(["--env-file", {str(missing_env)!r}, "connectors", "list"])
+sys.platform = "win32"
+second = main(["--env-file", {str(missing_env)!r}, "schedule", "status"])
+if (first, second) != (0, 2):
+    raise SystemExit(f"unexpected exit codes: {{first}}, {{second}}")
+"""
+    environment = os.environ.copy()
+    environment["TEAMMEM_CONFIG_DIR"] = str(CONFIG_DIR)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "unsupported scheduling platform: win32" in result.stderr
+    assert "Unix scheduler imported" not in result.stderr

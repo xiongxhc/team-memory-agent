@@ -13,7 +13,6 @@ from .connectors.registry import connector_names, get_connector
 from .daily import run_daily
 from .identity import IdentityMaps
 from .reclaim import reclaim, reclaim_channel_projects
-from .schedule import install_schedule, remove_schedule, schedule_status
 from .services import (
     collect_connector,
     resolve_llm_backend,
@@ -167,37 +166,77 @@ def _schedule_backend() -> str:
     raise RuntimeError(f"unsupported scheduling platform: {sys.platform}")
 
 
+def _schedule_api():
+    from . import schedule
+
+    return schedule
+
+
+def _load_config(env_file: Path, *, required: bool = False) -> Config | None:
+    try:
+        return Config.load(
+            env_file=env_file,
+            require_env_file=required,
+        )
+    except OSError:
+        print("error: unable to load environment configuration", file=sys.stderr)
+    except ValueError as failure:
+        print(f"error: {failure}", file=sys.stderr)
+    return None
+
+
+def _schedule_error(failure: OSError | ValueError) -> int:
+    message = (
+        str(failure)
+        if isinstance(failure, ValueError)
+        else "schedule operation failed"
+    )
+    print(f"error: {message}", file=sys.stderr)
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
 
-    cfg = Config.load(env_file=args.env_file)
-
     if args.cmd == "schedule":
         try:
             backend = _schedule_backend()
-            if args.schedule_cmd == "install":
-                path = install_schedule(cfg, args.time)
+        except RuntimeError as failure:
+            print(str(failure), file=sys.stderr)
+            return 2
+        if args.schedule_cmd == "install":
+            cfg = _load_config(args.env_file, required=True)
+            if cfg is None:
+                return 2
+            schedule = _schedule_api()
+            try:
+                path = schedule.install_schedule(cfg, args.time)
                 print(
                     f"installed: backend={backend} path={path} time={args.time}"
                 )
                 return 0
+            except (OSError, ValueError) as failure:
+                return _schedule_error(failure)
+        schedule = _schedule_api()
+        try:
             if args.schedule_cmd == "status":
-                status = schedule_status()
+                status = schedule.schedule_status()
                 state = "installed" if status.installed else "not installed"
                 print(
                     f"{state}: backend={status.backend} path={status.path} "
                     f"time={status.time or 'unknown'}"
                 )
                 return 0
-            removed = remove_schedule()
+            removed = schedule.remove_schedule()
             print("removed" if removed else "not installed")
             return 0
-        except RuntimeError as failure:
-            if str(failure).startswith("unsupported scheduling platform:"):
-                print(str(failure), file=sys.stderr)
-                return 2
-            raise
+        except (OSError, ValueError) as failure:
+            return _schedule_error(failure)
+
+    cfg = _load_config(args.env_file)
+    if cfg is None:
+        return 2
 
     if args.cmd == "import-bundles":
         from .importer import import_inbox
