@@ -8,8 +8,10 @@ from teammem.identity import IdentityMaps
 
 from .base import CollectionResult, Connector
 from .config import ConnectorSettings
+from .discord import DiscordConnector
 from .feishu import FeishuConnector
 from .gitlab import GitLabConnector
+from .slack import SlackConnector
 
 
 class _ConfiguredConnector:
@@ -42,11 +44,11 @@ def _github_connector() -> Connector:
 
 
 _CONNECTORS: dict[str, Connector | Callable[[], Connector]] = {
-    "discord": _ConfiguredConnector("discord", ("TEAMMEM_DISCORD_BOT_TOKEN",)),
+    "discord": DiscordConnector(),
     "feishu": FeishuConnector(),
     "github": _github_connector,
     "gitlab": GitLabConnector(),
-    "slack": _ConfiguredConnector("slack", ("TEAMMEM_SLACK_BOT_TOKEN",)),
+    "slack": SlackConnector(),
 }
 
 
