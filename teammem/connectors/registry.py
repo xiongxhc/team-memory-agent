@@ -1,5 +1,6 @@
 """Static built-in connector registry with no import-time network activity."""
 
+from collections.abc import Callable
 from datetime import datetime
 
 from teammem.config import Config
@@ -34,10 +35,16 @@ class _ConfiguredConnector:
         raise NotImplementedError(f"{self.name} connector is not implemented")
 
 
-_CONNECTORS: dict[str, Connector] = {
+def _github_connector() -> Connector:
+    from .github import GitHubConnector
+
+    return GitHubConnector()
+
+
+_CONNECTORS: dict[str, Connector | Callable[[], Connector]] = {
     "discord": _ConfiguredConnector("discord", ("TEAMMEM_DISCORD_BOT_TOKEN",)),
     "feishu": FeishuConnector(),
-    "github": _ConfiguredConnector("github", ("TEAMMEM_GITHUB_TOKEN",)),
+    "github": _github_connector,
     "gitlab": GitLabConnector(),
     "slack": _ConfiguredConnector("slack", ("TEAMMEM_SLACK_BOT_TOKEN",)),
 }
@@ -49,6 +56,7 @@ def connector_names() -> tuple[str, ...]:
 
 def get_connector(name: str) -> Connector:
     try:
-        return _CONNECTORS[name]
+        connector = _CONNECTORS[name]
     except KeyError:
         raise KeyError(f"unknown connector: {name}") from None
+    return connector() if callable(connector) else connector
