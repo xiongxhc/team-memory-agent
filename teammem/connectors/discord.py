@@ -50,6 +50,7 @@ class DiscordConnector:
         since = now - timedelta(days=cfg.since_days)
         events: list[Event] = []
         names: dict[str, str] = {}
+        warnings: list[str] = []
         for channel_id, project in ids.resources("discord-channel").items():
             try:
                 channel = fetch(f"/channels/{channel_id}", {})
@@ -63,6 +64,11 @@ class DiscordConnector:
                 messages = self._messages(fetch, channel_id, since)
             except Exception:
                 continue
+            if not messages:
+                warnings.append(
+                    f"discord channel {channel_id} returned no messages; verify "
+                    "READ_MESSAGE_HISTORY and MESSAGE_CONTENT access"
+                )
             for message in messages:
                 if not self._is_human_content(message):
                     continue
@@ -77,7 +83,9 @@ class DiscordConnector:
                     raw=json.dumps(message, ensure_ascii=False),
                     hash=str(message["id"]),
                 ))
-        return CollectionResult(events=tuple(events), channel_names=names)
+        return CollectionResult(
+            events=tuple(events), channel_names=names, warnings=tuple(warnings)
+        )
 
     @staticmethod
     def _is_human_content(message: dict) -> bool:

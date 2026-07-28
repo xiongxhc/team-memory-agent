@@ -31,6 +31,7 @@ class IdentityMaps:
                 for value in m.get(field) or []:
                     self._check_and_insert_person((kind, value.lower()), slug, value)
         self._project_by_resource: dict[tuple[str, str], str] = {}
+        self._resource_values: dict[tuple[str, str], str] = {}
         for slug, p in (projects.get("projects") or {}).items():
             for field, kind in RESOURCE_FIELDS.items():
                 for value in p.get(field) or []:
@@ -46,6 +47,7 @@ class IdentityMaps:
         if key in self._project_by_resource and self._project_by_resource[key] != slug:
             raise ValueError(f"resource collision: {raw_value!r} claimed by both {self._project_by_resource[key]!r} and {slug!r}")
         self._project_by_resource[key] = slug
+        self._resource_values.setdefault(key, raw_value)
 
     @classmethod
     def load(cls, config_dir: Path) -> "IdentityMaps":
@@ -60,7 +62,8 @@ class IdentityMaps:
         return self._project_by_resource.get((kind, value.lower()))
 
     def resources(self, kind: str) -> dict[str, str]:
-        return {value: slug for (resource_kind, value), slug in self._project_by_resource.items()
+        return {self._resource_values[(resource_kind, value)]: slug
+                for (resource_kind, value), slug in self._project_by_resource.items()
                 if resource_kind == kind}
 
     def project_for_repo(self, path_with_namespace: str) -> str | None:

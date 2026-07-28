@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pytest
 
 from teammem.config import Config
@@ -28,3 +31,17 @@ def test_registry_connectors_report_exact_missing_environment_names(name, missin
 def test_registry_rejects_unknown_connector():
     with pytest.raises(KeyError, match="unknown connector: unknown"):
         get_connector("unknown")
+
+
+def test_registry_defers_optional_chat_adapter_imports_until_requested():
+    """Eager optional adapter imports make registry discovery depend on every chat implementation."""
+    code = (
+        "import sys; import teammem.connectors.registry; "
+        "print('teammem.connectors.slack' in sys.modules, "
+        "'teammem.connectors.discord' in sys.modules)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True
+    )
+
+    assert result.stdout.strip() == "False False"
