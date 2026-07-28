@@ -18,15 +18,27 @@ def _env_file_path(path: Path) -> Path:
     return absolute.parent.resolve() / absolute.name
 
 
-def read_env_file(path: Path) -> dict[str, str]:
+def read_env_file(path: Path, *, required: bool = False) -> dict[str, str]:
     """Read literal KEY=VALUE entries from a private hub environment file."""
     path = _env_file_path(path)
     try:
-        descriptor = os.open(
-            path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-        )
+        path_metadata = os.lstat(path)
     except FileNotFoundError:
+        if required:
+            raise ValueError(f"environment file does not exist: {path}") from None
         return {}
+    if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(
+        path_metadata.st_mode
+    ):
+        raise ValueError(
+            f"environment file must be a regular non-symlink file: {path}"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    try:
+        descriptor = os.open(path, flags)
     except OSError as failure:
         raise ValueError(
             f"environment file must be a regular non-symlink file: {path}"
@@ -34,15 +46,25 @@ def read_env_file(path: Path) -> dict[str, str]:
 
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"environment file must be a regular file: {path}")
-        if metadata.st_uid != os.getuid():
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (path_metadata.st_dev, path_metadata.st_ino)
+        ):
+            raise ValueError(f"environment file changed during validation: {path}")
+        current_uid = getattr(os, "getuid", lambda: metadata.st_uid)()
+        if metadata.st_uid != current_uid:
             raise ValueError(f"environment file must be user-owned: {path}")
         if stat.S_IMODE(metadata.st_mode) != 0o600:
             raise ValueError(f"environment file mode must be exactly 0600: {path}")
         with os.fdopen(descriptor, encoding="utf-8") as handle:
             descriptor = -1
-            lines = handle.read().splitlines()
+            try:
+                lines = handle.read().splitlines()
+            except UnicodeError:
+                raise ValueError(
+                    f"environment file must contain UTF-8 text: {path}"
+                ) from None
     finally:
         if descriptor != -1:
             os.close(descriptor)
@@ -56,6 +78,13 @@ def read_env_file(path: Path) -> dict[str, str]:
             raise ValueError(f"invalid environment-file entry at {path}:{number}")
         values[key] = value
     return values
+
+
+def _integer(values: dict, key: str, default: int) -> int:
+    try:
+        return int(values.get(key, default))
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be an integer") from None
 
 
 @dataclass
@@ -84,11 +113,17 @@ class Config:
     snapshots: Path | None = None
 
     @classmethod
-    def load(cls, env: dict | None = None, env_file: Path | None = None) -> "Config":
+    def load(
+        cls,
+        env: dict | None = None,
+        env_file: Path | None = None,
+        *,
+        require_env_file: bool = False,
+    ) -> "Config":
         env_file = _env_file_path(
             DEFAULT_ENV_FILE if env_file is None else Path(env_file)
         )
-        values = read_env_file(env_file)
+        values = read_env_file(env_file, required=require_env_file)
         values.update(os.environ if env is None else env)
         return cls(
             db_path=Path(values.get("TEAMMEM_DB", str(cls.db_path))),
@@ -98,7 +133,7 @@ class Config:
             gitlab_group=values.get("TEAMMEM_GITLAB_GROUP", cls.gitlab_group),
             feishu_app_id=values.get("TEAMMEM_FEISHU_APP_ID", cls.feishu_app_id),
             feishu_app_secret=values.get("TEAMMEM_FEISHU_APP_SECRET", cls.feishu_app_secret),
-            since_days=int(values.get("TEAMMEM_SINCE_DAYS", cls.since_days)),
+            since_days=_integer(values, "TEAMMEM_SINCE_DAYS", cls.since_days),
             vault_dir=Path(values.get("TEAMMEM_VAULT", str(cls.vault_dir))),
             push=values.get("TEAMMEM_PUSH", "0").lower() in ("1", "true", "yes"),
             obsidian_projects=(Path(values["TEAMMEM_OBSIDIAN_PROJECTS"])
