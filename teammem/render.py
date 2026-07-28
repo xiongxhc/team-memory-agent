@@ -59,7 +59,8 @@ def _msg_channel_ids(rows: list[dict]) -> set:
     for r in rows:
         if r["kind"] == "message":
             try:
-                cid = (json.loads(r["refs"]) or {}).get("chat_id")
+                refs = json.loads(r["refs"]) or {}
+                cid = refs.get("channel_id") or refs.get("chat_id")
                 if cid:
                     chans.add(cid)
             except (TypeError, ValueError):
@@ -134,7 +135,10 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             detail = ", ".join(f"{len(v)} {k}" for k, v in sorted(kinds.items()))
             tally.append(f"\n### {_person_link(_fname(ids.display_name(person)))} — "
                       f"{len(rs)} events ({detail})\n")
-            work = [r for r in rs if r["kind"] in ("commit", "mr", "journal-highlight")]
+            work = [
+                r for r in rs
+                if r["kind"] in ("commit", "pr", "mr", "journal-highlight")
+            ]
             msgs = [r for r in rs if r["kind"] == "message"]
             tally += [_line(r) for r in work[:5]]
             if msgs:
@@ -166,7 +170,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             cname = channel_names.get(chat_id)
             shown = f"**{cname}** (`{chat_id}`)" if cname else f"`{chat_id}`"
             flags_md.append(f"- **Unmapped channel**: {shown} ({n} messages) — map it "
-                      f"in projects.yaml feishu_channels\n")
+                      f"in the matching projects.yaml provider channel list\n")
         for proj, slug, share in f["concentration"]:
             flags_md.append(f"- **Concentration**: {_project_link(proj)} — {int(share * 100)}% by "
                       f"{_person_link(_fname(ids.display_name(slug)))}\n")
@@ -200,7 +204,10 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                 md.append(f"\n### {d}\n{t.rstrip()}\n")
             if entries:
                 md.append("\n**Activity detail**\n")
-            work = [r for r in mine if r["kind"] in ("commit", "mr", "journal-highlight")]
+            work = [
+                r for r in mine
+                if r["kind"] in ("commit", "pr", "mr", "journal-highlight")
+            ]
             msgs = [r for r in mine if r["kind"] == "message"]
             md += [_line(r) for r in work]
             if msgs:
@@ -230,7 +237,10 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                 nm = _fname(ids.display_name(person))
                 link = (_person_link(nm) if not person.startswith("_unmapped/")
                         else f"`{person}`")
-                work = [r for r in prs if r["kind"] in ("commit", "mr", "journal-highlight")]
+                work = [
+                    r for r in prs
+                    if r["kind"] in ("commit", "pr", "mr", "journal-highlight")
+                ]
                 msgs = [r for r in prs if r["kind"] == "message"]
                 md.append(f"\n### {link} — {len(prs)} events\n")
                 md += [_line(r) for r in work[:MAX_WORK_LINES]]

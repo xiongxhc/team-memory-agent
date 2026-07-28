@@ -62,15 +62,22 @@ def flags(conn: sqlite3.Connection, monday: date, ids: IdentityMaps) -> dict:
          if p.startswith("_unmapped/")), key=lambda x: -x[1])
     channel_counts: dict[str, int] = {}
     for r in this_week:
-        if r["source"] != "feishu-channel" or r["project"] not in (None, "(no project)"):
+        if (
+            r["source"]
+            not in ("slack-channel", "feishu-channel", "discord-channel")
+            or r["project"] not in (None, "(no project)")
+        ):
             continue
         try:
-            chat_id = (json.loads(r["refs"]) or {}).get("chat_id")
+            refs = json.loads(r["refs"]) or {}
+            chat_id = refs.get("channel_id") or refs.get("chat_id")
         except (TypeError, ValueError):
             chat_id = None
         if chat_id:
             channel_counts[chat_id] = channel_counts.get(chat_id, 0) + 1
-    unmapped_channels = sorted(channel_counts.items(), key=lambda x: -x[1])
+    unmapped_channels = sorted(
+        channel_counts.items(), key=lambda item: (-item[1], item[0])
+    )
     concentration = []
     for proj, rs in by_key(this_week, "project").items():
         if proj == "(no project)" or len(rs) < 10:

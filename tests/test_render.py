@@ -240,3 +240,60 @@ def test_message_line_names_channels_when_cache_present(tmp_path):
                  channel_names={"oc_pm": "PM. Share"})
     page = (vault / "Person" / "Alex Rivera.md").read_text()
     assert "💬 1 messages across 1 channels (PM. Share)" in page
+
+
+def test_github_pull_requests_render_as_work_items(tmp_path):
+    conn = _seed(tmp_path)
+    insert_events(conn, [Event(
+        person="alex",
+        ts="2026-07-14T12:00:00+00:00",
+        source="github",
+        kind="pr",
+        summary="[open] Add provider-neutral runner",
+        refs='{"url": "https://github.test/pull/7"}',
+        hash="pr-7",
+        project="project-alpha",
+    )])
+
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    assert "[open] Add provider-neutral runner" in (
+        vault / "Person" / "Alex Rivera.md"
+    ).read_text()
+
+
+def test_channel_id_refs_are_counted_with_legacy_chat_id_refs(tmp_path):
+    conn = _seed(tmp_path)
+    insert_events(conn, [
+        Event(
+            person="alex",
+            ts="2026-07-14T10:00:00+00:00",
+            source="slack-channel",
+            kind="message",
+            summary="one",
+            refs='{"channel_id": "C1"}',
+            hash="slack-1",
+        ),
+        Event(
+            person="alex",
+            ts="2026-07-14T10:01:00+00:00",
+            source="feishu-channel",
+            kind="message",
+            summary="two",
+            refs='{"chat_id": "oc_1"}',
+            hash="feishu-1",
+        ),
+    ])
+
+    vault = tmp_path / "vault"
+    render_vault(
+        conn,
+        IdentityMaps.load(CONFIG_DIR),
+        vault,
+        TODAY,
+        channel_names={"C1": "Slack", "oc_1": "Feishu"},
+    )
+
+    page = (vault / "Person" / "Alex Rivera.md").read_text()
+    assert "💬 2 messages across 2 channels (Feishu, Slack)" in page
