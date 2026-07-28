@@ -3,14 +3,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from teammem.config import Config
+from teammem.connectors.config import ConnectorSettings
+from teammem.connectors.feishu import FeishuConnector
 from teammem.feishu_collector import _summary, collect_feishu
 from teammem.identity import IdentityMaps
 
 NOW = datetime(2026, 7, 16, tzinfo=timezone.utc)
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
 
-CHATS = {"items": [{"chat_id": "oc_example_alpha", "name": "Project Alpha"}],
-         "has_more": False, "page_token": ""}
 MSG = {"message_id": "om_1", "chat_id": "oc_example_alpha", "msg_type": "text",
        "create_time": "1784264400000",
        "sender": {"id": "ou_example_alex", "id_type": "open_id",
@@ -23,8 +23,8 @@ IMG_MSG = {**MSG, "message_id": "om_3", "msg_type": "image",
 
 
 def fake_fetch(path, params):
-    if path == "/im/v1/chats":
-        return CHATS
+    if path == "/im/v1/chats/oc_example_alpha":
+        return {"name": "Project Alpha"}
     if path == "/im/v1/messages":
         assert params["container_id"] == "oc_example_alpha"
         assert params["start_time"].isdigit() and params["end_time"].isdigit()
@@ -35,8 +35,6 @@ def fake_fetch(path, params):
 def test_messages_become_events(tmp_path):
     cfg = Config.load(env={"TEAMMEM_CONFIG_DIR": str(tmp_path)})
     events = collect_feishu(cfg, IdentityMaps.load(CONFIG_DIR), fake_fetch, NOW)
-    names = json.loads((tmp_path / "channel_names.json").read_text())
-    assert names == {"oc_example_alpha": "Project Alpha"}          # name cache persisted
     assert len(events) == 2                                   # bot message skipped
     text = next(e for e in events if e.hash == "om_1")
     assert (text.person, text.project, text.kind) == ("alex", "project-alpha", "message")
@@ -45,6 +43,28 @@ def test_messages_become_events(tmp_path):
     assert text.ts.startswith("2026-07-17T")                  # 1784264400000 ms UTC
     img = next(e for e in events if e.hash == "om_3")
     assert img.summary == "[image]"
+
+
+def test_feishu_fetches_only_project_mapped_channels():
+    calls = []
+
+    def recording_fetch(path, params):
+        calls.append((path, params))
+        if path == "/im/v1/chats/oc_example_alpha":
+            return {"name": "Project Alpha"}
+        if path == "/im/v1/messages":
+            return {"items": [MSG], "has_more": False, "page_token": ""}
+        raise AssertionError(path)
+
+    cfg = Config.load(env={})
+    ids = IdentityMaps.load(CONFIG_DIR)
+    settings = ConnectorSettings(name="feishu", enabled=True, options={})
+    result = FeishuConnector(fetch=recording_fetch).collect(cfg, ids, settings, NOW)
+
+    message_calls = [params for path, params in calls if path == "/im/v1/messages"]
+    assert {call["container_id"] for call in message_calls} == {"oc_example_alpha"}
+    assert result.channel_names == {"oc_example_alpha": "Project Alpha"}
+    assert all(event.source == "feishu-channel" for event in result.events)
 
 
 def test_unknown_sender_is_unmapped(tmp_path):

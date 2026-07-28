@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from teammem.config import Config
+from teammem.connectors.config import ConnectorSettings
+from teammem.connectors.gitlab import GitLabConnector
 from teammem.events import event_hash
 from teammem.gitlab_collector import collect_gitlab
 from teammem.identity import IdentityMaps
@@ -95,3 +97,24 @@ def test_ghost_mr_author_is_unmapped_not_crash():
         "/projects/1/merge_requests": [[ghost_mr]],
     })
     assert events[0].person == "_unmapped/(none)"
+
+
+def test_connector_preserves_legacy_gitlab_event_identities():
+    result = GitLabConnector(fetch_json=fake_fetch({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/repository/commits": [[COMMIT]],
+        "/projects/1/merge_requests": [[MR]],
+    })).collect(
+        Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
+        IdentityMaps.load(CONFIG_DIR),
+        ConnectorSettings(name="gitlab", enabled=True, options={}),
+        NOW,
+    )
+    assert [(event.source, event.kind, event.refs, event.hash) for event in result.events] == [
+        ("gitlab", "commit",
+         '{"sha": "sha-abc", "url": "https://gitlab.internal/team/project-alpha/-/commit/sha-abc"}',
+         "sha-abc"),
+        ("gitlab", "mr",
+         '{"iid": 7, "url": "https://gitlab.internal/team/project-alpha/-/merge_requests/7"}',
+         "b56227665acb0f91946d18838c871e0cd076abdbcfade0e3bc52ba25d107c767"),
+    ]
