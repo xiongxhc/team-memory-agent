@@ -84,3 +84,31 @@ def test_flags_unmapped_channel(tmp_path):
     ])
     f = flags(conn, date(2026, 7, 13), IdentityMaps.load(CONFIG_DIR))
     assert f["unmapped_channels"] == [("oc_9", 2)]
+
+
+def test_flags_accepts_provider_neutral_channel_id(tmp_path):
+    conn = _seed(tmp_path)
+    insert_events(conn, [
+        Event(
+            person="alex",
+            ts="2026-07-14T13:00:00+04:00",
+            source="slack-channel",
+            kind="message",
+            summary="msg s1",
+            hash="s1",
+            refs=json.dumps({"channel_id": "C9"}),
+        ),
+        Event(
+            person="alex",
+            ts="2026-07-14T13:05:00+04:00",
+            source="discord-channel",
+            kind="message",
+            summary="msg d1",
+            hash="d1",
+            refs=json.dumps({"channel_id": "D9"}),
+        ),
+    ])
+
+    result = flags(conn, date(2026, 7, 13), IdentityMaps.load(CONFIG_DIR))
+
+    assert result["unmapped_channels"] == [("C9", 1), ("D9", 1)]

@@ -344,3 +344,136 @@ def test_main_docs_sync_copies_docs(tmp_path, monkeypatch, capsys):
     assert main(["docs-sync"]) == 0
     out = tmp_path / "vault" / "Docs" / "project-alpha" / "architecture.md"
     assert out.read_text() == "# arch\n"
+
+
+def test_connectors_list_is_static_and_needs_no_credentials(monkeypatch, capsys):
+    for name in (
+        "TEAMMEM_GITHUB_TOKEN",
+        "TEAMMEM_GITLAB_TOKEN",
+        "TEAMMEM_SLACK_BOT_TOKEN",
+        "TEAMMEM_FEISHU_APP_SECRET",
+        "TEAMMEM_DISCORD_BOT_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert main(["connectors", "list"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "discord",
+        "feishu",
+        "github",
+        "gitlab",
+        "slack",
+    ]
+
+
+def test_connectors_check_reports_variable_names_not_values(
+    tmp_path, monkeypatch, capsys
+):
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "connectors.yaml").write_text(
+        "connectors:\n  github:\n    enabled: true\n"
+    )
+    secret = "secret-value-that-must-not-print"
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(config))
+    monkeypatch.setenv("TEAMMEM_GITHUB_TOKEN", secret)
+
+    assert main(["connectors", "check"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "github: ok\n"
+    assert secret not in captured.out + captured.err
+
+    monkeypatch.delenv("TEAMMEM_GITHUB_TOKEN")
+    assert main(["connectors", "check"]) == 2
+    captured = capsys.readouterr()
+    assert "TEAMMEM_GITHUB_TOKEN" in captured.err
+    assert secret not in captured.out + captured.err
+
+
+def test_collect_accepts_registry_connector_name(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config"
+    config.mkdir()
+    for name in ("roster.example.yaml", "projects.example.yaml"):
+        (config / name).write_text((CONFIG_DIR / name).read_text())
+    (config / "connectors.yaml").write_text(
+        "connectors:\n  github:\n    enabled: false\n"
+    )
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(config))
+    monkeypatch.delenv("TEAMMEM_GITHUB_TOKEN", raising=False)
+
+    assert main(["collect", "github", "--dry-run"]) == 2
+    assert "TEAMMEM_GITHUB_TOKEN" in capsys.readouterr().err
+
+
+def test_collect_enabled_runs_only_enabled_connectors(
+    tmp_path, monkeypatch, capsys
+):
+    config = tmp_path / "config"
+    config.mkdir()
+    for name in ("roster.example.yaml", "projects.example.yaml"):
+        (config / name).write_text((CONFIG_DIR / name).read_text())
+    (config / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  github:\n    enabled: true\n"
+        "  slack:\n    enabled: false\n"
+    )
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(config))
+    monkeypatch.delenv("TEAMMEM_GITHUB_TOKEN", raising=False)
+
+    assert main(["collect", "--enabled", "--dry-run"]) == 2
+    captured = capsys.readouterr()
+    assert "github" in captured.err
+    assert "slack" not in captured.err
+
+
+def test_collect_runtime_failure_never_prints_secret(
+    tmp_path, monkeypatch, capsys
+):
+    class FailingConnector:
+        name = "github"
+
+        def validate(self, cfg, settings):
+            return []
+
+        def collect(self, cfg, ids, settings, now):
+            raise RuntimeError(f"request rejected for {cfg.github_token}")
+
+    token = "ghp-never-print-this"
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    monkeypatch.setenv("TEAMMEM_DB", str(tmp_path / "ledger.db"))
+    monkeypatch.setenv("TEAMMEM_GITHUB_TOKEN", token)
+    monkeypatch.setattr("teammem.cli.get_connector", lambda name: FailingConnector())
+
+    assert main(["collect", "github"]) == 1
+    captured = capsys.readouterr()
+    assert "github: collection failed" in captured.err
+    assert token not in captured.out + captured.err
+
+
+def test_run_daily_prints_step_warnings_and_returns_result_exit_code(
+    tmp_path, monkeypatch, capsys
+):
+    from teammem.daily import DailyResult, StepResult
+
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    monkeypatch.setattr(
+        "teammem.cli.run_daily",
+        lambda cfg, ids, settings, now: DailyResult(
+            steps=(
+                StepResult(
+                    "discord",
+                    "ok",
+                    "0 fetched; warning: MESSAGE_CONTENT may be disabled",
+                    ("MESSAGE_CONTENT may be disabled",),
+                ),
+                StepResult("render", "failed", "cannot write vault"),
+            ),
+            exit_code=1,
+        ),
+    )
+
+    assert main(["run-daily"]) == 1
+    captured = capsys.readouterr()
+    assert "discord: ok" in captured.out
+    assert "WARN discord: MESSAGE_CONTENT may be disabled" in captured.err
+    assert "render: failed" in captured.err
