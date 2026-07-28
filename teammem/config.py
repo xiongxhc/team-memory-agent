@@ -2,6 +2,7 @@
 environment variable so the launchd tick can be configured without code edits."""
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -11,16 +12,43 @@ DEFAULT_ENV_FILE = Path("~/.config/teammem/hub.env").expanduser()
 _ENVIRONMENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _env_file_path(path: Path) -> Path:
+    expanded = Path(path).expanduser()
+    absolute = expanded if expanded.is_absolute() else Path.cwd() / expanded
+    return absolute.parent.resolve() / absolute.name
+
+
 def read_env_file(path: Path) -> dict[str, str]:
     """Read literal KEY=VALUE entries from a private hub environment file."""
-    path = path.expanduser().resolve()
-    if not path.exists():
+    path = _env_file_path(path)
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+    except FileNotFoundError:
         return {}
-    if path.stat().st_mode & 0o077:
-        raise ValueError(f"environment file must be user-only: {path}")
+    except OSError as failure:
+        raise ValueError(
+            f"environment file must be a regular non-symlink file: {path}"
+        ) from failure
+
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"environment file must be a regular file: {path}")
+        if metadata.st_uid != os.getuid():
+            raise ValueError(f"environment file must be user-owned: {path}")
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise ValueError(f"environment file mode must be exactly 0600: {path}")
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            descriptor = -1
+            lines = handle.read().splitlines()
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
 
     values = {}
-    for number, raw_line in enumerate(path.read_text().splitlines(), start=1):
+    for number, raw_line in enumerate(lines, start=1):
         if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
         key, separator, value = raw_line.partition("=")
@@ -57,7 +85,9 @@ class Config:
 
     @classmethod
     def load(cls, env: dict | None = None, env_file: Path | None = None) -> "Config":
-        env_file = (DEFAULT_ENV_FILE if env_file is None else Path(env_file)).expanduser().resolve()
+        env_file = _env_file_path(
+            DEFAULT_ENV_FILE if env_file is None else Path(env_file)
+        )
         values = read_env_file(env_file)
         values.update(os.environ if env is None else env)
         return cls(

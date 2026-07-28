@@ -7,12 +7,13 @@ from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from .config import Config
+from .config import DEFAULT_ENV_FILE, Config
 from .connectors.config import load_connector_settings
 from .connectors.registry import connector_names, get_connector
 from .daily import run_daily
 from .identity import IdentityMaps
 from .reclaim import reclaim, reclaim_channel_projects
+from .schedule import install_schedule, remove_schedule, schedule_status
 from .services import (
     collect_connector,
     resolve_llm_backend,
@@ -27,6 +28,13 @@ from .store import open_db, stats as store_stats
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="teammem", description=__doc__)
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=DEFAULT_ENV_FILE,
+        metavar="PATH",
+        help="private hub environment file (default: ~/.config/teammem/hub.env)",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_connectors = sub.add_parser(
@@ -84,6 +92,19 @@ def _parser() -> argparse.ArgumentParser:
     p_import.add_argument("--archive", required=True)
     p_import.add_argument("--quarantine", required=True)
     p_import.add_argument("--dry-run", action="store_true")
+
+    p_schedule = sub.add_parser(
+        "schedule", help="manage the explicit daily hub schedule"
+    )
+    schedule_sub = p_schedule.add_subparsers(
+        dest="schedule_cmd", required=True
+    )
+    p_schedule_install = schedule_sub.add_parser(
+        "install", help="install or replace the daily schedule"
+    )
+    p_schedule_install.add_argument("--time", default="18:20", metavar="HH:MM")
+    schedule_sub.add_parser("status", help="show daily schedule status")
+    schedule_sub.add_parser("remove", help="remove the daily schedule")
     return parser
 
 
@@ -138,11 +159,45 @@ def _print_daily(result) -> None:
             print(f"WARN {step.name}: {warning}", file=sys.stderr)
 
 
+def _schedule_backend() -> str:
+    if sys.platform == "darwin":
+        return "launchd"
+    if sys.platform.startswith("linux"):
+        return "systemd"
+    raise RuntimeError(f"unsupported scheduling platform: {sys.platform}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
 
-    cfg = Config.load()
+    cfg = Config.load(env_file=args.env_file)
+
+    if args.cmd == "schedule":
+        try:
+            backend = _schedule_backend()
+            if args.schedule_cmd == "install":
+                path = install_schedule(cfg, args.time)
+                print(
+                    f"installed: backend={backend} path={path} time={args.time}"
+                )
+                return 0
+            if args.schedule_cmd == "status":
+                status = schedule_status()
+                state = "installed" if status.installed else "not installed"
+                print(
+                    f"{state}: backend={status.backend} path={status.path} "
+                    f"time={status.time or 'unknown'}"
+                )
+                return 0
+            removed = remove_schedule()
+            print("removed" if removed else "not installed")
+            return 0
+        except RuntimeError as failure:
+            if str(failure).startswith("unsupported scheduling platform:"):
+                print(str(failure), file=sys.stderr)
+                return 2
+            raise
 
     if args.cmd == "import-bundles":
         from .importer import import_inbox
