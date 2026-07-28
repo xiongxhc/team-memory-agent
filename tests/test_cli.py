@@ -992,3 +992,151 @@ if (first, second) != (0, 2):
     assert result.returncode == 0, result.stderr
     assert "unsupported scheduling platform: win32" in result.stderr
     assert "Unix scheduler imported" not in result.stderr
+
+
+def test_schedule_install_runtime_failure_returns_clean_exit_2(
+    tmp_path, monkeypatch, capsys
+):
+    env_file = tmp_path / "hub.env"
+    env_file.write_text("# configured\n")
+    env_file.chmod(0o600)
+    sensitive_detail = "private-runtime-detail-3287498237498"
+
+    def fail_install(cfg, time):
+        try:
+            raise RuntimeError(sensitive_detail)
+        except RuntimeError as cause:
+            raise RuntimeError(
+                "launchd schedule installation failed; previous state restored"
+            ) from cause
+
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        cli_module,
+        "_schedule_api",
+        lambda: SimpleNamespace(install_schedule=fail_install),
+    )
+
+    assert main([
+        "--env-file", str(env_file), "schedule", "install"
+    ]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "error: launchd schedule installation failed; previous state restored\n"
+    )
+    assert sensitive_detail not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_schedule_remove_rollback_runtime_failure_returns_clean_exit_2(
+    tmp_path, monkeypatch, capsys
+):
+    sensitive_detail = "private-rollback-detail-3287498237498"
+
+    def fail_remove():
+        try:
+            raise RuntimeError(sensitive_detail)
+        except RuntimeError as cause:
+            raise RuntimeError(
+                "systemd schedule removal failed and rollback failed"
+            ) from cause
+
+    monkeypatch.setattr(cli_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        cli_module,
+        "_schedule_api",
+        lambda: SimpleNamespace(remove_schedule=fail_remove),
+    )
+
+    assert main([
+        "--env-file", str(tmp_path / "broken.env"), "schedule", "remove"
+    ]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "error: systemd schedule removal failed and rollback failed\n"
+    )
+    assert sensitive_detail not in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("platform", "failure"),
+    [
+        (
+            "darwin",
+            subprocess.CalledProcessError(
+                1,
+                ["launchctl", "bootstrap", "private-command-detail-3287498237498"],
+            ),
+        ),
+        (
+            "linux",
+            subprocess.SubprocessError(
+                "systemd runner private-detail-3287498237498"
+            ),
+        ),
+    ],
+)
+def test_schedule_runner_failure_returns_generic_secret_free_exit_2(
+    tmp_path, monkeypatch, capsys, platform, failure
+):
+    from teammem.schedule import install_schedule
+
+    env_file = tmp_path / "hub.env"
+    env_file.write_text("# configured\n")
+    env_file.chmod(0o600)
+
+    def fail_runner(command, **kwargs):
+        raise failure
+
+    def install_with_failing_runner(cfg, time):
+        return install_schedule(
+            cfg,
+            time,
+            platform=platform,
+            executable="/opt/pipx/bin/teammem",
+            agents_dir=tmp_path / "LaunchAgents",
+            systemd_dir=tmp_path / "systemd",
+            runner=fail_runner,
+        )
+
+    monkeypatch.setattr(cli_module.sys, "platform", platform)
+    monkeypatch.setattr(
+        cli_module,
+        "_schedule_api",
+        lambda: SimpleNamespace(install_schedule=install_with_failing_runner),
+    )
+
+    assert main([
+        "--env-file", str(env_file), "schedule", "install"
+    ]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "error: schedule operation failed\n"
+    assert "private" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("failure", [AssertionError("bug"), KeyboardInterrupt()])
+def test_schedule_programming_and_base_exceptions_still_propagate(
+    tmp_path, monkeypatch, failure
+):
+    def fail_status():
+        raise failure
+
+    monkeypatch.setattr(cli_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        cli_module,
+        "_schedule_api",
+        lambda: SimpleNamespace(schedule_status=fail_status),
+    )
+
+    with pytest.raises(type(failure), match="bug" if str(failure) else None):
+        main([
+            "--env-file", str(tmp_path / "broken.env"), "schedule", "status"
+        ])

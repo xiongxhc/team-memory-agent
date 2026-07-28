@@ -2,6 +2,7 @@
 
 import argparse
 import sqlite3
+import subprocess
 import sys
 from dataclasses import replace
 from datetime import date, datetime, timezone
@@ -23,6 +24,14 @@ from .services import (
     run_report,
 )
 from .store import open_db, stats as store_stats
+
+
+_SCHEDULE_FAILURES = (
+    OSError,
+    ValueError,
+    RuntimeError,
+    subprocess.SubprocessError,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -185,10 +194,12 @@ def _load_config(env_file: Path, *, required: bool = False) -> Config | None:
     return None
 
 
-def _schedule_error(failure: OSError | ValueError) -> int:
+def _schedule_error(
+    failure: OSError | ValueError | RuntimeError | subprocess.SubprocessError,
+) -> int:
     message = (
         str(failure)
-        if isinstance(failure, ValueError)
+        if isinstance(failure, (ValueError, RuntimeError))
         else "schedule operation failed"
     )
     print(f"error: {message}", file=sys.stderr)
@@ -216,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"installed: backend={backend} path={path} time={args.time}"
                 )
                 return 0
-            except (OSError, ValueError) as failure:
+            except _SCHEDULE_FAILURES as failure:
                 return _schedule_error(failure)
         schedule = _schedule_api()
         try:
@@ -231,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
             removed = schedule.remove_schedule()
             print("removed" if removed else "not installed")
             return 0
-        except (OSError, ValueError) as failure:
+        except _SCHEDULE_FAILURES as failure:
             return _schedule_error(failure)
 
     cfg = _load_config(args.env_file)
