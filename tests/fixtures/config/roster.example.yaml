@@ -4,10 +4,16 @@ members:
   alex:
     name: Alex Rivera
     emails: [alex@example.com]
+    github: [alex-gh]
     gitlab: [alexdev]
+    slack: [U0123]
     feishu: [ou_example_alex]
+    discord: ["1234567890"]
   sam:
     name: Sam Lee
     emails: [sam@example.com, sam.li@example.com]
+    github: [sam-gh]
     gitlab: [samdev]
+    slack: [U0456]
     feishu: [ou_example_sam]
+    discord: ["2345678901"]

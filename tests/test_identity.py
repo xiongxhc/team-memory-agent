@@ -64,6 +64,36 @@ def test_channel_maps_to_project():
     assert _maps().project_for_channel("oc_unknown") is None
 
 
+def test_same_text_can_identify_resources_from_different_providers():
+    ids = IdentityMaps(
+        {"members": {"alex": {"github": ["alex-gh"], "slack": ["U1"]}}},
+        {"projects": {
+            "one": {"github_repos": ["same"]},
+            "two": {"slack_channels": ["same"]},
+        }},
+    )
+    assert ids.project("github-repo", "same") == "one"
+    assert ids.project("slack-channel", "same") == "two"
+
+
+def test_resources_return_only_the_requested_provider_kind():
+    ids = IdentityMaps(
+        {"members": {}},
+        {"projects": {
+            "one": {"github_repos": ["team/one"]},
+            "two": {"slack_channels": ["C0123"]},
+        }},
+    )
+    assert ids.resources("github-repo") == {"team/one": "one"}
+    assert ids.resources("slack-channel") == {"c0123": "two"}
+
+
+def test_existing_gitlab_and_feishu_helpers_remain_compatible():
+    ids = IdentityMaps.load(CONFIG_DIR)
+    assert ids.project_for_repo("team/project-alpha") == "project-alpha"
+    assert ids.project_for_channel("oc_example_alpha") == "project-alpha"
+
+
 def test_display_name():
     m = _maps()
     assert m.display_name("alex") == "Alex Rivera"
