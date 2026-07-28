@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import Config
@@ -17,8 +17,9 @@ from .identity import IdentityMaps
 from .importer import import_inbox
 from .reclaim import reclaim, reclaim_channel_projects
 from .services import (
-    _llm_backend,
     collect_connector,
+    redact_secrets,
+    resolve_llm_backend,
     run_docs_sync,
     run_journal,
     run_render,
@@ -63,22 +64,6 @@ _LOCAL_STAGES = (
 )
 
 
-def _redact(detail: object, cfg: Config) -> str:
-    text = str(detail)
-    secrets = (
-        cfg.gitlab_token,
-        cfg.feishu_app_secret,
-        cfg.github_token,
-        cfg.slack_bot_token,
-        cfg.discord_bot_token,
-        cfg.anthropic_api_key,
-    )
-    for secret in secrets:
-        if secret:
-            text = text.replace(secret, "[REDACTED]")
-    return text
-
-
 def _call_service(function, *args, **kwargs) -> tuple[int, str]:
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -101,14 +86,14 @@ def _service_step(
     try:
         code, detail = _call_service(function, *args, **kwargs)
     except Exception as error:
-        steps.append(StepResult(name, "failed", _redact(error, cfg)))
+        steps.append(StepResult(name, "failed", redact_secrets(error, cfg)))
         return False
     ok = code == 0
     steps.append(
         StepResult(
             name,
             "ok" if ok else "failed",
-            _redact(detail or f"exit {code}", cfg),
+            redact_secrets(detail or f"exit {code}", cfg),
         )
     )
     return ok
@@ -156,6 +141,8 @@ def run_daily(
 ) -> DailyResult:
     """Run enabled collection and local projection stages exactly once."""
     steps: list[StepResult] = []
+    local_day = now.date()
+    collection_now = now.astimezone(timezone.utc)
     enabled = [
         (name, connector_settings)
         for name, connector_settings in settings.items()
@@ -165,7 +152,7 @@ def run_daily(
     try:
         conn = open_db(cfg.db_path)
     except Exception as error:
-        steps.append(StepResult("ledger", "failed", _redact(error, cfg)))
+        steps.append(StepResult("ledger", "failed", redact_secrets(error, cfg)))
         for name, _connector_settings in enabled:
             steps.append(StepResult(name, "skipped", "ledger unavailable"))
         steps.extend(
@@ -198,7 +185,7 @@ def run_daily(
                 cfg,
                 ids,
                 connector_settings,
-                now,
+                collection_now,
                 connector=connector,
                 conn=conn,
                 emit=False,
@@ -212,7 +199,9 @@ def run_daily(
                 StepResult(name, "ok", detail, warnings=result.warnings)
             )
         except Exception as error:
-            steps.append(StepResult(name, "failed", _redact(error, cfg)))
+            steps.append(
+                StepResult(name, "failed", redact_secrets(error, cfg))
+            )
 
     paths = (cfg.inbox, cfg.archive, cfg.quarantine)
     if all(path is not None for path in paths):
@@ -234,7 +223,9 @@ def run_daily(
                 )
             )
         except Exception as error:
-            steps.append(StepResult("import", "failed", _redact(error, cfg)))
+            steps.append(
+                StepResult("import", "failed", redact_secrets(error, cfg))
+            )
     else:
         steps.append(
             StepResult(
@@ -257,14 +248,16 @@ def run_daily(
         )
         reclaim_ok = True
     except Exception as error:
-        steps.append(StepResult("reclaim", "failed", _redact(error, cfg)))
+        steps.append(
+            StepResult("reclaim", "failed", redact_secrets(error, cfg))
+        )
         reclaim_ok = False
 
     if not reclaim_ok:
         for name in ("journal", "report", "docs-sync", "render", "push"):
             steps.append(StepResult(name, "skipped", "reclaim failed"))
     else:
-        daily_llm = _llm_backend(cfg, cfg.llm_daily_model, 1024)
+        daily_llm = resolve_llm_backend(cfg, cfg.llm_daily_model, 1024)
         if daily_llm is None:
             steps.append(StepResult("journal", "skipped", "no LLM backend"))
         else:
@@ -275,16 +268,16 @@ def run_daily(
                 run_journal,
                 cfg,
                 ids,
-                today=now.date(),
+                today=local_day,
                 since_days=cfg.since_days,
                 conn=conn,
                 llm=daily_llm,
             )
 
-        if now.date().weekday() != 4:
+        if local_day.weekday() != 4:
             steps.append(StepResult("report", "skipped", "not Friday"))
         else:
-            report_llm = _llm_backend(cfg, cfg.llm_report_model, 8192)
+            report_llm = resolve_llm_backend(cfg, cfg.llm_report_model, 8192)
             if report_llm is None:
                 steps.append(StepResult("report", "skipped", "no LLM backend"))
             else:
@@ -295,7 +288,7 @@ def run_daily(
                     run_report,
                     cfg,
                     ids,
-                    base=now.date(),
+                    base=local_day,
                     conn=conn,
                     llm=report_llm,
                 )
@@ -314,7 +307,7 @@ def run_daily(
             run_render,
             replace(cfg, push=False),
             ids,
-            today=now.date(),
+            today=local_day,
             conn=conn,
         )
 
@@ -327,7 +320,9 @@ def run_daily(
                 push(cfg.vault_dir)
                 steps.append(StepResult("push", "ok", "pushed"))
             except Exception as error:
-                steps.append(StepResult("push", "failed", _redact(error, cfg)))
+                steps.append(
+                    StepResult("push", "failed", redact_secrets(error, cfg))
+                )
 
     if cfg.snapshots is None:
         steps.append(
@@ -335,10 +330,12 @@ def run_daily(
         )
     else:
         try:
-            destination = _snapshot(conn, cfg.snapshots, now.date().isoformat())
+            destination = _snapshot(conn, cfg.snapshots, local_day.isoformat())
             steps.append(StepResult("snapshot", "ok", str(destination)))
         except Exception as error:
-            steps.append(StepResult("snapshot", "failed", _redact(error, cfg)))
+            steps.append(
+                StepResult("snapshot", "failed", redact_secrets(error, cfg))
+            )
 
     exit_code = 1 if any(step.status == "failed" for step in steps) else 0
     return DailyResult(tuple(steps), exit_code)

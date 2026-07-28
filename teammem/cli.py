@@ -15,6 +15,7 @@ from .identity import IdentityMaps
 from .reclaim import reclaim, reclaim_channel_projects
 from .services import (
     collect_connector,
+    resolve_llm_backend,
     run_collect,
     run_docs_sync,
     run_journal,
@@ -22,18 +23,6 @@ from .services import (
     run_report,
 )
 from .store import open_db, stats as store_stats
-from .summarize import claude_cli_llm, http_llm
-
-
-def _llm_backend(cfg: Config, model: str, max_tokens: int):
-    """Resolve the optional synthesis backend used by individual CLI commands."""
-    if cfg.anthropic_api_key:
-        return http_llm(model, cfg.anthropic_api_key, max_tokens=max_tokens)
-    import shutil
-
-    if shutil.which("claude"):
-        return claude_cli_llm(model)
-    return None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -124,6 +113,21 @@ def _check_enabled_connectors(
     return (2 if invalid else 0), invalid
 
 
+def _list_connectors(cfg: Config, settings) -> None:
+    for name in connector_names():
+        connector_settings = settings[name]
+        if not connector_settings.enabled:
+            print(f"{name}: disabled")
+            continue
+        missing = get_connector(name).validate(cfg, connector_settings)
+        state = (
+            f"enabled/missing {', '.join(missing)}"
+            if missing
+            else "enabled/ok"
+        )
+        print(f"{name}: {state}")
+
+
 def _print_daily(result) -> None:
     for step in result.steps:
         line = f"{step.name}: {step.status}"
@@ -137,12 +141,6 @@ def _print_daily(result) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-
-    # Listing is deliberately static: no config, credentials, or provider imports.
-    if args.cmd == "connectors" and args.connectors_cmd == "list":
-        for name in connector_names():
-            print(name)
-        return 0
 
     cfg = Config.load()
 
@@ -168,6 +166,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "connectors":
         settings = load_connector_settings(cfg.config_dir)
+        if args.connectors_cmd == "list":
+            _list_connectors(cfg, settings)
+            return 0
         code, _invalid = _check_enabled_connectors(cfg, settings)
         return code
 
@@ -223,7 +224,9 @@ def main(argv: list[str] | None = None) -> int:
         llm = (
             None
             if args.dry_run
-            else _llm_backend(cfg, cfg.llm_daily_model, max_tokens=1024)
+            else resolve_llm_backend(
+                cfg, cfg.llm_daily_model, max_tokens=1024
+            )
         )
         return run_journal(
             cfg,
@@ -241,7 +244,9 @@ def main(argv: list[str] | None = None) -> int:
         llm = (
             None
             if args.dry_run
-            else _llm_backend(cfg, cfg.llm_report_model, max_tokens=8192)
+            else resolve_llm_backend(
+                cfg, cfg.llm_report_model, max_tokens=8192
+            )
         )
         return run_report(
             cfg,
@@ -300,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "run-daily":
         ids = IdentityMaps.load(cfg.config_dir)
         settings = load_connector_settings(cfg.config_dir)
-        result = run_daily(cfg, ids, settings, datetime.now(timezone.utc))
+        result = run_daily(cfg, ids, settings, datetime.now().astimezone())
         _print_daily(result)
         return result.exit_code
 

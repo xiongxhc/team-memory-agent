@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from teammem.config import Config
@@ -41,6 +41,16 @@ class FixtureConnector:
         return self.result
 
 
+class RecordingConnector(FixtureConnector):
+    def __init__(self, name, seen):
+        super().__init__(name)
+        self.seen = seen
+
+    def collect(self, cfg, ids, settings, now):
+        self.seen["connector_now"] = now
+        return super().collect(cfg, ids, settings, now)
+
+
 def _settings(*enabled):
     return {
         name: ConnectorSettings(name, name in enabled, {})
@@ -60,7 +70,7 @@ def _cfg(tmp_path, **values):
 
 def test_daily_continues_after_one_network_connector_fails(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
-    monkeypatch.setattr("teammem.daily._llm_backend", lambda *args: None)
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
     result = run_daily(
         cfg,
         IdentityMaps.load(CONFIG_DIR),
@@ -83,7 +93,7 @@ def test_daily_continues_after_one_network_connector_fails(tmp_path, monkeypatch
 
 def test_daily_exposes_connector_warnings_in_result(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
-    monkeypatch.setattr("teammem.daily._llm_backend", lambda *args: None)
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
     result = run_daily(
         cfg,
         IdentityMaps.load(CONFIG_DIR),
@@ -106,7 +116,7 @@ def test_daily_exposes_connector_warnings_in_result(tmp_path, monkeypatch):
 def test_daily_redacts_secrets_from_connector_failures(tmp_path, monkeypatch):
     token = "ghp-never-print-this"
     cfg = _cfg(tmp_path, TEAMMEM_GITHUB_TOKEN=token)
-    monkeypatch.setattr("teammem.daily._llm_backend", lambda *args: None)
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
     result = run_daily(
         cfg,
         IdentityMaps.load(CONFIG_DIR),
@@ -147,7 +157,7 @@ def test_daily_ledger_open_failure_skips_dependent_stages(tmp_path, monkeypatch)
 def test_daily_runs_weekly_report_only_on_friday(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     calls = []
-    monkeypatch.setattr("teammem.daily._llm_backend", lambda *args: object())
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: object())
     monkeypatch.setattr("teammem.daily.run_journal", lambda *args, **kwargs: 0)
     monkeypatch.setattr(
         "teammem.daily.run_report",
@@ -170,9 +180,45 @@ def test_daily_runs_weekly_report_only_on_friday(tmp_path, monkeypatch):
     assert calls == [NOW.date()]
 
 
+def test_daily_uses_operator_friday_but_collects_with_utc_clock(
+    tmp_path, monkeypatch
+):
+    local_now = datetime(
+        2026, 7, 17, 18, 20, tzinfo=timezone(timedelta(hours=-7))
+    )
+    snapshots = tmp_path / "snapshots"
+    cfg = _cfg(tmp_path, TEAMMEM_SNAPSHOTS=str(snapshots))
+    seen = {}
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: object())
+    monkeypatch.setattr(
+        "teammem.daily.run_journal",
+        lambda *args, **kwargs: seen.setdefault("journal_day", kwargs["today"]) and 0,
+    )
+    monkeypatch.setattr(
+        "teammem.daily.run_report",
+        lambda *args, **kwargs: seen.setdefault("report_day", kwargs["base"]) and 0,
+    )
+
+    result = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings("github"),
+        local_now,
+        connectors={"github": RecordingConnector("github", seen)},
+    )
+
+    assert result.status("report") == "ok"
+    assert seen["connector_now"].tzinfo == timezone.utc
+    assert seen["connector_now"] == datetime(2026, 7, 18, 1, 20, tzinfo=timezone.utc)
+    assert seen["journal_day"].isoformat() == "2026-07-17"
+    assert seen["report_day"].isoformat() == "2026-07-17"
+    assert "generated: 2026-07-17" in (cfg.vault_dir / "README.md").read_text()
+    assert (snapshots / "ledger-2026-07-17.db").exists()
+
+
 def test_daily_marks_unconfigured_optional_stages_skipped(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
-    monkeypatch.setattr("teammem.daily._llm_backend", lambda *args: None)
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
     result = run_daily(
         cfg, IdentityMaps.load(CONFIG_DIR), _settings(), NOW, connectors={}
     )
@@ -201,7 +247,7 @@ def test_daily_imports_only_from_configured_disposable_staging_directory(
         TEAMMEM_ARCHIVE=str(tmp_path / "archive"),
         TEAMMEM_QUARANTINE=str(tmp_path / "quarantine"),
     )
-    monkeypatch.setattr("teammem.daily._llm_backend", lambda *args: None)
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
 
     result = run_daily(
         cfg, IdentityMaps.load(CONFIG_DIR), _settings(), NOW, connectors={}
@@ -221,7 +267,7 @@ def test_daily_persists_channel_metadata_atomically_after_collection(
         (cfgdir / name).write_text((CONFIG_DIR / name).read_text())
     (cfgdir / "channel_names.json").write_text('{"old": "Existing"}')
     cfg = _cfg(tmp_path, TEAMMEM_CONFIG_DIR=str(cfgdir))
-    monkeypatch.setattr("teammem.daily._llm_backend", lambda *args: None)
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
     result = run_daily(
         cfg,
         IdentityMaps.load(cfgdir),
@@ -245,7 +291,7 @@ def test_daily_persists_channel_metadata_atomically_after_collection(
 
 def test_daily_llm_failure_is_visible_but_render_still_runs(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
-    monkeypatch.setattr("teammem.daily._llm_backend", lambda *args: object())
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: object())
     monkeypatch.setattr(
         "teammem.daily.run_journal",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("llm offline")),
@@ -266,7 +312,7 @@ def test_daily_snapshot_uses_sqlite_backup_and_retains_fourteen(tmp_path, monkey
     for day in range(1, 16):
         (snapshots / f"ledger-2026-06-{day:02d}.db").write_text("old")
     cfg = _cfg(tmp_path, TEAMMEM_SNAPSHOTS=str(snapshots))
-    monkeypatch.setattr("teammem.daily._llm_backend", lambda *args: None)
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
 
     result = run_daily(
         cfg, IdentityMaps.load(CONFIG_DIR), _settings(), NOW, connectors={}

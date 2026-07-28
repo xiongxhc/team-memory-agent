@@ -41,7 +41,23 @@ class CollectionRun:
     warnings: tuple[str, ...]
 
 
-def _llm_backend(cfg: Config, model: str, max_tokens: int):
+def redact_secrets(detail: object, cfg: Config) -> str:
+    """Remove configured credential values from operator-visible details."""
+    text = str(detail)
+    for secret in (
+        cfg.gitlab_token,
+        cfg.feishu_app_secret,
+        cfg.github_token,
+        cfg.slack_bot_token,
+        cfg.discord_bot_token,
+        cfg.anthropic_api_key,
+    ):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
+
+
+def resolve_llm_backend(cfg: Config, model: str, max_tokens: int):
     """Resolve the optional synthesis backend without exposing credentials."""
     if cfg.anthropic_api_key:
         return http_llm(model, cfg.anthropic_api_key, max_tokens=max_tokens)
@@ -216,9 +232,12 @@ def run_render(
         try:
             push(cfg.vault_dir)
             print("pushed")
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as error:
+            lines = (error.stderr or "").strip().splitlines()
+            detail = redact_secrets(lines[-1] if lines else error, cfg)
             print(
-                "WARN: vault push failed; commits retained for next push",
+                f"WARN: vault push failed ({detail}); "
+                "commits retained for next push",
                 file=sys.stderr,
             )
     return 0
@@ -263,7 +282,9 @@ def run_journal(
             "no LLM calls, nothing written"
         )
         return 0
-    backend = llm or _llm_backend(cfg, cfg.llm_daily_model, max_tokens=1024)
+    backend = llm or resolve_llm_backend(
+        cfg, cfg.llm_daily_model, max_tokens=1024
+    )
     if backend is None:
         print(
             "no LLM backend: set ANTHROPIC_API_KEY or install the claude CLI",
@@ -352,7 +373,9 @@ def run_report(
             f" {'hit' if cached else 'miss'}"
         )
         return 0
-    backend = llm or _llm_backend(cfg, cfg.llm_report_model, max_tokens=8192)
+    backend = llm or resolve_llm_backend(
+        cfg, cfg.llm_report_model, max_tokens=8192
+    )
     if backend is None:
         print(
             "no LLM backend: set ANTHROPIC_API_KEY or install the claude CLI",
