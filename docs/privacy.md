@@ -7,8 +7,8 @@ creates no schedule. Every GitHub, GitLab, Slack, Feishu, and Discord enable fla
 defaults to `false`. `teammem connectors list` and `teammem connectors check`
 inspect local configuration only.
 
-The hub belongs on an operator-controlled, normally available Mac mini, Linux
-server, or VPS. Provider payloads and the SQLite ledger remain on that machine.
+The hub belongs on an always-on, operator-controlled Mac mini, Linux server, or
+VPS. Provider payloads and the SQLite ledger remain on that machine.
 Rendered views expose normalized summaries and references; operators are
 responsible for access control to the ledger, inbox, archive, quarantine,
 snapshots, and rendered views.
@@ -43,7 +43,8 @@ hide user-authored content. The daily result surfaces that diagnostic.
 
 Feishu is an official option, not a legacy path. The existing private deployment
 remains Feishu-based and unchanged; enabling Slack in a separate public
-deployment does not migrate, replace, or reconfigure it.
+deployment does not migrate, replace, or reconfigure it. Public Slack remains
+optional and collects only human top-level messages in its allowlisted channels.
 
 ## Credentials and configuration
 
@@ -98,8 +99,21 @@ setup` asks the member to accept the proposed 17:30 local time, choose another
 time, or decline.
 
 The hub's `teammem run-daily` command also runs once and never installs a
-schedule. Built-in hub schedule installation is not part of the current command
-set.
+schedule. Package installation creates no background job. Only the explicit
+`teammem schedule install --time HH:MM` command installs or replaces the
+operator's 18:20-local-time-by-default launchd or systemd user job;
+`teammem schedule status` inspects it and `teammem schedule remove` removes it.
+
+The schedule definition contains no credential values. Its process invocation
+contains only the resolved executable, `--env-file`, the private environment
+file's path, and `run-daily`; secrets stay inside the separately protected
+`0600` file. The built-in job does not pull or export the private MemberKit Git
+inbox. Operators either refresh a disposable staging export separately before a
+scheduled import or omit inbox paths from the scheduled configuration.
+
+Scheduling does not turn the hub into an inbound service. Provider polling and
+operator-owned Git transport need outbound access, but the hub opens no inbound
+public port.
 
 ## Intended use
 

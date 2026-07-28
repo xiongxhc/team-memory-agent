@@ -27,6 +27,16 @@ if [ -n "$matches" ]; then
   exit 1
 fi
 
+obsolete_schedule_claims=$(git grep -nI -E \
+  -e '(does not yet provide|has no) hub schedule' \
+  -e 'hub schedule installation (belongs to|is not part of)' \
+  -- README.md docs || test $? -eq 1)
+if [ -n "$obsolete_schedule_claims" ]; then
+  printf '%s\n' "$obsolete_schedule_claims"
+  echo "obsolete hub-scheduling claim found"
+  exit 1
+fi
+
 if [ -n "${TEAMMEM_PUBLIC_DENY_REGEX:-}" ]; then
   private_matches=$(git grep -nI -E \
     -e "$TEAMMEM_PUBLIC_DENY_REGEX" -- || test $? -eq 1)

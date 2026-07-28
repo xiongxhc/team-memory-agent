@@ -4,26 +4,29 @@ Team Memory Agent has two installation locations:
 
 | Location | Package | Responsibility |
 |---|---|---|
-| Operator-controlled, normally available Mac mini, Linux server, or VPS | `teammem` | Poll enabled central providers, import reviewed bundles, own the ledger, and render shared views |
+| Always-on, operator-controlled Mac mini, Linux server, or VPS | `teammem` | Poll enabled central providers, import reviewed bundles, own the ledger, and render shared views |
 | Each participating member's workstation | `teammem-memberkit` | Prepare local drafts, support manual highlights, remind, review, and explicitly push |
 
-Start the hub manually. Package installation enables no network connector,
-performs no provider request, and creates no schedule. `teammem run-daily` is one
-run only on the operator machine.
+Install and configure the hub, validate it, and run it manually before scheduling
+it. Package installation enables no network connector, performs no provider
+request, and creates no background job. `teammem run-daily` is one run only on
+the operator machine. Only `teammem schedule install` creates a schedule.
 
 ## Hub installation lifecycle
 
 The connector-capable hub is version 0.2.0 and requires Python 3.11 or newer.
+PyPI currently has 0.1.0, not this connector-capable release.
 
 ### Current source-checkout installation
 
-Until 0.2.0 is published, operators can install a reviewed source revision:
+The current pre-release path is a reviewed source revision:
 
 ```bash
 git clone https://github.com/xiongxhc/team-memory-agent.git
 cd team-memory-agent
 python3 -m venv .venv
 .venv/bin/pip install -e .
+source .venv/bin/activate
 mkdir -p ~/.config/teammem
 chmod 700 ~/.config/teammem
 cp config/roster.example.yaml ~/.config/teammem/roster.yaml
@@ -31,49 +34,62 @@ cp config/projects.example.yaml ~/.config/teammem/projects.yaml
 cp config/connectors.example.yaml ~/.config/teammem/connectors.yaml
 touch ~/.config/teammem/hub.env
 chmod 600 ~/.config/teammem/hub.env
+$EDITOR ~/.config/teammem/hub.env
 ```
 
 Edit the three YAML files and `hub.env` before enabling collection. Never commit
 the environment file. Keep secrets, ledgers, inboxes, archives, quarantine
-records, snapshots, and rendered views outside the checkout. Invoke the hub as
-`.venv/bin/teammem`.
+records, snapshots, and rendered views outside the checkout. Keep this virtual
+environment activated when installing the schedule so the scheduler records the
+correct `teammem` executable.
 
-Upgrade a source installation only after reviewing the target revision:
+For a scheduled source installation, remove the old schedule before upgrading.
+Review the target revision, reinstall, validate, run once manually, and then
+explicitly recreate the schedule:
 
 ```bash
+source .venv/bin/activate
+teammem schedule remove
 git status --short
 git pull --ff-only
 .venv/bin/pip install --upgrade -e .
-.venv/bin/teammem connectors check
-.venv/bin/teammem run-daily
+teammem connectors check
+teammem run-daily
+teammem schedule install --time 18:20
 ```
 
-Uninstall it with:
+Remove the schedule before uninstalling the source installation:
 
 ```bash
+source .venv/bin/activate
+teammem schedule remove
 .venv/bin/pip uninstall teammem
 ```
 
 ### Published-package path after release
 
-Once a connector-capable release is confirmed on the package index, install it
-with an explicit minimum version:
+After a connector-capable release is confirmed on PyPI, install it with an
+explicit minimum version:
 
 ```bash
 pipx install 'teammem>=0.2.0'
 ```
 
-For a currently installed 0.2.0-or-newer package:
+Do not treat this after-publication command as a claim that 0.2.0 is currently
+available. For a scheduled 0.2.0-or-newer package installation, use this order:
 
 ```bash
+teammem schedule remove
 pipx upgrade teammem
 teammem connectors check
 teammem run-daily
+teammem schedule install --time 18:20
 ```
 
-Uninstall the packaged command with:
+Remove the schedule before uninstalling the packaged command:
 
 ```bash
+teammem schedule remove
 pipx uninstall teammem
 ```
 
@@ -137,8 +153,9 @@ Discord's messages endpoint returns no history without
 An empty channel result therefore produces a diagnostic warning to verify both.
 
 Feishu is a first-class official provider. The private deployment remains
-Feishu-based and unchanged. The public GitHub + Slack quick start neither
-reconfigures nor replaces it.
+Feishu-based and unchanged. Public Slack is an optional,
+top-level-message-only connector; the GitHub + Slack quick start neither
+reconfigures nor replaces the private deployment.
 
 ### Example GitHub + Slack mapping
 
@@ -177,7 +194,7 @@ members:
 Use example IDs only in public files. Put actual IDs in the operator-owned
 configuration.
 
-## Validate, then run once
+## Validate, run once, then schedule
 
 The following commands load local configuration and credentials but do not call a
 provider:
@@ -204,11 +221,130 @@ remain visible but may still permit deterministic rendering from ledger evidence
 and cached summaries.
 
 `run-daily` does not stay resident and does not install, change, or remove a
-schedule. The current package has no hub schedule-install command. Built-in
-launchd/systemd management belongs to the later operator-scheduling task; until
-then, run it manually or invoke this one-shot command from an independently
-managed trusted scheduler. Polling needs outbound HTTPS (and Git access when the
-operator performs inbox/vault transport), not an inbound public port.
+schedule. After that observed run succeeds, explicitly install the 18:20 daily
+job and inspect it:
+
+```bash
+teammem schedule install --time 18:20
+teammem schedule status
+```
+
+The time is the operator host's local timezone. Package installation alone does
+nothing in the background; only `schedule install` writes and enables the job.
+The schedule's invocation contains only the resolved `teammem` executable,
+`--env-file`, the environment-file path, and `run-daily`. Credential values
+remain in the user-owned `0600` environment file and are never copied into the
+launchd or systemd definition.
+
+Polling needs outbound provider HTTPS access and Git access when the operator
+performs inbox or vault transport. It opens no inbound public port.
+
+### macOS: launchd
+
+On an always-on Mac mini, installation writes and loads this user LaunchAgent:
+
+```text
+~/Library/LaunchAgents/org.teammem.hub-daily.plist
+```
+
+Its output files are:
+
+```text
+~/.local/state/teammem/schedule.log
+~/.local/state/teammem/schedule.err
+```
+
+Inspect or remove it through the CLI:
+
+```bash
+teammem schedule status
+teammem schedule remove
+```
+
+The `StartCalendarInterval` uses local time. Apple's documented behavior is that
+a calendar job missed while the Mac is asleep runs when the computer wakes; a
+job missed while the Mac is powered off waits until the next designated time.
+See Apple's
+[Scheduling Timed Jobs](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/ScheduledJobs.html).
+This is a per-user LaunchAgent, so keep the operator's GUI session logged in.
+Keep the host normally available and rely on the connector lookback, not the
+scheduler alone, to recover provider events after a gap.
+
+Use this exact upgrade order:
+
+```bash
+teammem schedule remove
+pipx upgrade teammem
+teammem connectors check
+teammem run-daily
+teammem schedule install --time 18:20
+```
+
+For a source checkout, replace the `pipx upgrade` step with the reviewed
+`git pull --ff-only` and editable reinstall shown above. Always run
+`teammem schedule remove` before uninstalling either installation.
+
+### Linux server or VPS: systemd user timer
+
+Installation writes and enables these user units:
+
+```text
+~/.config/systemd/user/teammem-daily.service
+~/.config/systemd/user/teammem-daily.timer
+```
+
+On an unattended server or VPS, an administrator must enable lingering for the
+operator account so its user manager starts at boot and remains available after
+logout:
+
+```bash
+sudo loginctl enable-linger "$USER"
+teammem schedule install --time 18:20
+```
+
+That administrative choice is the operator's responsibility; `teammem` does not
+run `sudo` or change linger state. The
+[official `loginctl` manual](https://www.freedesktop.org/software/systemd/man/latest/loginctl.html)
+documents that `enable-linger` starts the user manager at boot and keeps it
+after logout.
+
+Inspect the timer, next run, and service logs with:
+
+```bash
+teammem schedule status
+systemctl --user status teammem-daily.timer
+systemctl --user list-timers teammem-daily.timer
+journalctl --user -u teammem-daily.service
+```
+
+The timer contains `OnCalendar=*-*-* 18:20:00` without a timezone suffix, so
+systemd uses the host's current local timezone. `Persistent=true` causes one
+missed calendar activation to run when the user timer becomes active again. See
+the official
+[`systemd.timer`](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html)
+and
+[`systemd.time`](https://www.freedesktop.org/software/systemd/man/latest/systemd.time.html)
+manuals. Connector lookback then recovers provider events from the gap, while
+ledger idempotency prevents duplicate attributed events on overlapping runs.
+
+Remove the timer with:
+
+```bash
+teammem schedule remove
+```
+
+Use the same remove, upgrade, validate, manual-run, and reinstall order shown for
+macOS. Remove the timer before uninstalling `teammem`.
+
+### Local-filesystem requirement
+
+Schedule lifecycle operations serialize changes with a directory lock. That
+locking has been verified on local macOS filesystems and normal local Linux
+filesystem semantics. NFS and SMB locking behavior varies by server, client, and
+mount configuration. If the operator's home is network-mounted, place the
+schedule-definition directories on a local filesystem or use an external
+trusted scheduler with equivalent lifecycle controls; do not assume the built-in
+schedule is safe on an unverified network home.
 
 ## Safe MemberKit inbox import
 
@@ -255,7 +391,16 @@ Git checkout. A later export can contain previously accepted bundles; event and
 archive idempotency inserts no duplicate events.
 
 `run-daily` does not pull the inbox checkout or create this export. Inbox
-transport remains an explicit operator-owned step.
+transport remains an explicit operator-owned step. The built-in schedule invokes
+only `teammem run-daily`; it does not run `git pull`, `git archive`, or any
+private MemberKit transport command.
+
+If `TEAMMEM_INBOX`, `TEAMMEM_ARCHIVE`, and `TEAMMEM_QUARANTINE` are configured
+for a scheduled run, the operator must refresh a disposable staging export
+separately before that run. The transport checkout itself must remain clean and
+must never be configured as the import path. If no separate refresh workflow is
+in place, omit all three inbox paths from the scheduled hub configuration and
+perform bundle staging/import during an observed manual run instead.
 
 ## MemberKit lifecycle
 
