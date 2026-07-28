@@ -2,6 +2,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 SCANNER = Path(__file__).parents[1] / "scripts" / "check-public.sh"
 
@@ -63,6 +65,40 @@ def test_public_scan_applies_operator_private_identifier_regex(tmp_path):
         capture_output=True,
         text=True,
         env=env,
+    )
+
+    assert result.returncode == 1
+
+
+def test_public_scan_rejects_tracked_hub_environment_file(tmp_path):
+    _tracked_repo(tmp_path, "hub.env", "TEAMMEM_SINCE_DAYS=7\n")
+
+    result = subprocess.run(
+        [str(SCANNER)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "ghp_" + "A" * 36,
+        "glpat-" + "A" * 20,
+        "xoxb-" + "1" * 12 + "-" + "2" * 12 + "-" + "A" * 24,
+    ],
+)
+def test_public_scan_rejects_provider_token_shapes_in_prose(tmp_path, credential):
+    _tracked_repo(tmp_path, "notes.txt", f"temporary credential: {credential}\n")
+
+    result = subprocess.run(
+        [str(SCANNER)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
     )
 
     assert result.returncode == 1

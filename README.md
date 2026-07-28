@@ -82,6 +82,15 @@ memberkit dismiss --date YYYY-MM-DD
 The date defaults to today for `draft`, `review`, `push`, and `dismiss`. Removed or
 dismissed events remain excluded from later catch-up drafts.
 
+For work from WhatsApp, Telegram, LINE, email, meetings, or another source that
+the hub does not support, MemberKit remains the reviewed manual fallback. Add a
+valid `journal-highlight` entry to an existing local draft's `events` list, run
+`memberkit review`, and push only if the draft is correct. The entry stays local
+until `memberkit push`; MemberKit does not log in to, scrape, or automatically
+read those applications. See the
+[`teammem-bundle/v1` contract](https://github.com/xiongxhc/team-memory-agent/blob/master/schemas/teammem-bundle-v1.md)
+for the five required event fields.
+
 ### Schedule behavior
 
 A scheduled run checks yesterday and today, preserving every event's original local
@@ -109,22 +118,144 @@ for upgrades, troubleshooting, files created locally, and safe removal.
 
 ## Hub quick start
 
-The hub operator manages the central collectors, roster, inbox importer, ledger,
-and rendered views. Install the published command in an isolated environment:
+The hub runs on an operator-controlled, normally available machine: an always-on
+Mac mini, a Linux server, or a VPS. It collects central sources, imports reviewed
+MemberKit bundles, owns the SQLite ledger, and renders the shared Markdown views.
+Members do not install it.
+
+The public quick start uses GitHub and Slack. GitLab, Feishu, and Discord are
+equally supported built-in options. Every network connector is disabled by
+default; package installation makes no provider request and creates no schedule.
+
+### 1. Install the published package
 
 ```bash
 pipx install teammem
 mkdir -p ~/.config/teammem
+chmod 700 ~/.config/teammem
 curl -fsSL \
   https://raw.githubusercontent.com/xiongxhc/team-memory-agent/master/config/roster.example.yaml \
   -o ~/.config/teammem/roster.yaml
 curl -fsSL \
   https://raw.githubusercontent.com/xiongxhc/team-memory-agent/master/config/projects.example.yaml \
   -o ~/.config/teammem/projects.yaml
+curl -fsSL \
+  https://raw.githubusercontent.com/xiongxhc/team-memory-agent/master/config/connectors.example.yaml \
+  -o ~/.config/teammem/connectors.yaml
+touch ~/.config/teammem/hub.env
+chmod 600 ~/.config/teammem/hub.env
 ```
 
-Edit both configuration files before collecting or importing data. Operators who
-are developing adapters or running from a pinned checkout can instead use:
+Requires Python 3.11 or newer and `pipx`. Upgrade or uninstall the packaged
+command with:
+
+```bash
+pipx upgrade teammem
+pipx uninstall teammem
+```
+
+Uninstalling the command does not remove operator-owned configuration, ledgers,
+archives, quarantine records, inbox exports, snapshots, or rendered views.
+
+### 2. Configure GitHub and Slack
+
+Edit `connectors.yaml` so only the chosen connectors are enabled:
+
+```yaml
+connectors:
+  github:
+    enabled: true
+  gitlab:
+    enabled: false
+  slack:
+    enabled: true
+  feishu:
+    enabled: false
+  discord:
+    enabled: false
+```
+
+In `projects.yaml`, add only the repositories and shared project channels the hub
+should collect:
+
+```yaml
+projects:
+  project-alpha:
+    github_repos: [team/project-alpha]
+    slack_channels: [C0123]
+```
+
+Add each member's GitHub login and Slack user ID to `roster.yaml`. Create a
+fine-grained GitHub token limited to those repositories with **Contents: read**
+and **Pull requests: read**. Create a Slack app with a bot token, grant
+`channels:read` and `channels:history` (plus `groups:read` and `groups:history`
+only for private project channels), and visibly add the app to every configured
+channel.
+
+Edit the user-only `hub.env` and set actual values for
+`TEAMMEM_GITHUB_TOKEN`, `TEAMMEM_SLACK_BOT_TOKEN`, `TEAMMEM_CONFIG_DIR`,
+`TEAMMEM_DB`, and `TEAMMEM_VAULT`. Values are literal, so use absolute paths
+rather than `~` or shell variables. Process environment values override this
+file.
+
+The complete provider table, current official permission links, and all runtime
+paths are in the
+[deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md).
+
+### 3. Check locally, then run once
+
+These two commands inspect local configuration only; they do not authenticate or
+make network requests:
+
+```bash
+teammem connectors list
+teammem connectors check
+```
+
+Then perform one operator-observed run:
+
+```bash
+teammem run-daily
+```
+
+`teammem run-daily` executes one idempotent run on the operator machine and
+returns a per-step result. It does not remain resident and does not create,
+change, or remove a schedule. Hub schedule installation belongs to a later
+operator-scheduling release; package installation alone never schedules this
+command.
+
+### What the built-in connectors can see
+
+| Connector | Collection boundary |
+|---|---|
+| GitHub | Commits and pull requests from explicitly mapped repositories |
+| GitLab | Commits and merge requests in the operator-configured group; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
+| Slack | Human top-level messages in explicitly mapped shared project channels; no DMs and no thread replies |
+| Feishu | Human messages in explicitly mapped group chats; no direct chats |
+| Discord | Human messages in explicitly mapped guild channels; no DMs, bot messages, or webhooks |
+
+Slack polling uses 15 messages per page and 60-second pacing between history
+pages, matching the limits applicable to commercially distributed
+non-Marketplace apps. Discord may return empty content or history when
+`READ_MESSAGE_HISTORY` or `MESSAGE_CONTENT` access is missing.
+
+Feishu remains a first-class official connector. The existing private deployment
+continues to use Feishu unchanged; the GitHub + Slack public path is an additional
+configuration, not a migration or replacement.
+
+### Reviewed bundle inbox
+
+The operator creates a private inbox Git repository, grants each member push
+access, and provides each member an inbox URL and roster slug. Import from a
+disposable `git archive` export, never directly from the transport checkout:
+accepted and quarantined files are consumed from the configured import directory.
+See the [deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md)
+for the safe export and `run-daily` workflow.
+
+### Source-checkout alternative
+
+Operators developing adapters or running a pinned checkout can install it in a
+dedicated virtual environment instead:
 
 ```bash
 git clone https://github.com/xiongxhc/team-memory-agent.git
@@ -133,44 +264,18 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 cp config/roster.example.yaml config/roster.yaml
 cp config/projects.example.yaml config/projects.yaml
+cp config/connectors.example.yaml config/connectors.yaml
 ```
 
-Import reviewed bundles into a local ledger:
+Run checkout commands as `.venv/bin/teammem ...`. To upgrade, review the target
+revision, update the checkout with `git pull --ff-only`, then run
+`.venv/bin/pip install --upgrade -e .`. To uninstall the checkout installation,
+run `.venv/bin/pip uninstall teammem`; preserve runtime data outside the checkout
+before deleting the virtual environment or checkout.
 
-```bash
-TEAMMEM_DB=ledger.db TEAMMEM_CONFIG_DIR=~/.config/teammem \
-  teammem import-bundles \
-    --inbox inbox \
-    --archive archive \
-    --quarantine quarantine
-```
-
-Render Markdown views:
-
-```bash
-TEAMMEM_DB=ledger.db TEAMMEM_CONFIG_DIR=~/.config/teammem TEAMMEM_VAULT=vault \
-  teammem render
-```
-
-GitLab and Feishu collectors are optional. LLM-backed synthesis is optional; the
-ledger, bundle importer, queries, and deterministic renderer work without it.
-
-The operator should create a private inbox Git repository, grant each member push
-access, and give each member an inbox URL and roster slug. Import from a disposable
-export of the inbox, not directly from its Git working tree, because accepted
-files are consumed from the import directory. See
-[deployment](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md)
-for the complete operator and MemberKit lifecycle.
-
-Upgrade or uninstall the packaged command with:
-
-```bash
-pipx upgrade teammem
-pipx uninstall teammem
-```
-
-Uninstalling the command does not remove operator-owned configuration, ledgers,
-archives, quarantine records, or rendered views.
+LLM-backed synthesis is optional. Without a configured backend, journal and
+weekly-report synthesis are skipped while the ledger, importer, queries, and
+deterministic renderer continue to work.
 
 ## Principles
 

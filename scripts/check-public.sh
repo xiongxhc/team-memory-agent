@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-bad_files=$(git ls-files -- '*.db' '*.pem' '*.key' '.env' '*/.env')
+bad_files=$(git ls-files -- '*.db' '*.pem' '*.key' '.env' '*/.env' 'hub.env' '*/hub.env')
 if [ -n "$bad_files" ]; then
   echo "runtime or credential-like files found:"
   echo "$bad_files"
@@ -14,6 +14,7 @@ matches=$(git grep -nI -E \
   -e '(^|[^0-9A-Fa-f:])([Ff][CcDd][0-9A-Fa-f]{2}|[Ff][Ee][89AaBb][0-9A-Fa-f]):' \
   -e 'gitlab\.company\.local' \
   -e 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' \
+  -e '(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})' \
   -e '"(api[_-]?(key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|password|private[_-]?key|token|secret)"[[:space:]]*:[[:space:]]*"[A-Za-z0-9_./+=$:@-]{16,}"' \
   -e '^[[:space:]]*(api[_-]?(key|token)|access[_-]?token|auth[_-]?token|client[_-]?secret|password|private[_-]?key|token|secret):[[:space:]]*[A-Za-z0-9_./+=$:@-]{16,}' \
   -e '^[[:space:]]*[A-Z0-9_]*(API_KEY|API_TOKEN|TOKEN|SECRET|PASSWORD|PRIVATE_KEY)[A-Z0-9_]*[[:space:]]*=[[:space:]]*"?[A-Za-z0-9_./+=$:@-]{16,}' \
