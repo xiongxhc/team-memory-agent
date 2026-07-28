@@ -87,6 +87,37 @@ def _run(
     )
 
 
+def _launchctl(
+    runner: Runner | None,
+    *arguments: str,
+    check: bool,
+) -> subprocess.CompletedProcess[str]:
+    return _run(runner, ["launchctl", *arguments], check=check)
+
+
+def _systemctl(
+    runner: Runner | None,
+    *arguments: str,
+    check: bool,
+) -> subprocess.CompletedProcess[str]:
+    return _run(runner, ["systemctl", "--user", *arguments], check=check)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.stat().st_uid != os.getuid():
+        raise PermissionError(f"schedule state directory is not user-owned: {path}")
+    path.chmod(0o700)
+
+
 def _write_atomic(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
@@ -97,13 +128,25 @@ def _write_atomic(path: Path, data: bytes) -> None:
             delete=False,
         ) as handle:
             temporary = Path(handle.name)
+            temporary.chmod(0o600)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        path.chmod(0o600)
+        _fsync_directory(path.parent)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _unlink_durable(path: Path) -> bool:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    _fsync_directory(path.parent)
+    return True
 
 
 def _executable(value: str | None) -> str:
@@ -122,11 +165,7 @@ def _launchd_target() -> str:
 
 
 def _launchd_loaded(runner: Runner | None) -> bool:
-    result = _run(
-        runner,
-        ["launchctl", "print", _launchd_target()],
-        check=False,
-    )
+    result = _launchctl(runner, "print", _launchd_target(), check=False)
     return result.returncode == 0
 
 
@@ -139,16 +178,18 @@ def _install_launchd(
     runner: Runner | None,
 ) -> Path:
     path = _launchd_path(agents_dir)
-    if _launchd_loaded(runner):
-        _run(
-            runner,
-            ["launchctl", "bootout", _launchd_target()],
-            check=True,
+    previous = path.read_bytes() if path.exists() else None
+    was_loaded = _launchd_loaded(runner)
+    if was_loaded and previous is None:
+        raise RuntimeError(
+            "cannot replace loaded launchd schedule without its definition"
         )
+    if was_loaded:
+        _launchctl(runner, "bootout", _launchd_target(), check=True)
 
     state_dir = Path.home() / ".local" / "state" / "teammem"
     if agents_dir is None:
-        state_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(state_dir)
     payload = {
         "Label": LABEL,
         "ProgramArguments": [
@@ -162,17 +203,68 @@ def _install_launchd(
         "StandardOutPath": str(state_dir / "schedule.log"),
         "StartCalendarInterval": {"Hour": hour, "Minute": minute},
     }
-    _write_atomic(path, plistlib.dumps(payload, sort_keys=True))
-    _run(
-        runner,
-        ["launchctl", "bootstrap", _launchd_domain(), str(path)],
-        check=True,
-    )
+    try:
+        _write_atomic(path, plistlib.dumps(payload, sort_keys=True))
+        _launchctl(
+            runner, "bootstrap", _launchd_domain(), str(path), check=True
+        )
+    except Exception as failure:
+        try:
+            if previous is None:
+                _unlink_durable(path)
+            else:
+                _write_atomic(path, previous)
+            if was_loaded:
+                _launchctl(
+                    runner,
+                    "bootstrap",
+                    _launchd_domain(),
+                    str(path),
+                    check=True,
+                )
+        except Exception as rollback_failure:
+            raise RuntimeError(
+                "launchd schedule installation failed and rollback failed"
+            ) from rollback_failure
+        restored = (
+            "previous schedule restored"
+            if previous is not None
+            else "previous state restored"
+        )
+        raise RuntimeError(
+            f"launchd schedule installation failed; {restored}"
+        ) from failure
     return path
 
 
 def _systemd_exec(arguments: Sequence[str]) -> str:
     return shlex.join([argument.replace("%", "%%") for argument in arguments])
+
+
+def _systemd_enabled(runner: Runner | None) -> bool:
+    result = _systemctl(runner, "is-enabled", SYSTEMD_TIMER, check=False)
+    return result.returncode == 0
+
+
+def _set_systemd_enabled(runner: Runner | None, enabled: bool) -> None:
+    action = "enable" if enabled else "disable"
+    _systemctl(runner, action, "--now", SYSTEMD_TIMER, check=True)
+
+
+def _reload_systemd(runner: Runner | None) -> None:
+    _systemctl(runner, "daemon-reload", check=True)
+
+
+def _snapshot_files(paths: Sequence[Path]) -> dict[Path, bytes | None]:
+    return {path: path.read_bytes() if path.exists() else None for path in paths}
+
+
+def _restore_files(snapshot: dict[Path, bytes | None]) -> None:
+    for path, previous in snapshot.items():
+        if previous is None:
+            _unlink_durable(path)
+        else:
+            _write_atomic(path, previous)
 
 
 def _install_systemd(
@@ -184,6 +276,10 @@ def _install_systemd(
     runner: Runner | None,
 ) -> Path:
     service_path, timer_path = _systemd_paths(systemd_dir)
+    previous = _snapshot_files([service_path, timer_path])
+    was_enabled = (
+        _systemd_enabled(runner) if previous[timer_path] is not None else False
+    )
     service = (
         "[Unit]\n"
         "Description=Run Team Memory Agent daily workflow\n"
@@ -204,18 +300,28 @@ def _install_systemd(
         "[Install]\n"
         "WantedBy=timers.target\n"
     )
-    _write_atomic(service_path, service.encode())
-    _write_atomic(timer_path, timer.encode())
-    _run(
-        runner,
-        ["systemctl", "--user", "daemon-reload"],
-        check=True,
-    )
-    _run(
-        runner,
-        ["systemctl", "--user", "enable", "--now", SYSTEMD_TIMER],
-        check=True,
-    )
+    enable_attempted = False
+    try:
+        _write_atomic(service_path, service.encode())
+        _write_atomic(timer_path, timer.encode())
+        _reload_systemd(runner)
+        enable_attempted = True
+        _set_systemd_enabled(runner, True)
+    except Exception as failure:
+        try:
+            _restore_files(previous)
+            _reload_systemd(runner)
+            if was_enabled:
+                _set_systemd_enabled(runner, True)
+            elif enable_attempted:
+                _set_systemd_enabled(runner, False)
+        except Exception as rollback_failure:
+            raise RuntimeError(
+                "systemd schedule installation failed and rollback failed"
+            ) from rollback_failure
+        raise RuntimeError(
+            "systemd schedule installation failed; previous state restored"
+        ) from failure
     return timer_path
 
 
@@ -258,6 +364,29 @@ def _launchd_time(path: Path) -> str | None:
         return None
 
 
+def _launchd_definition_is_valid(path: Path) -> bool:
+    try:
+        data = plistlib.loads(path.read_bytes())
+        arguments = data["ProgramArguments"]
+        return (
+            data["Label"] == LABEL
+            and data["RunAtLoad"] is False
+            and _launchd_time(path) is not None
+            and isinstance(arguments, list)
+            and len(arguments) == 4
+            and isinstance(arguments[0], str)
+            and bool(arguments[0])
+            and arguments[1] == "--env-file"
+            and isinstance(arguments[2], str)
+            and bool(arguments[2])
+            and arguments[3] == "run-daily"
+            and isinstance(data["StandardOutPath"], str)
+            and isinstance(data["StandardErrorPath"], str)
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+
+
 def _systemd_time(path: Path) -> str | None:
     try:
         text = path.read_text()
@@ -276,29 +405,67 @@ def _systemd_time(path: Path) -> str | None:
     return f"{hour:02d}:{minute:02d}"
 
 
+def _systemd_definition_is_valid(
+    service_path: Path,
+    timer_path: Path,
+) -> bool:
+    try:
+        service = service_path.read_text()
+        timer = timer_path.read_text()
+        exec_lines = [
+            line.removeprefix("ExecStart=")
+            for line in service.splitlines()
+            if line.startswith("ExecStart=")
+        ]
+        arguments = shlex.split(exec_lines[0]) if len(exec_lines) == 1 else []
+    except (OSError, ValueError):
+        return False
+    return (
+        "[Service]" in service.splitlines()
+        and "Type=oneshot" in service.splitlines()
+        and len(arguments) == 4
+        and bool(arguments[0])
+        and arguments[1] == "--env-file"
+        and bool(arguments[2])
+        and arguments[3] == "run-daily"
+        and "[Timer]" in timer.splitlines()
+        and _systemd_time(timer_path) is not None
+        and "Persistent=true" in timer.splitlines()
+        and f"Unit={SYSTEMD_SERVICE}" in timer.splitlines()
+        and "WantedBy=timers.target" in timer.splitlines()
+    )
+
+
 def schedule_status(
     platform: str | None = None,
     agents_dir: Path | None = None,
     systemd_dir: Path | None = None,
     runner: Runner | None = None,
 ) -> ScheduleStatus:
-    """Read the installed definition without changing scheduler state."""
-    del runner
+    """Read valid definition and active user-scheduler state without mutation."""
     backend = _backend(platform)
     if backend == "launchd":
         path = _launchd_path(agents_dir)
+        exists = path.exists()
+        time = _launchd_time(path) if exists else None
+        valid = exists and _launchd_definition_is_valid(path)
         return ScheduleStatus(
-            path.exists(),
-            _launchd_time(path) if path.exists() else None,
+            valid and _launchd_loaded(runner),
+            time,
             backend,
             path,
         )
 
     service_path, timer_path = _systemd_paths(systemd_dir)
-    installed = service_path.exists() and timer_path.exists()
+    time = _systemd_time(timer_path) if timer_path.exists() else None
+    valid = (
+        service_path.exists()
+        and timer_path.exists()
+        and _systemd_definition_is_valid(service_path, timer_path)
+    )
     return ScheduleStatus(
-        installed,
-        _systemd_time(timer_path) if installed else None,
+        valid and _systemd_enabled(runner),
+        time,
         backend,
         timer_path,
     )
@@ -317,27 +484,16 @@ def remove_schedule(
         if not path.exists():
             return False
         if _launchd_loaded(runner):
-            _run(
-                runner,
-                ["launchctl", "bootout", _launchd_target()],
-                check=True,
-            )
-        path.unlink()
+            _launchctl(runner, "bootout", _launchd_target(), check=True)
+        _unlink_durable(path)
         return True
 
     service_path, timer_path = _systemd_paths(systemd_dir)
     if not service_path.exists() and not timer_path.exists():
         return False
-    _run(
-        runner,
-        ["systemctl", "--user", "disable", "--now", SYSTEMD_TIMER],
-        check=True,
-    )
-    timer_path.unlink(missing_ok=True)
-    service_path.unlink(missing_ok=True)
-    _run(
-        runner,
-        ["systemctl", "--user", "daemon-reload"],
-        check=True,
-    )
+    if timer_path.exists() and _systemd_enabled(runner):
+        _set_systemd_enabled(runner, False)
+    _unlink_durable(timer_path)
+    _unlink_durable(service_path)
+    _reload_systemd(runner)
     return True
