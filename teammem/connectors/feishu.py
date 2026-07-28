@@ -66,21 +66,36 @@ class FeishuConnector:
         end = str(int(now.timestamp()))
         events: list[Event] = []
         names: dict[str, str] = {}
-        for chat_id, project in ids.resources("feishu-channel").items():
+        warnings: list[str] = []
+        resources = ids.resources("feishu-channel")
+        failed_channels = 0
+        for chat_id, project in resources.items():
             try:
                 chat = fetch(f"/im/v1/chats/{chat_id}", {})
-            except RuntimeError:
+            except Exception:
+                failed_channels += 1
+                warnings.append(
+                    f"feishu channel {chat_id} metadata request failed"
+                )
                 continue
             if chat.get("chat_mode") != "group":
                 continue
             if name := chat.get("name"):
                 names[chat_id] = name
-            for msg in self._paginate(fetch, "/im/v1/messages", {
-                "container_id_type": "chat",
-                "container_id": chat_id,
-                "start_time": start,
-                "end_time": end,
-            }):
+            try:
+                messages = self._paginate(fetch, "/im/v1/messages", {
+                    "container_id_type": "chat",
+                    "container_id": chat_id,
+                    "start_time": start,
+                    "end_time": end,
+                })
+            except Exception:
+                failed_channels += 1
+                warnings.append(
+                    f"feishu channel {chat_id} history request failed"
+                )
+                continue
+            for msg in messages:
                 sender = msg.get("sender") or {}
                 if sender.get("sender_type") != "user":
                     continue
@@ -97,7 +112,15 @@ class FeishuConnector:
                     raw=json.dumps(msg, ensure_ascii=False),
                     hash=msg["message_id"],
                 ))
-        return CollectionResult(events=tuple(events), channel_names=names)
+        if resources and failed_channels == len(resources):
+            raise RuntimeError(
+                "feishu collection failed for every configured channel"
+            )
+        return CollectionResult(
+            events=tuple(events),
+            channel_names=names,
+            warnings=tuple(warnings),
+        )
 
     @staticmethod
     def _paginate(fetch: FeishuFetch, path: str, params: dict) -> list:

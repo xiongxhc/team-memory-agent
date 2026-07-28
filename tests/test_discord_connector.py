@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from teammem.config import Config
 from teammem.connectors.config import ConnectorSettings
 from teammem.connectors.discord import DiscordConnector
@@ -17,6 +19,16 @@ def _cfg():
 
 def _settings():
     return ConnectorSettings(name="discord", enabled=True, options={})
+
+
+def _ids_with_channels(*channel_ids):
+    return IdentityMaps(
+        {"members": {"alex": {"discord": ["1234567890"]}}},
+        {"projects": {
+            f"project-{index}": {"discord_channels": [channel_id]}
+            for index, channel_id in enumerate(channel_ids, start=1)
+        }},
+    )
 
 
 def _channel(**extra):
@@ -111,12 +123,15 @@ def test_discord_never_requests_messages_when_metadata_fails():
             raise RuntimeError("metadata unavailable")
         raise AssertionError(path)
 
-    result = DiscordConnector(fetch=discord_fixture).collect(
-        _cfg(), IdentityMaps.load(CONFIG_DIR), _settings(), NOW
-    )
+    with pytest.raises(
+        RuntimeError,
+        match="discord collection failed for every configured channel",
+    ):
+        DiscordConnector(fetch=discord_fixture).collect(
+            _cfg(), IdentityMaps.load(CONFIG_DIR), _settings(), NOW
+        )
 
     assert calls == [("/channels/9876543210", {})]
-    assert result.events == ()
 
 
 def test_discord_validation_requires_the_bot_token():
@@ -141,3 +156,72 @@ def test_discord_warns_when_empty_history_cannot_verify_read_or_content_permissi
     assert result.warnings == (
         "discord channel 9876543210 returned no messages; verify READ_MESSAGE_HISTORY and MESSAGE_CONTENT access",
     )
+
+
+def test_discord_warns_when_human_messages_have_unavailable_content():
+    """Treating blank human content as an ordinary skipped message hides MESSAGE_CONTENT loss."""
+    def discord_fixture(path, params):
+        if path == "/channels/9876543210":
+            return _channel()
+        if path == "/channels/9876543210/messages":
+            return [{
+                "id": "1",
+                "timestamp": "2026-07-14T09:00:00+00:00",
+                "content": "",
+                "type": 0,
+                "author": {"id": "1234567890", "bot": False},
+            }]
+        raise AssertionError(path)
+
+    result = DiscordConnector(fetch=discord_fixture).collect(
+        _cfg(), IdentityMaps.load(CONFIG_DIR), _settings(), NOW
+    )
+
+    assert result.events == ()
+    assert result.warnings == (
+        "discord channel 9876543210 returned human messages with unavailable "
+        "content; verify MESSAGE_CONTENT access",
+    )
+
+
+def test_discord_warns_for_one_failed_allowlisted_channel_and_keeps_other_events():
+    """Silently dropping one failed allowlisted guild channel makes collection look complete."""
+    def discord_fixture(path, params):
+        channel_id = path.split("/")[2]
+        if path.count("/") == 2:
+            return _channel(id=channel_id)
+        if channel_id == "222":
+            raise RuntimeError("history failed with credential value")
+        return [{
+            "id": "1",
+            "timestamp": "2026-07-14T09:00:00+00:00",
+            "content": "collected",
+            "type": 0,
+            "author": {"id": "1234567890", "bot": False},
+        }]
+
+    result = DiscordConnector(fetch=discord_fixture).collect(
+        _cfg(), _ids_with_channels("111", "222"), _settings(), NOW
+    )
+
+    assert [event.summary for event in result.events] == ["collected"]
+    assert result.warnings == ("discord channel 222 history request failed",)
+    assert "credential" not in result.warnings[0]
+
+
+def test_discord_raises_when_every_allowlisted_channel_request_fails():
+    """Returning success after every configured guild channel errors would hide a failed run."""
+    def discord_fixture(path, params):
+        channel_id = path.split("/")[2]
+        if path.count("/") == 2 and channel_id == "111":
+            raise RuntimeError("metadata unavailable")
+        if path.count("/") == 2:
+            return _channel(id=channel_id)
+        raise RuntimeError("history unavailable")
+
+    with pytest.raises(
+        RuntimeError, match="discord collection failed for every configured channel"
+    ):
+        DiscordConnector(fetch=discord_fixture).collect(
+            _cfg(), _ids_with_channels("111", "222"), _settings(), NOW
+        )

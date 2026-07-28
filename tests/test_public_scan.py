@@ -14,6 +14,7 @@ def _tracked_repo(tmp_path, name, content):
         check=True,
     )
     path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     subprocess.run(
         ["git", "-C", str(tmp_path), "add", name],
@@ -72,6 +73,25 @@ def test_public_scan_applies_operator_private_identifier_regex(tmp_path):
 
 def test_public_scan_rejects_tracked_hub_environment_file(tmp_path):
     _tracked_repo(tmp_path, "hub.env", "TEAMMEM_SINCE_DAYS=7\n")
+
+    result = subprocess.run(
+        [str(SCANNER)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+
+
+def test_public_scan_rejects_tracked_memberkit_environment_file_at_any_depth(
+    tmp_path,
+):
+    _tracked_repo(
+        tmp_path,
+        "member/config/memberkit.env",
+        "MEMBERKIT_MEMBER=alex\n",
+    )
 
     result = subprocess.run(
         [str(SCANNER)],

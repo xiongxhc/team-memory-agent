@@ -51,10 +51,16 @@ class DiscordConnector:
         events: list[Event] = []
         names: dict[str, str] = {}
         warnings: list[str] = []
-        for channel_id, project in ids.resources("discord-channel").items():
+        resources = ids.resources("discord-channel")
+        failed_channels = 0
+        for channel_id, project in resources.items():
             try:
                 channel = fetch(f"/channels/{channel_id}", {})
             except Exception:
+                failed_channels += 1
+                warnings.append(
+                    f"discord channel {channel_id} metadata request failed"
+                )
                 continue
             if not isinstance(channel, dict) or not channel.get("guild_id"):
                 continue
@@ -63,11 +69,23 @@ class DiscordConnector:
             try:
                 messages = self._messages(fetch, channel_id, since)
             except Exception:
+                failed_channels += 1
+                warnings.append(
+                    f"discord channel {channel_id} history request failed"
+                )
                 continue
             if not messages:
                 warnings.append(
                     f"discord channel {channel_id} returned no messages; verify "
                     "READ_MESSAGE_HISTORY and MESSAGE_CONTENT access"
+                )
+            elif any(
+                self._is_human_message(message) and not message.get("content")
+                for message in messages
+            ):
+                warnings.append(
+                    f"discord channel {channel_id} returned human messages "
+                    "with unavailable content; verify MESSAGE_CONTENT access"
                 )
             for message in messages:
                 if not self._is_human_content(message):
@@ -83,22 +101,29 @@ class DiscordConnector:
                     raw=json.dumps(message, ensure_ascii=False),
                     hash=str(message["id"]),
                 ))
+        if resources and failed_channels == len(resources):
+            raise RuntimeError(
+                "discord collection failed for every configured channel"
+            )
         return CollectionResult(
             events=tuple(events), channel_names=names, warnings=tuple(warnings)
         )
 
     @staticmethod
-    def _is_human_content(message: dict) -> bool:
+    def _is_human_message(message: dict) -> bool:
         author = message.get("author") or {}
         return (
             message.get("type") == 0
-            and bool(message.get("content"))
             and bool(message.get("id"))
             and bool(message.get("timestamp"))
             and bool(author.get("id"))
             and not author.get("bot")
             and not message.get("webhook_id")
         )
+
+    @classmethod
+    def _is_human_content(cls, message: dict) -> bool:
+        return cls._is_human_message(message) and bool(message.get("content"))
 
     @staticmethod
     def _timestamp(message: dict) -> datetime:

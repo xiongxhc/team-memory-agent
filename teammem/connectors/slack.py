@@ -1,4 +1,4 @@
-"""Slack bot polling restricted to mapped shared channels."""
+"""Slack bot polling restricted to mapped public or private channels."""
 
 import json
 import time
@@ -74,10 +74,30 @@ class SlackConnector:
         oldest = str(int((now - timedelta(days=cfg.since_days)).timestamp()))
         events: list[Event] = []
         names: dict[str, str] = {}
-        for channel_id, project in ids.resources("slack-channel").items():
+        warnings: list[str] = []
+        resources = ids.resources("slack-channel")
+        failed_channels = 0
+        history_started = False
+
+        def fetch_history(params: dict) -> dict:
+            nonlocal history_started
+            if history_started:
+                self._sleep(_HISTORY_INTERVAL_SECONDS)
+            history_started = True
+            while True:
+                try:
+                    return fetch("conversations.history", params)
+                except SlackRateLimited as error:
+                    self._sleep(error.retry_after)
+
+        for channel_id, project in resources.items():
             try:
                 metadata = fetch("conversations.info", {"channel": channel_id})
             except Exception:
+                failed_channels += 1
+                warnings.append(
+                    f"slack channel {channel_id} metadata request failed"
+                )
                 continue
             channel = metadata.get("channel") or {}
             if not self._shared_channel(channel):
@@ -85,8 +105,12 @@ class SlackConnector:
             if name := channel.get("name"):
                 names[channel_id] = name
             try:
-                messages = self._history(fetch, channel_id, oldest)
+                messages = self._history(fetch_history, channel_id, oldest)
             except Exception:
+                failed_channels += 1
+                warnings.append(
+                    f"slack channel {channel_id} history request failed"
+                )
                 continue
             for message in messages:
                 if not self._is_human_top_level(message):
@@ -103,7 +127,15 @@ class SlackConnector:
                     raw=json.dumps(message, ensure_ascii=False),
                     hash=ts,
                 ))
-        return CollectionResult(events=tuple(events), channel_names=names)
+        if resources and failed_channels == len(resources):
+            raise RuntimeError(
+                "slack collection failed for every configured channel"
+            )
+        return CollectionResult(
+            events=tuple(events),
+            channel_names=names,
+            warnings=tuple(warnings),
+        )
 
     @staticmethod
     def _shared_channel(channel: dict) -> bool:
@@ -124,20 +156,20 @@ class SlackConnector:
             and message.get("thread_ts", message.get("ts")) == message.get("ts")
         )
 
-    def _history(self, fetch: SlackFetch, channel_id: str, oldest: str) -> list[dict]:
+    def _history(
+        self,
+        fetch_history: Callable[[dict], dict],
+        channel_id: str,
+        oldest: str,
+    ) -> list[dict]:
         messages: list[dict] = []
         cursor = ""
         while True:
             params = {"channel": channel_id, "oldest": oldest, "limit": _HISTORY_LIMIT}
             if cursor:
                 params["cursor"] = cursor
-            try:
-                page = fetch("conversations.history", params)
-            except SlackRateLimited as error:
-                self._sleep(error.retry_after)
-                continue
+            page = fetch_history(params)
             messages.extend(page.get("messages") or [])
             cursor = (page.get("response_metadata") or {}).get("next_cursor") or ""
             if not cursor:
                 return messages
-            self._sleep(_HISTORY_INTERVAL_SECONDS)

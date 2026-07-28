@@ -23,6 +23,16 @@ def _settings():
     return ConnectorSettings(name="slack", enabled=True, options={})
 
 
+def _ids_with_channels(*channel_ids):
+    return IdentityMaps(
+        {"members": {"alex": {"slack": ["U0123"]}}},
+        {"projects": {
+            f"project-{index}": {"slack_channels": [channel_id]}
+            for index, channel_id in enumerate(channel_ids, start=1)
+        }},
+    )
+
+
 def _metadata(**channel):
     return {"ok": True, "channel": {
         "id": "C0123", "name": "project-alpha", "is_channel": True,
@@ -124,12 +134,15 @@ def test_slack_never_requests_history_when_metadata_fails():
             raise RuntimeError("metadata unavailable")
         raise AssertionError(path)
 
-    result = SlackConnector(fetch=slack_fixture).collect(
-        _cfg(), IdentityMaps.load(CONFIG_DIR), _settings(), NOW
-    )
+    with pytest.raises(
+        RuntimeError,
+        match="slack collection failed for every configured channel",
+    ):
+        SlackConnector(fetch=slack_fixture).collect(
+            _cfg(), IdentityMaps.load(CONFIG_DIR), _settings(), NOW
+        )
 
     assert calls == [("conversations.info", {"channel": "C0123"})]
-    assert result.events == ()
 
 
 def test_slack_validation_requires_only_the_bot_token():
@@ -195,3 +208,70 @@ def test_slack_http_fetch_uses_retry_after_for_a_rate_limited_history_request(mo
     with pytest.raises(SlackRateLimited) as error:
         fetch("conversations.history", {"channel": "C0123"})
     assert error.value.retry_after == 3
+
+
+def test_slack_warns_for_one_failed_allowlisted_channel_and_keeps_other_events():
+    """Silently dropping one failed allowlisted channel makes a partial collection look complete."""
+    def slack_fixture(path, params):
+        channel_id = params["channel"]
+        if path == "conversations.info":
+            return _metadata(id=channel_id)
+        if channel_id == "C0999":
+            raise RuntimeError("history failed with credential value")
+        return {
+            "ok": True,
+            "response_metadata": {},
+            "messages": [{
+                "type": "message",
+                "ts": "1784077200.000001",
+                "user": "U0123",
+                "text": "collected",
+            }],
+        }
+
+    result = SlackConnector(fetch=slack_fixture, sleep=lambda _seconds: None).collect(
+        _cfg(), _ids_with_channels("C0123", "C0999"), _settings(), NOW
+    )
+
+    assert [event.summary for event in result.events] == ["collected"]
+    assert result.warnings == ("slack channel C0999 history request failed",)
+    assert "credential" not in result.warnings[0]
+
+
+def test_slack_raises_when_every_allowlisted_channel_request_fails():
+    """Returning success after every configured channel errors would make run-daily exit zero."""
+    def slack_fixture(path, params):
+        if path == "conversations.info" and params["channel"] == "C0123":
+            raise RuntimeError("metadata unavailable")
+        if path == "conversations.info":
+            return _metadata(id=params["channel"])
+        raise RuntimeError("history unavailable")
+
+    with pytest.raises(
+        RuntimeError, match="slack collection failed for every configured channel"
+    ):
+        SlackConnector(fetch=slack_fixture, sleep=lambda _seconds: None).collect(
+            _cfg(), _ids_with_channels("C0123", "C0999"), _settings(), NOW
+        )
+
+
+def test_slack_paces_history_calls_across_allowlisted_channels():
+    """Pacing only cursor pages can exceed the global history limit across channels."""
+    calls, sleeps = [], []
+
+    def slack_fixture(path, params):
+        calls.append((path, params))
+        if path == "conversations.info":
+            return _metadata(id=params["channel"])
+        return {"ok": True, "response_metadata": {}, "messages": []}
+
+    SlackConnector(fetch=slack_fixture, sleep=sleeps.append).collect(
+        _cfg(), _ids_with_channels("C0123", "C0999"), _settings(), NOW
+    )
+
+    assert [
+        params["channel"]
+        for path, params in calls
+        if path == "conversations.history"
+    ] == ["C0123", "C0999"]
+    assert sleeps == [60]

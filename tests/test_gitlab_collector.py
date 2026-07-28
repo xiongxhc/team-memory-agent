@@ -87,6 +87,8 @@ def test_since_and_updated_after_params_sent():
     assert seen["/projects/1/repository/commits"]["since"] == "2026-07-08T00:00:00Z"
     assert seen["/projects/1/merge_requests"]["updated_after"] == "2026-07-08T00:00:00Z"
     assert seen["/projects/1/repository/commits"]["per_page"] == 100
+    assert seen["/groups/42/projects"]["include_subgroups"] == "true"
+    assert seen["/groups/42/projects"]["with_shared"] == "false"
 
 
 def test_ghost_mr_author_is_unmapped_not_crash():

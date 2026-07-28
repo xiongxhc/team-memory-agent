@@ -47,8 +47,8 @@ silently discarded.
 | Provider | Query boundary | Event source and kinds |
 |---|---|---|
 | GitHub | Only `github_repos` explicitly mapped to projects | `github`: `commit`, `pr` |
-| GitLab | Projects returned under `TEAMMEM_GITLAB_GROUP`, including configured subgroups; `gitlab_repos` maps known projects and unknown in-scope projects remain visible without project attribution | `gitlab`: `commit`, `mr` |
-| Slack | Only `slack_channels` whose metadata identifies a shared channel containing the app | `slack-channel`: `message` |
+| GitLab | Projects in the `TEAMMEM_GITLAB_GROUP` hierarchy, including subgroups but excluding projects merely shared into it; `gitlab_repos` maps known projects and unknown in-scope projects remain visible without project attribution | `gitlab`: `commit`, `mr` |
+| Slack | Only `slack_channels` whose metadata identifies a public or private project channel containing the app | `slack-channel`: `message` |
 | Feishu | Only `feishu_channels` whose metadata identifies a group chat containing the app | `feishu-channel`: `message` |
 | Discord | Only `discord_channels` whose metadata includes a guild ID | `discord-channel`: `message` |
 
@@ -56,8 +56,11 @@ Chat is stricter than forge collection: an unlisted channel is never discovered
 or collected merely because an app can see it. Slack direct and multi-person
 direct messages are rejected, and only human top-level messages are emitted.
 The adapter never calls `conversations.replies`. It uses 15-message history
-pages and 60-second pacing between pages for the limits applicable to
-commercially distributed non-Marketplace apps. Feishu direct chats and Discord
+pages and globally paces requests at least 60 seconds apart across pages and
+channels. Slack's tighter limit applies to affected commercially distributed
+apps outside Marketplace approval; Slack says internal customer-built apps are
+not affected. The adapter uses the conservative behavior for portability and
+treats `Retry-After` as authoritative. Feishu direct chats and Discord
 DM/group-DM channels are rejected. Discord also skips bot and webhook messages;
 empty history carries a warning because it can mean missing
 `READ_MESSAGE_HISTORY` or `MESSAGE_CONTENT` access.

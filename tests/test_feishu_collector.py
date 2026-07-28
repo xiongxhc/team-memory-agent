@@ -2,6 +2,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from teammem.config import Config
 from teammem.connectors.config import ConnectorSettings
 from teammem.connectors.feishu import FeishuConnector
@@ -20,6 +22,16 @@ BOT_MSG = {**MSG, "message_id": "om_2",
            "sender": {"id": "cli_x", "id_type": "app_id", "sender_type": "app"}}
 IMG_MSG = {**MSG, "message_id": "om_3", "msg_type": "image",
            "body": {"content": json.dumps({"image_key": "k"})}}
+
+
+def _ids_with_channels(*channel_ids):
+    return IdentityMaps(
+        {"members": {"alex": {"feishu": ["ou_example_alex"]}}},
+        {"projects": {
+            f"project-{index}": {"feishu_channels": [channel_id]}
+            for index, channel_id in enumerate(channel_ids, start=1)
+        }},
+    )
 
 
 def fake_fetch(path, params):
@@ -101,15 +113,18 @@ def test_feishu_never_fetches_messages_when_chat_metadata_fails():
             return {"items": [MSG], "has_more": False, "page_token": ""}
         raise AssertionError(path)
 
-    result = FeishuConnector(fetch=fetch).collect(
-        Config.load(env={}),
-        IdentityMaps.load(CONFIG_DIR),
-        ConnectorSettings(name="feishu", enabled=True, options={}),
-        NOW,
-    )
+    with pytest.raises(
+        RuntimeError,
+        match="feishu collection failed for every configured channel",
+    ):
+        FeishuConnector(fetch=fetch).collect(
+            Config.load(env={}),
+            IdentityMaps.load(CONFIG_DIR),
+            ConnectorSettings(name="feishu", enabled=True, options={}),
+            NOW,
+        )
 
     assert not [path for path, _ in calls if path == "/im/v1/messages"]
-    assert result.events == ()
 
 
 def test_unknown_sender_is_unmapped(tmp_path):
@@ -139,3 +154,46 @@ def test_pagination_via_page_token(tmp_path):
     events = collect_feishu(Config.load(env={"TEAMMEM_CONFIG_DIR": str(tmp_path)}),
                             IdentityMaps.load(CONFIG_DIR), fetch, NOW)
     assert {e.hash for e in events} == {"om_1", "om_3"}
+
+
+def test_feishu_warns_for_one_failed_allowlisted_chat_and_keeps_other_events():
+    """Silently dropping one failed allowlisted group makes partial history look complete."""
+    def fetch(path, params):
+        if path.startswith("/im/v1/chats/"):
+            return {"chat_mode": "group"}
+        if params["container_id"] == "oc_failed":
+            raise RuntimeError("history failed with credential value")
+        return {"items": [MSG], "has_more": False, "page_token": ""}
+
+    result = FeishuConnector(fetch=fetch).collect(
+        Config.load(env={}),
+        _ids_with_channels("oc_example_alpha", "oc_failed"),
+        ConnectorSettings(name="feishu", enabled=True, options={}),
+        NOW,
+    )
+
+    assert [event.summary for event in result.events] == [
+        "deploy done, checking logs"
+    ]
+    assert result.warnings == ("feishu channel oc_failed history request failed",)
+    assert "credential" not in result.warnings[0]
+
+
+def test_feishu_raises_when_every_allowlisted_chat_request_fails():
+    """Returning success after every configured group errors would hide a failed daily run."""
+    def fetch(path, params):
+        if path == "/im/v1/chats/oc_metadata_failed":
+            raise RuntimeError("metadata unavailable")
+        if path.startswith("/im/v1/chats/"):
+            return {"chat_mode": "group"}
+        raise RuntimeError("history unavailable")
+
+    with pytest.raises(
+        RuntimeError, match="feishu collection failed for every configured channel"
+    ):
+        FeishuConnector(fetch=fetch).collect(
+            Config.load(env={}),
+            _ids_with_channels("oc_metadata_failed", "oc_history_failed"),
+            ConnectorSettings(name="feishu", enabled=True, options={}),
+            NOW,
+        )

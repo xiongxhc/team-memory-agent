@@ -11,71 +11,32 @@ Start the hub manually. Package installation enables no network connector,
 performs no provider request, and creates no schedule. `teammem run-daily` is one
 run only on the operator machine.
 
-## Hub package lifecycle
+## Hub installation lifecycle
 
-Requires Python 3.11 or newer and `pipx`.
+The connector-capable hub is version 0.2.0 and requires Python 3.11 or newer.
 
-### Install the published package
+### Current source-checkout installation
 
-```bash
-pipx install teammem
-mkdir -p ~/.config/teammem
-chmod 700 ~/.config/teammem
-curl -fsSL \
-  https://raw.githubusercontent.com/xiongxhc/team-memory-agent/master/config/roster.example.yaml \
-  -o ~/.config/teammem/roster.yaml
-curl -fsSL \
-  https://raw.githubusercontent.com/xiongxhc/team-memory-agent/master/config/projects.example.yaml \
-  -o ~/.config/teammem/projects.yaml
-curl -fsSL \
-  https://raw.githubusercontent.com/xiongxhc/team-memory-agent/master/config/connectors.example.yaml \
-  -o ~/.config/teammem/connectors.yaml
-touch ~/.config/teammem/hub.env
-chmod 600 ~/.config/teammem/hub.env
-```
-
-Edit the three YAML files and `hub.env` before enabling collection. Never commit
-the environment file.
-
-### Upgrade the published package
-
-```bash
-pipx upgrade teammem
-teammem connectors check
-teammem run-daily
-```
-
-Review release notes and keep the existing user-owned configuration and runtime
-data in place.
-
-### Uninstall the published package
-
-```bash
-pipx uninstall teammem
-```
-
-Uninstalling the command does not remove operator-owned configuration, ledgers,
-archives, quarantine records, inbox checkouts or exports, snapshots, or rendered
-views. Preserve or delete those separately according to the team's retention
-policy.
-
-### Source-checkout alternative
-
-Contributors developing adapters or operators pinning a reviewed revision can
-install an editable checkout:
+Until 0.2.0 is published, operators can install a reviewed source revision:
 
 ```bash
 git clone https://github.com/xiongxhc/team-memory-agent.git
 cd team-memory-agent
 python3 -m venv .venv
 .venv/bin/pip install -e .
-cp config/roster.example.yaml config/roster.yaml
-cp config/projects.example.yaml config/projects.yaml
-cp config/connectors.example.yaml config/connectors.yaml
+mkdir -p ~/.config/teammem
+chmod 700 ~/.config/teammem
+cp config/roster.example.yaml ~/.config/teammem/roster.yaml
+cp config/projects.example.yaml ~/.config/teammem/projects.yaml
+cp config/connectors.example.yaml ~/.config/teammem/connectors.yaml
+touch ~/.config/teammem/hub.env
+chmod 600 ~/.config/teammem/hub.env
 ```
 
-Keep secrets, ledgers, inboxes, archives, quarantine records, snapshots, and
-rendered views outside the checkout. Invoke the hub as `.venv/bin/teammem`.
+Edit the three YAML files and `hub.env` before enabling collection. Never commit
+the environment file. Keep secrets, ledgers, inboxes, archives, quarantine
+records, snapshots, and rendered views outside the checkout. Invoke the hub as
+`.venv/bin/teammem`.
 
 Upgrade a source installation only after reviewing the target revision:
 
@@ -93,8 +54,33 @@ Uninstall it with:
 .venv/bin/pip uninstall teammem
 ```
 
-After preserving any mistakenly colocated runtime data, the operator may delete
-the virtual environment and checkout.
+### Published-package path after release
+
+Once a connector-capable release is confirmed on the package index, install it
+with an explicit minimum version:
+
+```bash
+pipx install 'teammem>=0.2.0'
+```
+
+For a currently installed 0.2.0-or-newer package:
+
+```bash
+pipx upgrade teammem
+teammem connectors check
+teammem run-daily
+```
+
+Uninstall the packaged command with:
+
+```bash
+pipx uninstall teammem
+```
+
+Uninstalling either command does not remove operator-owned configuration,
+ledgers, archives, quarantine records, inbox checkouts or exports, snapshots, or
+rendered views. Preserve or delete those separately according to the team's
+retention policy.
 
 ## Hub runtime configuration
 
@@ -132,14 +118,17 @@ documentation.
 | Provider | Environment variables | Non-secret YAML | Minimum provider setup | What collection can see |
 |---|---|---|---|---|
 | GitHub | `TEAMMEM_GITHUB_TOKEN` | `github` member IDs; `github_repos`; `enabled: true` | Fine-grained token restricted to the selected repositories, with **Contents: read** for [list commits](https://docs.github.com/en/rest/commits/commits) and **Pull requests: read** for [list pull requests](https://docs.github.com/en/rest/pulls/pulls) | Default-branch commits and pull requests updated in the lookback, only for explicitly mapped repositories |
-| GitLab | `TEAMMEM_GITLAB_URL`, `TEAMMEM_GITLAB_TOKEN`, `TEAMMEM_GITLAB_GROUP` | `gitlab` member IDs and emails; `gitlab_repos`; `enabled: true` | Token that can see the configured group with [`read_api`](https://docs.gitlab.com/security/tokens/access_token_scopes/). The adapter uses the official [group projects](https://docs.gitlab.com/api/groups/), [commits](https://docs.gitlab.com/api/commits/), and [merge requests](https://docs.gitlab.com/api/merge_requests/) APIs | Projects returned under the configured group, including subgroups. Known `gitlab_repos` receive project attribution; other in-scope projects remain visibly unmapped |
-| Slack | `TEAMMEM_SLACK_BOT_TOKEN` | `slack` member IDs; `slack_channels`; `enabled: true` | Bot token only. For public channels grant `channels:read` and `channels:history`; for private project channels also grant `groups:read` and `groups:history`. Add the app visibly to every allowlisted channel. See [`conversations.info`](https://docs.slack.dev/reference/methods/conversations.info/), [`conversations.history`](https://docs.slack.dev/reference/methods/conversations.history/), and the deliberately unused [`conversations.replies`](https://docs.slack.dev/reference/methods/conversations.replies/) | Human top-level messages in allowlisted shared project channels containing the app; no DMs, multi-person DMs, unlisted channels, bot messages, or thread replies |
+| GitLab | `TEAMMEM_GITLAB_URL`, `TEAMMEM_GITLAB_TOKEN`, `TEAMMEM_GITLAB_GROUP` | `gitlab` member IDs and emails; `gitlab_repos`; `enabled: true` | Token that can see the configured group with [`read_api`](https://docs.gitlab.com/security/tokens/access_token_scopes/). `read_api` authorizes API reads but does not grant group/project membership or expand what the token identity can see. The adapter uses the official [group projects](https://docs.gitlab.com/api/groups/), [commits](https://docs.gitlab.com/api/commits/), and [merge requests](https://docs.gitlab.com/api/merge_requests/) APIs | Projects in the configured group hierarchy, including subgroups but excluding projects merely shared into that hierarchy. Known `gitlab_repos` receive project attribution; other in-scope projects remain visibly unmapped |
+| Slack | `TEAMMEM_SLACK_BOT_TOKEN` | `slack` member IDs; `slack_channels`; `enabled: true` | Bot token only. For public channels grant `channels:read` and `channels:history`; for private project channels grant `groups:read` and `groups:history`. Add the app visibly to every allowlisted channel. See [`conversations.info`](https://docs.slack.dev/reference/methods/conversations.info/), [`conversations.history`](https://docs.slack.dev/reference/methods/conversations.history/), and the deliberately unused [`conversations.replies`](https://docs.slack.dev/reference/methods/conversations.replies/) | Human top-level messages in allowlisted public or private project channels containing the app; no DMs, multi-person DMs, unlisted channels, bot messages, or thread replies |
 | Feishu | `TEAMMEM_FEISHU_APP_ID`, `TEAMMEM_FEISHU_APP_SECRET` | `feishu` member IDs; `feishu_channels`; `enabled: true` | Custom app with bot capability, installed in the tenant and visibly added to each allowlisted group. Use app-identity group-read permission (`im:chat:readonly`), message read (`im:message:readonly`), and group-message history (`im:message.group_msg`). See official [tenant token](https://open.feishu.cn/document/server-docs/authentication-management/access-token/tenant_access_token_internal), [group information](https://open.feishu.cn/document/server-docs/group/chat/get-2), and [conversation history](https://open.feishu.cn/document/server-docs/im-v1/message/list) documentation | Human messages only in allowlisted group chat IDs; no direct chats or unlisted groups |
 | Discord | `TEAMMEM_DISCORD_BOT_TOKEN` | `discord` member IDs; `discord_channels`; `enabled: true` | Bot installed in the guild with `VIEW_CHANNEL` and `READ_MESSAGE_HISTORY` for each allowlisted channel, plus the `MESSAGE_CONTENT` privileged intent in the Developer Portal. See [Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages), [permissions](https://docs.discord.com/developers/topics/permissions), and [Message Content Intent](https://docs.discord.com/developers/events/gateway#message-content-intent) | Human content messages in allowlisted guild channels; no DM/group-DM channels, unlisted guild channels, bots, or webhooks |
 
-For Slack, the adapter requests 15 messages per history page and waits 60 seconds
-between pages. This matches the one-request-per-minute, 15-object limit applicable
-to commercially distributed non-Marketplace apps described in Slack's
+For Slack, the adapter requests 15 messages per history page and globally waits
+at least 60 seconds between all `conversations.history` calls across pages and
+channels. `Retry-After` is authoritative when Slack returns it. Slack's tighter
+limit applies to affected commercially distributed apps outside Marketplace
+approval; Slack says internal customer-built apps are not affected. The adapter
+uses this conservative policy for portable deployments. See Slack's
 [official rate-limit notice](https://docs.slack.dev/changelog/2025/05/29/rate-limit-changes-for-non-marketplace-apps/).
 It never uses a user token and never requests thread replies.
 

@@ -127,35 +127,27 @@ The public quick start uses GitHub and Slack. GitLab, Feishu, and Discord are
 equally supported built-in options. Every network connector is disabled by
 default; package installation makes no provider request and creates no schedule.
 
-### 1. Install the published package
+### 1. Install the connector-capable source checkout
+
+The five-connector hub is version 0.2.0. Until that release is published, use a
+reviewed source checkout:
 
 ```bash
-pipx install teammem
+git clone https://github.com/xiongxhc/team-memory-agent.git
+cd team-memory-agent
+python3 -m venv .venv
+.venv/bin/pip install -e .
 mkdir -p ~/.config/teammem
 chmod 700 ~/.config/teammem
-curl -fsSL \
-  https://raw.githubusercontent.com/xiongxhc/team-memory-agent/master/config/roster.example.yaml \
-  -o ~/.config/teammem/roster.yaml
-curl -fsSL \
-  https://raw.githubusercontent.com/xiongxhc/team-memory-agent/master/config/projects.example.yaml \
-  -o ~/.config/teammem/projects.yaml
-curl -fsSL \
-  https://raw.githubusercontent.com/xiongxhc/team-memory-agent/master/config/connectors.example.yaml \
-  -o ~/.config/teammem/connectors.yaml
+cp config/roster.example.yaml ~/.config/teammem/roster.yaml
+cp config/projects.example.yaml ~/.config/teammem/projects.yaml
+cp config/connectors.example.yaml ~/.config/teammem/connectors.yaml
 touch ~/.config/teammem/hub.env
 chmod 600 ~/.config/teammem/hub.env
 ```
 
-Requires Python 3.11 or newer and `pipx`. Upgrade or uninstall the packaged
-command with:
-
-```bash
-pipx upgrade teammem
-pipx uninstall teammem
-```
-
-Uninstalling the command does not remove operator-owned configuration, ledgers,
-archives, quarantine records, inbox exports, snapshots, or rendered views.
+Requires Python 3.11 or newer and Git. The commands below use
+`.venv/bin/teammem`.
 
 ### 2. Configure GitHub and Slack
 
@@ -175,8 +167,8 @@ connectors:
     enabled: false
 ```
 
-In `projects.yaml`, add only the repositories and shared project channels the hub
-should collect:
+In `projects.yaml`, add only the repositories and public or private project
+channels containing the app that the hub should collect:
 
 ```yaml
 projects:
@@ -188,9 +180,9 @@ projects:
 Add each member's GitHub login and Slack user ID to `roster.yaml`. Create a
 fine-grained GitHub token limited to those repositories with **Contents: read**
 and **Pull requests: read**. Create a Slack app with a bot token, grant
-`channels:read` and `channels:history` (plus `groups:read` and `groups:history`
-only for private project channels), and visibly add the app to every configured
-channel.
+`channels:read` and `channels:history` for public channels, or `groups:read` and
+`groups:history` for private channels, and visibly add the app to every
+configured channel.
 
 Edit the user-only `hub.env` and set actual values for
 `TEAMMEM_GITHUB_TOKEN`, `TEAMMEM_SLACK_BOT_TOKEN`, `TEAMMEM_CONFIG_DIR`,
@@ -208,14 +200,14 @@ These two commands inspect local configuration only; they do not authenticate or
 make network requests:
 
 ```bash
-teammem connectors list
-teammem connectors check
+.venv/bin/teammem connectors list
+.venv/bin/teammem connectors check
 ```
 
 Then perform one operator-observed run:
 
 ```bash
-teammem run-daily
+.venv/bin/teammem run-daily
 ```
 
 `teammem run-daily` executes one idempotent run on the operator machine and
@@ -229,15 +221,18 @@ command.
 | Connector | Collection boundary |
 |---|---|
 | GitHub | Commits and pull requests from explicitly mapped repositories |
-| GitLab | Commits and merge requests in the operator-configured group; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
-| Slack | Human top-level messages in explicitly mapped shared project channels; no DMs and no thread replies |
+| GitLab | Commits and merge requests in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
+| Slack | Human top-level messages in explicitly mapped public or private project channels containing the app; no DMs and no thread replies |
 | Feishu | Human messages in explicitly mapped group chats; no direct chats |
 | Discord | Human messages in explicitly mapped guild channels; no DMs, bot messages, or webhooks |
 
-Slack polling uses 15 messages per page and 60-second pacing between history
-pages, matching the limits applicable to commercially distributed
-non-Marketplace apps. Discord may return empty content or history when
-`READ_MESSAGE_HISTORY` or `MESSAGE_CONTENT` access is missing.
+Slack polling uses 15 messages per page and globally paces all history requests
+at least 60 seconds apart. Slack's tighter limit applies to affected commercially
+distributed apps outside Marketplace approval; Slack says internal
+customer-built apps are not affected. The hub uses the conservative policy for
+portable deployments and honors `Retry-After` when Slack returns it. Discord may
+return empty content or history when `READ_MESSAGE_HISTORY` or
+`MESSAGE_CONTENT` access is missing.
 
 Feishu remains a first-class official connector. The existing private deployment
 continues to use Feishu unchanged; the GitHub + Slack public path is an additional
@@ -252,22 +247,21 @@ accepted and quarantined files are consumed from the configured import directory
 See the [deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md)
 for the safe export and `run-daily` workflow.
 
-### Source-checkout alternative
+### Published-package path after release
 
-Operators developing adapters or running a pinned checkout can install it in a
-dedicated virtual environment instead:
+Once a connector-capable release is confirmed on the package index, install it
+with an explicit minimum version:
 
 ```bash
-git clone https://github.com/xiongxhc/team-memory-agent.git
-cd team-memory-agent
-python3 -m venv .venv
-.venv/bin/pip install -e .
-cp config/roster.example.yaml config/roster.yaml
-cp config/projects.example.yaml config/projects.yaml
-cp config/connectors.example.yaml config/connectors.yaml
+pipx install 'teammem>=0.2.0'
 ```
 
-Run checkout commands as `.venv/bin/teammem ...`. To upgrade, review the target
+Then use `teammem ...` in place of `.venv/bin/teammem ...`. Upgrade or uninstall
+an installed 0.2.0-or-newer package with `pipx upgrade teammem` or
+`pipx uninstall teammem`. Uninstalling the command does not remove
+operator-owned configuration or runtime data.
+
+To upgrade a source checkout, review the target
 revision, update the checkout with `git pull --ff-only`, then run
 `.venv/bin/pip install --upgrade -e .`. To uninstall the checkout installation,
 run `.venv/bin/pip uninstall teammem`; preserve runtime data outside the checkout
@@ -283,7 +277,7 @@ deterministic renderer continue to work.
 - Import is idempotent per attributed event.
 - Unknown central identities are surfaced; unknown MemberKit identities are
   quarantined.
-- Shared-channel collection requires a visibly present integration.
+- Project-channel collection requires a visibly present integration.
 - Raw local databases, direct messages, and arbitrary files never enter a bundle.
 - This project provides work visibility, not employee scoring or performance
   evaluation.
