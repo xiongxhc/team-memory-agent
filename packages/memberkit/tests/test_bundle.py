@@ -1,6 +1,10 @@
+import json
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import pytest
 
 from memberkit import bundle
 
@@ -38,6 +42,123 @@ def make_rich_db(tmp_path, rows):
 
 def rich_row(project, session, title, iso):
     return (project, session, title, None, None, None, "change", iso, epoch(iso))
+
+
+def valid_bundle():
+    return {
+        "schema": "teammem-bundle/v1",
+        "member": "alex",
+        "date": "2026-07-27",
+        "events": [{
+            "ts": "2026-07-27T10:00:00",
+            "kind": "journal-highlight",
+            "summary": "kept",
+            "project": "project-alpha",
+            "refs": None,
+        }],
+        "journal_md": "stale",
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "top-level-type",
+        "top-level-keys",
+        "schema",
+        "member",
+        "date",
+        "date-format",
+        "events-type",
+        "journal-type",
+        "event-type",
+        "event-keys",
+        "summary",
+        "kind",
+        "project",
+        "refs",
+        "timestamp",
+        "wrong-day",
+    ],
+)
+def test_validate_bundle_rejects_non_frozen_v1_data(case):
+    data = valid_bundle()
+    expected_date = "2026-07-27"
+    if case == "top-level-type":
+        data = []
+    elif case == "top-level-keys":
+        data["extra"] = True
+    elif case == "schema":
+        data["schema"] = "teammem-bundle/v2"
+    elif case == "member":
+        data["member"] = "other"
+    elif case == "date":
+        data["date"] = "2026-07-28"
+    elif case == "date-format":
+        data["date"] = expected_date = "2026-7-27"
+    elif case == "events-type":
+        data["events"] = {}
+    elif case == "journal-type":
+        data["journal_md"] = None
+    elif case == "event-type":
+        data["events"][0] = []
+    elif case == "event-keys":
+        data["events"][0]["extra"] = True
+    elif case == "summary":
+        data["events"][0]["summary"] = "   "
+    elif case == "kind":
+        data["events"][0]["kind"] = "raw-observation"
+    elif case == "project":
+        data["events"][0]["project"] = ["project-alpha"]
+    elif case == "refs":
+        data["events"][0]["refs"] = ["private"]
+    elif case == "timestamp":
+        data["events"][0]["ts"] = "not-a-timestamp"
+    else:
+        data["events"][0]["ts"] = "2026-07-28T00:00:00"
+
+    with pytest.raises(ValueError):
+        bundle.validate_bundle(data, "alex", expected_date)
+
+
+def test_prepare_bundle_writes_empty_events_journal(tmp_path):
+    path = tmp_path / "bundle-alex-2026-07-27.json"
+    data = valid_bundle()
+    data["events"] = []
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    prepared = bundle.prepare_bundle(path, "alex", "2026-07-27")
+
+    assert prepared["events"] == []
+    assert prepared["journal_md"] == "## 2026-07-27"
+    assert json.loads(path.read_text(encoding="utf-8")) == prepared
+
+
+def test_prepare_bundle_fsyncs_same_directory_temp_before_replace(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "bundle-alex-2026-07-27.json"
+    path.write_text(json.dumps(valid_bundle()), encoding="utf-8")
+    order = []
+    real_fsync = bundle.os.fsync
+    real_replace = bundle.os.replace
+
+    def record_fsync(descriptor):
+        order.append("fsync")
+        return real_fsync(descriptor)
+
+    def record_replace(source, destination):
+        assert Path(source).parent == path.parent
+        assert Path(destination) == path
+        order.append("replace")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(bundle.os, "fsync", record_fsync)
+    monkeypatch.setattr(bundle.os, "replace", record_replace)
+
+    bundle.prepare_bundle(path, "alex", "2026-07-27")
+
+    assert order == ["fsync", "replace"]
 
 
 def test_draft_selects_only_that_day_and_groups_journal(tmp_path):

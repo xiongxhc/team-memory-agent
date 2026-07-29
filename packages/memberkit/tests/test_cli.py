@@ -11,7 +11,7 @@ import pytest
 
 from memberkit import cli
 from memberkit.config import Config
-from memberkit.state import DraftState
+from memberkit.state import DraftState, event_fingerprint
 
 
 def test_draft_command_records_pending_review_state(tmp_path, monkeypatch):
@@ -178,6 +178,106 @@ def _setup_cfg(tmp_path, *, timezone=None):
         workdir=tmp_path / "work",
         timezone=timezone,
     )
+
+
+def _review_event(summary):
+    return {
+        "ts": "2026-07-27T10:00:00",
+        "kind": "journal-highlight",
+        "summary": summary,
+        "project": "project-alpha",
+        "refs": None,
+    }
+
+
+def _write_review_bundle(cfg, events, journal="stale"):
+    path = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "schema": "teammem-bundle/v1",
+        "member": "alex",
+        "date": "2026-07-27",
+        "events": events,
+        "journal_md": journal,
+    }), encoding="utf-8")
+    return path
+
+
+def test_review_persists_authoritative_journal_and_removed_exclusion(
+    tmp_path, monkeypatch, capsys,
+):
+    cfg = _setup_cfg(tmp_path)
+    kept, removed = _review_event("kept"), _review_event("removed private event")
+    state_path = cfg.workdir / "state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({
+        "approved": [event_fingerprint(kept, "2026-07-27")],
+        "excluded": [],
+        "pending": {
+            "2026-07-27": [event_fingerprint(removed, "2026-07-27")]
+        },
+    }), encoding="utf-8")
+    path = _write_review_bundle(cfg, [kept], "private stale journal")
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+
+    assert cli.main(["review", "--date", "2026-07-27"]) == 0
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["journal_md"] == (
+        "## 2026-07-27\n\n### project-alpha\n- kept"
+    )
+    state = DraftState(state_path).snapshot()
+    assert event_fingerprint(removed, "2026-07-27") in state["excluded"]
+    output = capsys.readouterr().out
+    assert "kept" in output
+    assert "removed private event" not in output
+
+
+def test_review_invalid_json_preserves_bundle_and_state(tmp_path, monkeypatch):
+    cfg = _setup_cfg(tmp_path)
+    path = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    path.parent.mkdir(parents=True)
+    original = b'{"events": [member edit in progress'
+    path.write_bytes(original)
+    state_path = cfg.workdir / "state.json"
+    DraftState(state_path).refresh(
+        "2026-07-27", [_review_event("pending")], current=None
+    )
+    before = DraftState(state_path).snapshot()
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+
+    with pytest.raises(ValueError):
+        cli.main(["review", "--date", "2026-07-27"])
+
+    assert path.read_bytes() == original
+    assert DraftState(state_path).snapshot() == before
+
+
+def test_review_replace_failure_preserves_bundle_and_state(
+    tmp_path, monkeypatch,
+):
+    cfg = _setup_cfg(tmp_path)
+    kept, removed = _review_event("kept"), _review_event("removed")
+    state_path = cfg.workdir / "state.json"
+    DraftState(state_path).refresh(
+        "2026-07-27", [kept, removed], current=None
+    )
+    path = _write_review_bundle(cfg, [kept], "private stale journal")
+    original = path.read_bytes()
+    before = DraftState(state_path).snapshot()
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    monkeypatch.setattr(
+        cli.bundle.os,
+        "replace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        cli.main(["review", "--date", "2026-07-27"])
+
+    assert path.read_bytes() == original
+    assert DraftState(state_path).snapshot() == before
+    assert sorted(item.name for item in path.parent.iterdir()) == [path.name]
 
 
 def test_setup_prompts_to_accept_default_schedule(tmp_path, monkeypatch):
