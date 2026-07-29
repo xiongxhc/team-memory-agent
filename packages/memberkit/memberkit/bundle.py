@@ -1,6 +1,5 @@
 """Draft a teammem-bundle/v1 from the local claude-mem observations db (read-only)."""
 
-import json
 import os
 import re
 import sqlite3
@@ -17,8 +16,17 @@ _GENERIC_TITLE = re.compile(
     r"status|summary|tests?\s+passed|red\s+phase|green\s+phase)$",
     re.IGNORECASE,
 )
-_PRIVATE_PATH = re.compile(
-    r"(?:/Users/|/home/|file://|~/(?:\.|Library/)|[A-Za-z]:\\)"
+_PATH_LIKE = (
+    re.compile(r"(?<![A-Za-z0-9_:/])/(?!/)[^\s,;:!?]+"),
+    re.compile(r"(?<!\w)~[\\/][^\s,;:!?]+"),
+    re.compile(r"(?<!\w)[A-Za-z]:[\\/][^\s,;:!?]+"),
+    re.compile(r"\\\\[^\\/\s]+[\\/][^\\/\s]+"),
+    re.compile(r"(?<!:)(?<!/)//[^/\s]+/[^/\s]+"),
+    re.compile(r"(?<!\w)\.\.?[\\/][^\s,;:!?]+"),
+    re.compile(
+        r"(?<![\w./\\])(?:[A-Za-z0-9_.-]+[\\/])+"
+        r"[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}(?!\w)"
+    ),
 )
 _SIGNALS = (
     (500, ("security", "privacy", "credential", "secret", "direct message", "dm ")),
@@ -28,8 +36,11 @@ _SIGNALS = (
     (100, ("added", "fixed", "completed", "resolved", "implemented", "verified", "prevent")),
 )
 _MECHANICS = (
-    "progress", "test passed", "tests passed", "review dispatched", "staged",
-    "commit", "worktree", "red phase", "green phase",
+    "progress", "test passed", "tests pass", "tests passed", "test suite",
+    "diff inspection", "verification checks", "public-source scan",
+    "check-public", "code review", "review dispatched", "staged", "commit",
+    "worktree", "implementation initiated", "task started", "tdd approach",
+    "red phase", "green phase",
 )
 
 
@@ -100,55 +111,56 @@ def _meaningful(text: str | None) -> str:
     return normalized
 
 
-def _first_sentence(text: str | None) -> str:
-    normalized = _normalize(text)
-    if not normalized:
-        return ""
-    match = re.match(r"^(.+?[.!?])(?:\s|$)", normalized)
-    return match.group(1) if match else normalized
+def _contains_path_like(text: str) -> bool:
+    return any(pattern.search(text) for pattern in _PATH_LIKE)
 
 
-def _fact_text(raw: str | None) -> str:
-    if not raw:
-        return ""
-    try:
-        value = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        value = raw
-    if isinstance(value, str):
-        values = [value]
-    elif isinstance(value, list):
-        values = [item for item in value if isinstance(item, str)]
-    elif isinstance(value, dict):
-        values = [item for item in value.values() if isinstance(item, str)]
-    else:
-        values = []
-    for value in values:
-        sentence = _first_sentence(value)
-        if sentence and not _PRIVATE_PATH.search(sentence):
-            return sentence
+def _safe_meaningful(text: str | None) -> str:
+    selected = _meaningful(text)
+    if selected and not _contains_path_like(selected):
+        return selected
     return ""
+
+
+def _safe_narrative(text: str | None) -> str:
+    normalized = _normalize(text)
+    for sentence in re.split(r"(?<=[.!?])\s+", normalized):
+        selected = _safe_meaningful(sentence)
+        if selected:
+            return selected
+    return ""
+
+
+def _combine_summary(title: str, subtitle: str) -> str:
+    combined = f"{title} — {subtitle}"
+    if len(combined) <= SUMMARY_LIMIT:
+        return combined
+    title_part = _truncate(title, 80)
+    subtitle_part = _truncate(subtitle, SUMMARY_LIMIT - len(title_part) - 3)
+    return f"{title_part} — {subtitle_part}"
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    shortened = text[:limit - 1].rstrip()
+    if " " in shortened:
+        shortened = shortened.rsplit(" ", 1)[0]
+    return shortened.rstrip(" ,;:—-") + "…"
 
 
 def _summary(row: sqlite3.Row) -> str:
-    choices = (
-        _meaningful(row["title"]),
-        _meaningful(row["subtitle"]),
-        _meaningful(_first_sentence(row["narrative"])),
-        _meaningful(_fact_text(row["facts"])),
-    )
-    for selected in choices:
-        if selected and not _PRIVATE_PATH.search(selected):
-            return selected[:SUMMARY_LIMIT]
-    return ""
+    title = _safe_meaningful(row["title"])
+    subtitle = _safe_meaningful(row["subtitle"])
+    narrative = _safe_narrative(row["narrative"])
+    if title and subtitle:
+        return _combine_summary(title, subtitle)
+    return (title or subtitle or narrative)[:SUMMARY_LIMIT]
 
 
 def _score(row: sqlite3.Row, summary: str) -> int:
     text = " ".join([
         summary,
-        _normalize(row["title"]),
-        _normalize(row["subtitle"]),
-        _normalize(row["narrative"]),
         _normalize(row["type"]),
     ]).casefold()
     score = 0
@@ -159,7 +171,7 @@ def _score(row: sqlite3.Row, summary: str) -> int:
     if (row["type"] or "").casefold() == "decision":
         score = max(score, 400)
     if any(signal in text for signal in _MECHANICS):
-        score -= 25
+        score = min(score, -100)
     return score
 
 
@@ -201,7 +213,10 @@ def _curated_events(rows: list[sqlite3.Row]) -> list[dict]:
     selected: list[dict] = []
     for candidates_for_project in by_project.values():
         ranked = sorted(
-            candidates_for_project,
+            (
+                candidate for candidate in candidates_for_project
+                if candidate["score"] >= 0
+            ),
             key=lambda candidate: (-candidate["score"], candidate["epoch"],
                                    candidate["index"]),
         )
@@ -240,13 +255,15 @@ def draft(
             selected.extend([
                 _column_expression(columns, "memory_session_id"),
                 _column_expression(columns, "subtitle"),
-                _column_expression(columns, "facts"),
                 _column_expression(columns, "type"),
             ])
+        order_by = "created_at_epoch"
+        if not all_observations:
+            order_by += ", id" if "id" in columns else ", rowid"
         rows = con.execute(
             f"SELECT {', '.join(selected)} FROM observations"
             " WHERE created_at_epoch >= ? AND created_at_epoch < ?"
-            " ORDER BY created_at_epoch",
+            f" ORDER BY {order_by}",
             (lo, hi),
         ).fetchall()
     finally:
