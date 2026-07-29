@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     p_setup = sub.add_parser("setup", help="configure MemberKit and its local reminder")
     p_setup.add_argument("--member")
     p_setup.add_argument("--inbox-url")
-    p_setup.add_argument("--time")
+    p_setup.add_argument("--time", help="daily HH:MM in the Mac's local timezone")
     p_setup.add_argument("--no-schedule", action="store_true")
     p_setup.add_argument("--db", default="~/.claude-mem/claude-mem.db")
     p_setup.add_argument("--workdir", default="~/.memberkit")
@@ -39,7 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     p_schedule = sub.add_parser("schedule", help="manage the local draft reminder")
     schedule_sub = p_schedule.add_subparsers(dest="schedule_cmd", required=True)
     p_install = schedule_sub.add_parser("install")
-    p_install.add_argument("--time", default=DEFAULT_TIME)
+    p_install.add_argument(
+        "--time",
+        default=DEFAULT_TIME,
+        help="daily HH:MM in the Mac's local timezone",
+    )
     schedule_sub.add_parser("status")
     schedule_sub.add_parser("remove")
     sub.add_parser("scheduled-run", help="prepare local drafts for the scheduler")
@@ -50,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         inbox_url = args.inbox_url or input("Inbox Git URL: ").strip()
         if not member or not inbox_url:
             raise SystemExit("member slug and inbox URL are required")
+        config.resolve_timezone(args.timezone)
         config.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         lines = [
             f"MEMBERKIT_MEMBER={member}",

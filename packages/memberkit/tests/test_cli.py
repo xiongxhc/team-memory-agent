@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from memberkit import cli
 from memberkit.config import Config
 from memberkit.state import DraftState
@@ -190,6 +192,28 @@ def test_setup_can_decline_schedule_interactively(tmp_path, monkeypatch):
     ]) == 0
 
     assert installed == []
+
+
+def test_setup_invalid_timezone_preserves_existing_config(tmp_path, monkeypatch):
+    path = tmp_path / "memberkit.env"
+    original = (
+        b"MEMBERKIT_MEMBER=alex\n"
+        b"MEMBERKIT_INBOX_URL=git@example.test:team/inbox.git\n"
+        b"MEMBERKIT_TIMEZONE=Asia/Dubai\n"
+    )
+    path.write_bytes(original)
+    monkeypatch.setattr(cli.config, "CONFIG_FILE", path)
+
+    with pytest.raises(SystemExit, match="invalid MEMBERKIT_TIMEZONE"):
+        cli.main([
+            "setup",
+            "--member", "alex",
+            "--inbox-url", "git@example.test:team/inbox.git",
+            "--timezone", "Mars/Olympus_Mons",
+            "--no-schedule",
+        ])
+
+    assert path.read_bytes() == original
 
 
 def test_dismiss_excludes_pending_date_without_transmitting(tmp_path, monkeypatch):

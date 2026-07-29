@@ -501,9 +501,11 @@ They need Python 3.11 or newer, `pipx`, Git, a local `claude-mem` observations
 database, their roster slug, and push access to the inbox.
 
 `memberkit setup` writes `~/.config/teammem/memberkit.env` with mode `0600`. On
-macOS it offers to install a LaunchAgent at 17:30 local time. Press Enter to
-accept, enter another `HH:MM`, or enter `no` to decline. Package installation
-alone never installs the schedule.
+macOS it offers to install a LaunchAgent at 17:30 in the Mac's local timezone.
+Press Enter to accept, enter another `HH:MM`, or enter `no` to decline. The
+optional `MEMBERKIT_TIMEZONE` controls member-calendar attribution after the
+command starts; it does not move the launchd trigger. Package installation alone
+never installs the schedule.
 
 For managed onboarding:
 

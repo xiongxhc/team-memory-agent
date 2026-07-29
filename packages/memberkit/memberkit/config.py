@@ -29,6 +29,18 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return pairs
 
 
+def resolve_timezone(name: str | None) -> ZoneInfo | None:
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name.removeprefix(":"))
+    except ZoneInfoNotFoundError as exc:
+        raise SystemExit(
+            f"invalid MEMBERKIT_TIMEZONE {name!r}: "
+            "use an IANA timezone such as Asia/Dubai"
+        ) from exc
+
+
 def load(env: dict[str, str] | None = None) -> Config:
     merged = {**_read_env_file(CONFIG_FILE), **(dict(os.environ) if env is None else env)}
 
@@ -37,23 +49,10 @@ def load(env: dict[str, str] | None = None) -> Config:
             raise SystemExit(f"missing {key}: set it in {CONFIG_FILE} or the environment")
         return merged[key]
 
-    timezone_name = merged.get("MEMBERKIT_TIMEZONE")
-    try:
-        timezone = (
-            ZoneInfo(timezone_name.removeprefix(":"))
-            if timezone_name
-            else None
-        )
-    except ZoneInfoNotFoundError as exc:
-        raise SystemExit(
-            f"invalid MEMBERKIT_TIMEZONE {timezone_name!r}: "
-            "use an IANA timezone such as Asia/Dubai"
-        ) from exc
-
     return Config(
         member=need("MEMBERKIT_MEMBER"),
         db=Path(merged.get("MEMBERKIT_DB", "~/.claude-mem/claude-mem.db")).expanduser(),
         inbox_url=need("MEMBERKIT_INBOX_URL"),
         workdir=Path(merged.get("MEMBERKIT_WORKDIR", "~/.memberkit")).expanduser(),
-        timezone=timezone,
+        timezone=resolve_timezone(merged.get("MEMBERKIT_TIMEZONE")),
     )

@@ -34,13 +34,14 @@ memberkit setup
 ```
 
 Setup asks for the roster slug and inbox URL. On macOS it then offers a daily 17:30
-local reminder. Press Enter to accept, enter another `HH:MM`, or enter `no` to
-decline. It stores private configuration at
+reminder in the Mac's local timezone. Press Enter to accept, enter another
+`HH:MM`, or enter `no` to decline. It stores private configuration at
 `~/.config/teammem/memberkit.env`.
 
 For a machine whose host timezone differs from the member, pass an IANA timezone
 such as `memberkit setup --timezone Asia/Dubai`. Invalid explicit timezone names
-are rejected.
+are rejected. This setting controls member-calendar attribution, not the
+host-local launchd trigger.
 
 ## Review workflow
 
@@ -92,11 +93,13 @@ memberkit scheduled-run
 
 MemberKit supports macOS launchd for automatic schedule installation. Other
 platforms can schedule the portable `memberkit scheduled-run` command. A scheduled
-run checks yesterday and today in the configured member timezone, even if the host
-timezone differs. Late work remains attributed to its member-local date, work
-after midnight belongs to the new day, and unfinished dates remain in later
-reminders. Scheduling uses curated mode. It never replaces an existing draft;
-explicitly regenerate with `memberkit draft --force` after review if later
+run is triggered at the configured time in the host scheduler's local clock. Once
+running, it checks yesterday and today in the configured member timezone, even if
+that differs from the host. Late work remains attributed to its member-local date,
+work after member-local midnight belongs to the new day, and unfinished dates
+remain in later reminders. `MEMBERKIT_TIMEZONE` does not dynamically change the
+launchd trigger. Scheduling uses curated mode and never replaces an existing
+draft; explicitly regenerate with `memberkit draft --force` after review if later
 observations need to be included.
 
 ## Upgrade and uninstall
