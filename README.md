@@ -13,7 +13,7 @@ member reviews it, and nothing is transmitted until that member explicitly runs
 | Component | Installed by | Purpose |
 |---|---|---|
 | `teammem` | Hub operator | Collect, import, query, and render |
-| `teammem-memberkit` | Individual member | Draft, review, and push selected highlights |
+| `teammem-memberkit` | Individual member | Draft, review, and push local evidence |
 | `teammem-bundle/v1` | Both packages | Frozen JSON protocol |
 
 MemberKit is a standalone command-line package, not a skill. Members install only
@@ -70,28 +70,31 @@ today's draft:
 memberkit review
 ```
 
-By default, a draft contains at most seven curated highlights per project (normally
-three to seven, or fewer when the day is sparse). Curation is deterministic and
-local: it keeps the best outcome from each work session and makes no network or
-LLM call. If something appears to be missing, explicitly regenerate the raw
-one-row-per-observation view:
+By default, a draft contains one short v1 event for every eligible local
+observation, in timestamp order. A busy day can contain hundreds of events.
+MemberKit does not score, consolidate, semantically deduplicate, or cap them;
+TeamMem performs downstream synthesis after import. This is still a bounded v1
+projection, not a raw database export: internal facts, sessions, source metadata,
+files, and complete observation payloads remain local.
 
 ```bash
 memberkit draft --all --force --date YYYY-MM-DD
 ```
 
-`--all` is the raw compatibility mode. `--force` is separately required because
-MemberKit never overwrites an existing or partially edited draft by default.
-Raw mode deliberately preserves legacy, unfiltered title/narrative summaries for
-local inspection. It may reveal sensitive observation text, so review and redact
-every raw event before any push; curated path filtering does not apply to
-`--all`. The `ts` field is normalized from the observation epoch into the
-member's local timezone so every event remains valid for the bundle date.
+`--all` is a compatibility alias and produces the same events as the default.
+`--force` is separately required because MemberKit never overwrites an existing
+or partially edited draft by default. Eligible title or bounded narrative
+summaries may still contain sensitive text, so human review and redaction are
+mandatory before every push. The `ts` field is normalized from the observation
+epoch into the member's local timezone so every event remains valid for the
+bundle date.
 
 To remove private items, edit the `events` list in
 `~/.memberkit/out/bundle-<member>-<YYYY-MM-DD>.json`, save valid JSON, and review
 again. `journal_md` is only a preview and is regenerated from the reviewed event
-list when pushing.
+list when reviewing and again before pushing. Only the remaining `events` are
+accepted as evidence; TeamMem later deduplicates and summarizes them for shared
+human-facing reports.
 
 Share the reviewed date, or dismiss it without sharing:
 

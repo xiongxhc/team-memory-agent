@@ -102,9 +102,10 @@ the private file for that invocation.
 The installed macOS schedule runs `memberkit scheduled-run`. It creates
 local drafts for yesterday and today and shows a notification for every unfinished
 date. It does not invoke Git or transmit anything. New drafts contain a
-deterministic local curation of normally three to seven highlights per project,
-or fewer when there are fewer distinct work-session outcomes. The per-project cap
-is seven. Curation makes no LLM or network call.
+short frozen-v1 event for every eligible observation in timestamp order.
+MemberKit does not score, consolidate, semantically deduplicate, or cap this
+evidence. A busy day can therefore contain hundreds of events. Drafting makes no
+LLM or network call; TeamMem performs downstream synthesis after import.
 
 Review a date:
 
@@ -124,21 +125,20 @@ The JSON file is:
 ~/.memberkit/out/bundle-<member>-<YYYY-MM-DD>.json
 ```
 
-If a useful observation seems to be missing, inspect the raw compatibility mode:
+The former `--all` spelling remains available as a compatibility alias:
 
 ```bash
 memberkit draft --all --force --date YYYY-MM-DD
 ```
 
-`--all` restores the original one-row-per-observation projection in timestamp
-order. `--force` is a separate, explicit overwrite choice. Without `--force`,
-`memberkit draft` does not replace any existing file, including valid,
-member-edited, malformed, or partially written JSON. Raw mode is for local
-inspection and deliberately preserves unfiltered legacy title/narrative
-summaries. It may expose sensitive observation text. Curated path filtering does
-not apply, so review and redact every raw event before pushing. Raw mode retains
-the same rows, summaries, and epoch order, while `ts` is normalized from each
-epoch into the member's local timezone to satisfy the bundle-date contract.
+`--all` produces the same event set as the default. `--force` is a separate,
+explicit overwrite choice. Without `--force`, `memberkit draft` does not replace
+any existing file, including valid, member-edited, malformed, or partially
+written JSON. The v1 projection omits raw rows, facts, sessions, files, source
+metadata, and complete narratives, but its title or bounded narrative summaries
+may still contain sensitive text. Review and redact every event before pushing.
+`ts` is normalized from each observation epoch into the member's local timezone
+to satisfy the bundle-date contract.
 
 To redact an item:
 
@@ -148,7 +148,8 @@ To redact an item:
 4. Run `memberkit review --date YYYY-MM-DD` again.
 
 The `events` list is authoritative. MemberKit regenerates `journal_md` from that
-list during push, so editing only `journal_md` does not redact an event.
+list during review and again before push, so editing only `journal_md` does not
+redact an event.
 
 Push only after review:
 
@@ -159,7 +160,8 @@ memberkit push --date YYYY-MM-DD
 The first push clones the configured inbox under `~/.memberkit/inbox`. MemberKit
 writes only the reviewed bundle, creates a Git commit, and pushes it. If Git asks
 for credentials or reports a permission error, confirm your inbox access with the
-operator.
+operator. TeamMem imports the remaining events as evidence and performs
+deduplication and concise synthesis for human-facing reports afterward.
 
 Dismiss a date without sharing it:
 

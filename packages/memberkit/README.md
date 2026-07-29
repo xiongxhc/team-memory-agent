@@ -9,9 +9,10 @@ MemberKit prepares reviewable local drafts from configured observations. Schedul
 runs create drafts and reminders only. Nothing is transmitted until the member
 explicitly runs `memberkit push`.
 
-The default draft is a deterministic local curation of normally three to seven
-highlights per project (fewer for a sparse day), with at most one best outcome per
-work session and a hard cap of seven. It makes no LLM or network call.
+The default draft preserves one short frozen-v1 event for every eligible local
+observation in timestamp order. MemberKit does not score, consolidate,
+semantically deduplicate, or cap the evidence, so a busy day can contain hundreds
+of events. TeamMem performs downstream synthesis after import.
 
 ## Before installing
 
@@ -55,23 +56,22 @@ The date defaults to today in the configured member timezone. Drafts are stored 
 `~/.memberkit/out/bundle-<member>-<YYYY-MM-DD>.json`. Remove a private item from
 the JSON `events` list, save valid JSON, and run `memberkit review` again before
 pushing. Editing only `journal_md` does not remove an event because that preview is
-regenerated from `events` at push time.
+regenerated from `events` during review and again before push.
 
-If the curated draft may have omitted something important, use the raw
-one-row-per-observation compatibility mode:
+The former `--all` spelling remains accepted for compatibility:
 
 ```bash
 memberkit draft --all --force --date YYYY-MM-DD
 ```
 
-`--all` changes selection; `--force` explicitly permits replacement of an
-existing draft. Without `--force`, `memberkit draft` preserves any existing file,
-including malformed or partially edited JSON, byte-for-byte. Raw mode deliberately
-preserves legacy, unfiltered title/narrative summaries for local inspection and
-may reveal sensitive observation text. Review and redact every raw event before
-push; curated path filtering does not apply to `--all`. The `ts` field is
-normalized from the observation epoch into the member's local timezone so it
-matches the bundle date.
+`--all` produces the same event set as the default; `--force` explicitly permits
+replacement of an existing draft. Without `--force`, `memberkit draft` preserves
+any existing file, including malformed or partially edited JSON, byte-for-byte.
+This remains a bounded v1 projection rather than a raw database export, but title
+and narrative summaries may contain sensitive text. Human review and redaction
+are mandatory before every push. The `ts` field is normalized from the
+observation epoch into the member's local timezone so it matches the bundle
+date.
 
 To exclude an unfinished date without transmitting it:
 
@@ -98,9 +98,9 @@ running, it checks yesterday and today in the configured member timezone, even i
 that differs from the host. Late work remains attributed to its member-local date,
 work after member-local midnight belongs to the new day, and unfinished dates
 remain in later reminders. `MEMBERKIT_TIMEZONE` does not dynamically change the
-launchd trigger. Scheduling uses curated mode and never replaces an existing
-draft; explicitly regenerate with `memberkit draft --force` after review if later
-observations need to be included.
+launchd trigger. Scheduling uses the same evidence-first projection as direct
+drafting and never replaces an existing draft; explicitly regenerate with
+`memberkit draft --force` after review if later observations need to be included.
 
 ## Upgrade and uninstall
 
