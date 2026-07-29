@@ -34,6 +34,12 @@ _PATH_LIKE = (
         r"(?:[\\/][A-Za-z0-9_.-]+)+(?![\w/\\])",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"(?<![\w./\\])(?:README\.(?:md|rst|txt)|pyproject\.toml|"
+        r"\.env(?:\.[A-Za-z0-9_-]+)?|Dockerfile(?:\.[A-Za-z0-9_-]+)?|"
+        r"(?:docker-)?compose\.ya?ml)(?![\w./\\])",
+        re.IGNORECASE,
+    ),
 )
 _SIGNALS = (
     (500, ("security", "privacy", "credential", "secret", "direct message", "dm ")),
@@ -42,12 +48,20 @@ _SIGNALS = (
     (200, ("release", "released", "publish", "published", "shipped", "deployed", "merged")),
     (100, ("added", "fixed", "completed", "resolved", "implemented", "verified", "prevent")),
 )
-_MECHANICS = (
-    "progress", "test passed", "tests pass", "tests passed", "test suite",
-    "diff inspection", "verification checks", "public-source scan",
-    "check-public", "code review", "review dispatched", "staged", "commit",
-    "worktree", "implementation initiated", "task started", "tdd approach",
-    "red phase", "green phase",
+_MECHANICS_ONLY = (
+    re.compile(r"^progress(?: update)?(?: [a-z0-9_-]+)?[.!]?$", re.IGNORECASE),
+    re.compile(r"^tests? pass(?:ed)?[.!]?$", re.IGNORECASE),
+    re.compile(r"^review dispatched[.!]?$", re.IGNORECASE),
+    re.compile(r"^commit staged[.!]?$", re.IGNORECASE),
+    re.compile(r"^(?:red|green)(?: phase| mechanics)?[.!]?$", re.IGNORECASE),
+    re.compile(r"^diff inspection\b.*$", re.IGNORECASE),
+    re.compile(r"^verification checks?\b.*$", re.IGNORECASE),
+    re.compile(r"^(?:public-source scan|check-public)\b.*$", re.IGNORECASE),
+    re.compile(r"^code review completed\b.*$", re.IGNORECASE),
+    re.compile(
+        r"^(?:implementation initiated|task started|tdd approach)\b.*$",
+        re.IGNORECASE,
+    ),
 )
 _OUTCOME_SIGNALS = (
     "enforc", "prevent", "resolv", "fixed", "implemented", "completed",
@@ -183,7 +197,9 @@ def _score(row: sqlite3.Row, summary: str) -> tuple[int, int]:
     observation_type = (row["type"] or "").casefold()
     if observation_type == "decision":
         primary = max(primary, 400)
-    if any(signal in text for signal in _MECHANICS):
+    if primary == 0 and any(
+        pattern.fullmatch(summary.strip()) for pattern in _MECHANICS_ONLY
+    ):
         return (-100, 0)
     secondary = _TYPE_OUTCOME_SCORE.get(observation_type, 0)
     if any(signal in summary.casefold() for signal in _OUTCOME_SIGNALS):

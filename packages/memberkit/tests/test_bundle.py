@@ -295,6 +295,25 @@ def test_path_like_detector_rejects_local_paths_but_not_provider_names(unsafe):
     assert not bundle._contains_path_like("Slack/Discord connector decision")
 
 
+@pytest.mark.parametrize("unsafe", [
+    "README.md",
+    "README.rst",
+    "pyproject.toml",
+    ".env",
+    ".env.local",
+    "Dockerfile",
+    "Dockerfile.dev",
+    "docker-compose.yml",
+])
+def test_path_like_detector_rejects_bare_root_files_without_blocking_prose(
+    unsafe,
+):
+    assert bundle._contains_path_like(unsafe)
+    assert not bundle._contains_path_like(
+        "The project readme explains ordinary configuration"
+    )
+
+
 def test_curated_summary_combines_safe_title_and_subtitle_and_skips_unsafe_text(
     tmp_path,
 ):
@@ -378,6 +397,48 @@ def test_same_session_security_resolution_beats_earlier_security_discovery(
     assert [event["summary"] for event in out["events"]] == [
         "Slack DM exclusion enforced"
     ]
+
+
+@pytest.mark.parametrize("summary", [
+    "Important uncommitted release risk",
+    "Code review found unresolved privacy leak",
+    "Security fix committed and verified",
+    "Implemented progressive disclosure",
+])
+def test_incidental_mechanics_words_do_not_hide_meaningful_outcomes(
+    tmp_path, summary,
+):
+    rows = [
+        rich_row(
+            "sdk", "session-a", summary, "2026-07-24T09:00:00",
+            kind="discovery",
+        ),
+    ]
+
+    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
+
+    assert [event["summary"] for event in out["events"]] == [summary]
+
+
+@pytest.mark.parametrize("summary", [
+    "Progress update one",
+    "Tests passed",
+    "Review dispatched",
+    "Commit staged",
+    "RED mechanics",
+    "GREEN mechanics",
+])
+def test_true_mechanics_only_summaries_are_filtered(tmp_path, summary):
+    rows = [
+        rich_row(
+            "sdk", "session-a", summary, "2026-07-24T09:00:00",
+            kind="discovery",
+        ),
+    ]
+
+    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
+
+    assert out["events"] == []
 
 
 def test_long_title_and_subtitle_are_composed_then_truncated_once(tmp_path):
