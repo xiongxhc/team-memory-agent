@@ -145,7 +145,7 @@ def scheduled_run(config: Config, now: datetime | None = None,
         if path.exists():
             try:
                 current = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 pending_dates.append(date_text)
                 continue
             if not _valid_existing_draft(current, config, date_text):
