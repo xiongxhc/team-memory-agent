@@ -77,10 +77,11 @@ most one best outcome per local work session and caps each project at seven.
 whether curation omitted something, but it still emits only the frozen
 `teammem-bundle/v1` event shape.
 
-MemberKit does not include raw database rows, session identifiers, fact arrays,
-source metadata, local file paths, direct messages, or credentials in the bundle.
-Local review state remembers approved and excluded event fingerprints so later
-runs cannot silently restore a redacted event.
+MemberKit does not read or emit the observation database's internal `facts`
+column. It does not include raw database rows, session identifiers, source
+metadata, path-like local file references, direct messages, or credentials in the
+bundle. Local review state remembers approved and excluded event fingerprints so
+later runs cannot silently restore a redacted event.
 
 Member drafts, review state, and the inbox clone remain under the configured
 MemberKit work directory (`~/.memberkit` by default). Private configuration is
