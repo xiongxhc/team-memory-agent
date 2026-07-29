@@ -988,6 +988,7 @@ if (first, second) != (0, 0):
 """
     environment = os.environ.copy()
     environment["TEAMMEM_CONFIG_DIR"] = str(CONFIG_DIR)
+    environment["APPDATA"] = r"C:\\Users\\Alex\\AppData\\Roaming"
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=Path(__file__).parents[1],
@@ -1002,6 +1003,15 @@ if (first, second) != (0, 0):
         in result.stdout
     )
     assert "Unix scheduler imported" not in result.stderr
+
+
+def test_parser_uses_windows_appdata_default_at_parse_time(monkeypatch):
+    monkeypatch.setattr(cli_module.sys, "platform", "win32")
+    monkeypatch.setenv("APPDATA", r"C:\\Users\\Alex\\AppData\\Roaming")
+    args = cli_module._parser().parse_args(["stats"])
+    assert args.env_file == (
+        Path(r"C:\\Users\\Alex\\AppData\\Roaming") / "TeamMemory" / "hub.env"
+    )
 
 
 def test_schedule_install_runtime_failure_returns_clean_exit_2(

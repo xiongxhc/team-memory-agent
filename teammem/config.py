@@ -3,24 +3,72 @@ environment variable so the launchd tick can be configured without code edits.""
 
 import os
 import stat
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
+from typing import Any, Mapping
 
 
-DEFAULT_ENV_FILE = Path("~/.config/teammem/hub.env").expanduser()
 _ENVIRONMENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
-def _env_file_path(path: Path) -> Path:
+def default_env_file(
+    platform: str | None = None, env: Mapping[str, str] | None = None
+) -> Path:
+    """Resolve the operator's default environment file at call time."""
+    current = sys.platform if platform is None else platform
+    if current == "win32":
+        values = os.environ if env is None else env
+        root = values.get("APPDATA")
+        if not root:
+            raise RuntimeError("APPDATA is required on Windows")
+        return Path(root) / "TeamMemory" / "hub.env"
+    return Path("~/.config/teammem/hub.env").expanduser()
+
+
+def _env_file_path(path: Path, *, platform: str | None = None) -> Path:
+    if (sys.platform if platform is None else platform) == "win32":
+        return Path(path)
     expanded = Path(path).expanduser()
     absolute = expanded if expanded.is_absolute() else Path.cwd() / expanded
     return absolute.parent.resolve() / absolute.name
 
 
-def read_env_file(path: Path, *, required: bool = False) -> dict[str, str]:
+def _parse_env_lines(lines: list[str], path: Path) -> dict[str, str]:
+    values = {}
+    for number, raw_line in enumerate(lines, start=1):
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        key, separator, value = raw_line.partition("=")
+        if not separator or not _ENVIRONMENT_KEY.fullmatch(key):
+            raise ValueError(f"invalid environment-file entry at {path}:{number}")
+        values[key] = value
+    return values
+
+
+def read_env_file(
+    path: Path,
+    *,
+    required: bool = False,
+    platform: str | None = None,
+    windows_api: Any = None,
+) -> dict[str, str]:
     """Read literal KEY=VALUE entries from a private hub environment file."""
-    path = _env_file_path(path)
+    current = sys.platform if platform is None else platform
+    path = _env_file_path(path, platform=current)
+    if current == "win32":
+        from .windows_security import current_user_sid, read_windows_env_file
+
+        try:
+            lines = read_windows_env_file(
+                path, current_user_sid(windows_api), windows_api
+            )
+        except FileNotFoundError:
+            if required:
+                raise ValueError(f"environment file does not exist: {path}") from None
+            return {}
+        return _parse_env_lines(lines, path)
     try:
         path_metadata = os.lstat(path)
     except FileNotFoundError:
@@ -69,15 +117,7 @@ def read_env_file(path: Path, *, required: bool = False) -> dict[str, str]:
         if descriptor != -1:
             os.close(descriptor)
 
-    values = {}
-    for number, raw_line in enumerate(lines, start=1):
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        key, separator, value = raw_line.partition("=")
-        if not separator or not _ENVIRONMENT_KEY.fullmatch(key):
-            raise ValueError(f"invalid environment-file entry at {path}:{number}")
-        values[key] = value
-    return values
+    return _parse_env_lines(lines, path)
 
 
 def _integer(values: dict, key: str, default: int) -> int:
@@ -103,7 +143,7 @@ class Config:
     anthropic_api_key: str = ""    # ANTHROPIC_API_KEY — synthesis only, never committed
     llm_daily_model: str = "daily-summary-model"
     llm_report_model: str = "weekly-summary-model"
-    env_file: Path = DEFAULT_ENV_FILE
+    env_file: Path = field(default_factory=default_env_file)
     github_token: str = ""       # GitHub fine-grained token — never committed
     slack_bot_token: str = ""    # Slack bot token — never committed
     discord_bot_token: str = ""  # Discord bot token — never committed
@@ -119,11 +159,21 @@ class Config:
         env_file: Path | None = None,
         *,
         require_env_file: bool = False,
+        platform: str | None = None,
+        windows_api: Any = None,
     ) -> "Config":
         env_file = _env_file_path(
-            DEFAULT_ENV_FILE if env_file is None else Path(env_file)
+            default_env_file(platform=platform, env=env)
+            if env_file is None
+            else Path(env_file),
+            platform=platform,
         )
-        values = read_env_file(env_file, required=require_env_file)
+        values = read_env_file(
+            env_file,
+            required=require_env_file,
+            platform=platform,
+            windows_api=windows_api,
+        )
         values.update(os.environ if env is None else env)
         return cls(
             db_path=Path(values.get("TEAMMEM_DB", str(cls.db_path))),
