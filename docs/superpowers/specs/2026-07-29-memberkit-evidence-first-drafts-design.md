@@ -74,13 +74,15 @@ restoring member-deleted events.
 ### Push repeats the local preflight
 
 Push does not trust that review was run or that the file remained unchanged. It
-performs the same full validation, exclusion reconciliation, journal
-regeneration, and atomic local rewrite before any clone, pull, commit, or push.
-Only the validated regenerated bundle is copied to the inbox.
+performs the same full validation, journal regeneration, and atomic local
+rewrite before any clone, pull, commit, or push. It does not mutate review
+state before Git. Only the validated regenerated bundle is copied to the inbox.
 
 Validation or local-write failure performs no network-capable Git operation. A
-later Git failure retains the corrected local bundle and exclusions, but events
-are marked approved only after successful delivery or a verified no-op.
+later Git failure retains the corrected local bundle and leaves review state
+unchanged, so pending evidence remains pending. After successful delivery or a
+verified no-op, `record_push` reconciles included events as approved and omitted
+pending events as excluded in the same state update.
 
 ### TeamMem summarizes after import
 
@@ -105,9 +107,11 @@ that generated presentation, never to the accepted evidence set.
 - A malformed scheduled draft is preserved and reported for attention.
 - Invalid review or push input reports an actionable local error without
   rewriting the file or changing state.
-- Review and push use replacement-style atomic writes so a failure preserves the
-  previous bytes.
+- Review and push use replacement-style atomic writes so a local-write failure
+  preserves the previous bytes.
 - Push completes all validation and local persistence before Git/network work.
+- A Git failure leaves review state unchanged while retaining the corrected
+  local bundle.
 
 ## Verification
 
@@ -120,7 +124,9 @@ that generated presentation, never to the accepted evidence set.
   display, and exclusion state.
 - A later scheduled run cannot restore an excluded event.
 - Pushing without a prior review still regenerates the local and destination
-  journals before delivery.
+  journals before delivery and reconciles review state only after delivery.
+- A failed Git operation leaves approvals, exclusions, and pending fingerprints
+  unchanged.
 - Invalid bundles and atomic-write failures make zero Git/network calls.
 - Frozen-v1 import remains idempotent.
 - Existing macOS, Linux, Windows, timezone, reminder, and no-auto-push tests

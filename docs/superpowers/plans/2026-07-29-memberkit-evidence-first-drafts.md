@@ -4,7 +4,7 @@
 
 **Goal:** Preserve every eligible MemberKit v1 observation event, keep edited journals synchronized, and defer semantic summarization to TeamMem.
 
-**Architecture:** Simplify `bundle.draft()` to the existing legacy v1 projection for every caller. Add one shared local bundle preflight that validates the frozen envelope, regenerates `journal_md`, and atomically persists it; both review and push use it, while review state records removed pending fingerprints before later schedules can restore them.
+**Architecture:** Simplify `bundle.draft()` to the existing legacy v1 projection for every caller. Add one shared local bundle preflight that validates the frozen envelope, regenerates `journal_md`, and atomically persists it. Review records removals before displaying; push changes review state only after successful delivery or a verified no-op.
 
 **Tech Stack:** Python 3.11+, SQLite read-only URI, `pathlib`, `json`, replacement-style atomic writes, pytest, Git.
 
@@ -15,7 +15,8 @@
 - `--all` remains accepted as a compatibility alias and produces the same event set as default drafting.
 - The existing millisecond epoch query, member-timezone date boundary, normalized event timestamp, `--force`, and no-auto-push behavior remain unchanged.
 - Complete raw observation rows, facts, session metadata, file payloads, and direct messages are not added to the bundle.
-- Review and push finish validation, exclusion reconciliation, journal regeneration, and atomic local persistence before push performs any Git/network-capable call.
+- Review finishes validation, exclusion reconciliation, journal regeneration, and atomic local persistence before displaying.
+- Push finishes validation, journal regeneration, and atomic local persistence before Git, then reconciles review state only after successful delivery or a verified no-op.
 - macOS, Linux, and Windows scheduler implementation files are outside this change.
 - Commits use `Chris Xiong <xionghx713@gmail.com>` as author and committer, contain no `Co-Authored-By`, and are not pushed.
 
@@ -23,7 +24,7 @@
 
 - `packages/memberkit/memberkit/bundle.py` owns observation projection, `validate_bundle(data, member, date) -> dict`, `prepare_bundle(path, member, date) -> dict`, journal rendering, and atomic JSON persistence.
 - `packages/memberkit/memberkit/cli.py` owns the direct draft/review commands and invokes the shared preflight before displaying review output.
-- `packages/memberkit/memberkit/push.py` owns inbox Git transport and invokes the shared preflight before any transport operation.
+- `packages/memberkit/memberkit/push.py` owns inbox Git transport, invokes the shared preflight before transport, and records review-state decisions only after successful delivery or a verified no-op.
 - `packages/memberkit/memberkit/state.py` remains the fingerprint decision store; existing `refresh(date, discovered, current)` records removed pending events as excluded.
 - `packages/memberkit/memberkit/schedule.py` continues calling the default `bundle.draft()` and preserves existing member-edited drafts.
 - MemberKit tests cover component behavior; `tests/test_memberkit_integration.py` covers frozen-v1 hub import.
@@ -225,7 +226,7 @@ GIT_COMMITTER_NAME='Chris Xiong' GIT_COMMITTER_EMAIL='xionghx713@gmail.com' \
   git commit -m 'fix: synchronize reviewed MemberKit journals'
 ```
 
-### Task 3: Preflight Push Before Git or Network
+### Task 3: Preflight Push Before Git Without Mutating Review State
 
 **Files:**
 - Modify: `packages/memberkit/memberkit/push.py`
@@ -233,7 +234,7 @@ GIT_COMMITTER_NAME='Chris Xiong' GIT_COMMITTER_EMAIL='xionghx713@gmail.com' \
 
 **Interfaces:**
 - Consumes: `prepare_bundle(path, cfg.member, date) -> dict`
-- Consumes: review-state exclusion reconciliation from Task 2
+- Consumes: `DraftState.record_push(date, pushed) -> None`
 - Preserves: `push(cfg: Config, date: str) -> Path`
 
 - [ ] **Step 1: Write failing push-order tests**
@@ -253,7 +254,8 @@ assert not (cfg.workdir / "inbox").exists()
 Add a valid edited bundle with a stale private journal and valid ISO timestamp.
 Push it without review, then assert the local source and destination contain the
 same regenerated journal and the removed pending fingerprint is excluded. Add a
-Git-failure test proving included events are not approved.
+Git-failure test proving review state is entirely unchanged while the corrected
+local bundle remains.
 
 - [ ] **Step 2: Run test and verify RED**
 
@@ -273,12 +275,13 @@ At the beginning of `push()`:
 ```python
 data = bundle.prepare_bundle(src, cfg.member, date)
 state = DraftState(cfg.workdir / "state.json")
-state.refresh(date, discovered=[], current=data)
 ```
 
 Only then derive `clone` or invoke `_run`/`_git`. Copy the already validated
-serialized data to the destination. Keep `record_push()` after the verified
-no-op or successful remote push only.
+serialized data to the destination. Do not call `refresh()` or otherwise mutate
+review state before Git. Call `record_push()` only after a verified no-op or
+successful remote push; it records included approvals and omitted pending
+exclusions in the same state update.
 
 - [ ] **Step 4: Run GREEN and MemberKit integration tests**
 
