@@ -133,6 +133,29 @@ def validate_windows_state_dir(path: Path, sid: str, api: Any = None) -> Path:
     return _validate_path(Path(path), sid, api or _native_api(), directory=True)
 
 
+def provision_windows_state_dir(path: Path, sid: str, api: Any = None) -> Path:
+    """Create a missing state directory, then validate its opened handle.
+
+    A concurrent creator is safe only when the resulting directory satisfies the
+    same ownership, reparse-point, disk-file, and DACL contract as an existing
+    directory.  No lock or temporary file is created before that validation.
+    """
+    path = Path(path)
+    native = api or _native_api()
+    if not _windows_filesystem_path(path):
+        raise _safe_path(path, "environment path must be an absolute Windows filesystem path")
+    try:
+        return _validate_path(path, sid, native, directory=True)
+    except FileNotFoundError:
+        try:
+            native.create_directory(path)
+        except FileExistsError:
+            pass
+        except OSError as failure:
+            raise _safe_path(path, "environment path cannot be created securely") from failure
+        return _validate_path(path, sid, native, directory=True)
+
+
 class NativeWindowsApi:
     """Small lazy ctypes wrapper used only by Windows operators."""
 
@@ -169,6 +192,8 @@ class NativeWindowsApi:
             ctypes.c_wchar_p, dword, dword, handle, dword, dword, handle,
         ]
         kernel32.CreateFileW.restype = handle
+        kernel32.CreateDirectoryW.argtypes = [ctypes.c_wchar_p, handle]
+        kernel32.CreateDirectoryW.restype = boolean
         kernel32.GetFileType.argtypes = [handle]
         kernel32.GetFileType.restype = dword
 
@@ -237,6 +262,15 @@ class NativeWindowsApi:
                 raise FileNotFoundError(error, "Windows path does not exist", str(path))
             raise OSError(error, "CreateFileW failed")
         return handle
+
+    def create_directory(self, path: Path) -> None:
+        ctypes, kernel32, _ = self._libraries()
+        if kernel32.CreateDirectoryW(str(path), None):
+            return
+        error = ctypes.get_last_error()
+        if error == 183:  # ERROR_ALREADY_EXISTS
+            raise FileExistsError(error, "Windows directory already exists", str(path))
+        raise OSError(error, "CreateDirectoryW failed", str(path))
 
     def file_info(self, handle) -> dict[str, bool]:
         ctypes, kernel32, _ = self._libraries()

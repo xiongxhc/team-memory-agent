@@ -1,4 +1,5 @@
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ import teammem.schedule_windows as windows
 import teammem.windows_security as windows_security
 from teammem.windows_security import (
     NativeWindowsApi,
+    provision_windows_state_dir,
     read_windows_env_file,
     validate_windows_env_file,
     validate_windows_state_dir,
@@ -28,7 +30,10 @@ class FakeWindowsApi:
 
     def open_file(self, path, *, directory=False):
         self.opened.append((Path(path), directory))
-        return self.records[Path(path)]
+        try:
+            return self.records[Path(path)]
+        except KeyError:
+            raise FileNotFoundError(path) from None
 
     def file_info(self, handle):
         return handle["info"]
@@ -44,6 +49,9 @@ class FakeWindowsApi:
 
     def close_handle(self, handle):
         self.closed.append(handle)
+
+    def create_directory(self, path):
+        self.records[Path(path)] = _directory()
 
 
 def _file(*, owner=SID, aces=(), lines=("TEAMMEM_SINCE_DAYS=9\n",)):
@@ -394,3 +402,382 @@ def test_windows_state_directory_is_validated_before_future_lock_or_temp_files()
     with pytest.raises(ValueError):
         validate_windows_state_dir(state_dir, SID, api)
     assert not (state_dir / "schedule.lock").exists()
+
+
+class FakeTaskRunner:
+    """Hermetic byte-only model of the small schtasks surface TeamMem uses."""
+
+    def __init__(self, tasks=None):
+        self.tasks = dict(tasks or {})
+        self.calls = []
+        self.failures = {}
+        self.hook = None
+        self.list_bytes = None
+
+    def __call__(self, command, **kwargs):
+        assert kwargs == {"capture_output": True, "text": False}
+        self.calls.append((list(command), kwargs))
+        operation = command[1]
+        failure = self.failures.get(operation)
+        if failure:
+            return subprocess.CompletedProcess(command, failure, b"secret stdout", b"secret stderr")
+        if operation == "/Query" and "/XML" in command:
+            name = command[command.index("/TN") + 1]
+            xml = self.tasks.get(name)
+            if xml is None:
+                result = subprocess.CompletedProcess(command, 1, b"", b"not found")
+            else:
+                result = subprocess.CompletedProcess(command, 0, xml, b"")
+            return self.hook(command, result) if self.hook else result
+        if operation == "/Query":
+            rows = self.list_bytes if self.list_bytes is not None else b"".join(
+                name.encode() + b",Task\r\n" for name in self.tasks
+            )
+            result = subprocess.CompletedProcess(command, 0, rows, b"")
+            return self.hook(command, result) if self.hook else result
+        if operation == "/Create":
+            name = command[command.index("/TN") + 1]
+            xml_path = Path(command[command.index("/XML") + 1])
+            self.tasks[name] = xml_path.read_bytes()
+            result = subprocess.CompletedProcess(command, 0, b"", b"")
+            return self.hook(command, result) if self.hook else result
+        if operation == "/Delete":
+            name = command[command.index("/TN") + 1]
+            self.tasks.pop(name, None)
+            result = subprocess.CompletedProcess(command, 0, b"", b"")
+            return self.hook(command, result) if self.hook else result
+        raise AssertionError(command)
+
+
+class RecordingLock:
+    def __init__(self, events):
+        self.events = events
+
+    def __enter__(self):
+        self.events.append("lock-enter")
+        return self
+
+    def __exit__(self, *_args):
+        self.events.append("lock-exit")
+
+
+def _lifecycle_schedule(**changes):
+    values = {
+        "executable": r"C:\\Program Files\\TeamMem\\teammem.exe",
+        "env_file": r"C:\\Users\\Alex\\AppData\\Roaming\\TeamMemory\\hub.env",
+    }
+    values.update(changes)
+    return _schedule(**values)
+
+
+def _lifecycle_args(tmp_path, monkeypatch, *, runner=None, task=None):
+    schedule = task or _lifecycle_schedule()
+    runner = runner or FakeTaskRunner()
+    events = []
+    monkeypatch.setattr(windows, "provision_windows_state_dir", lambda path, sid, api: events.append("state") or tmp_path)
+    monkeypatch.setattr(windows, "validate_windows_env_file", lambda path, sid, api: events.append("env") or path)
+    api = FakeWindowsApi({})
+    cfg = type("Cfg", (), {"env_file": Path(schedule.env_file)})()
+    return schedule, runner, events, api, cfg
+
+
+def test_windows_status_reports_absent_with_exact_byte_query(tmp_path, monkeypatch):
+    schedule, runner, _events, api, _cfg = _lifecycle_args(tmp_path, monkeypatch)
+    status = windows.schedule_status(
+        api=api, runner=runner, executable=schedule.executable,
+        env_file=schedule.env_file,
+    )
+    assert status.installed is False
+    assert status.time is None
+    assert status.backend == "windows"
+    assert status.path == Path(schedule.task_name)
+    assert runner.calls == [
+        (["schtasks.exe", "/Query", "/TN", schedule.task_name, "/XML"], {"capture_output": True, "text": False}),
+        (["schtasks.exe", "/Query", "/FO", "CSV", "/NH"], {"capture_output": True, "text": False}),
+    ]
+
+
+def test_windows_status_validates_registered_xml_and_refuses_foreign_task(tmp_path, monkeypatch):
+    schedule, runner, _events, api, _cfg = _lifecycle_args(tmp_path, monkeypatch)
+    runner.tasks[schedule.task_name] = windows.build_task_xml(schedule)
+    status = windows.schedule_status(
+        api=api, runner=runner, executable=schedule.executable,
+        env_file=schedule.env_file,
+    )
+    assert (status.installed, status.time, status.backend, status.path) == (
+        True, "18:20", "windows", Path(schedule.task_name)
+    )
+
+    text = windows.build_task_xml(schedule)[2:].decode("utf-16-le")
+    foreign = b"\xff\xfe" + text.replace("TeamMem", "Other", 1).encode("utf-16-le")
+    runner.tasks[schedule.task_name] = foreign
+    with pytest.raises(RuntimeError, match="conflicts"):
+        windows.schedule_status(
+            api=api, runner=runner, executable=schedule.executable,
+            env_file=schedule.env_file,
+        )
+
+
+def test_windows_status_sanitizes_query_failure_when_list_contains_task(tmp_path, monkeypatch):
+    schedule, runner, _events, api, _cfg = _lifecycle_args(tmp_path, monkeypatch)
+    runner.tasks[schedule.task_name] = windows.build_task_xml(schedule)
+    runner.failures["/Query"] = 1
+    with pytest.raises(RuntimeError, match="Windows scheduler status is unavailable") as error:
+        windows.schedule_status(
+            api=api, runner=runner, executable=schedule.executable,
+            env_file=schedule.env_file,
+        )
+    assert "secret" not in str(error.value)
+
+
+def test_windows_install_replaces_under_lock_and_removes_private_temp_file(tmp_path, monkeypatch):
+    previous = _lifecycle_schedule()
+    replacement = _lifecycle_schedule(time="07:05")
+    runner = FakeTaskRunner({previous.task_name: windows.build_task_xml(previous)})
+    _schedule_value, runner, events, api, cfg = _lifecycle_args(
+        tmp_path, monkeypatch, runner=runner, task=replacement
+    )
+    path = windows.install_schedule(
+        cfg, 7, 5, replacement.executable, api=api, runner=runner,
+        state_dir=tmp_path, lock_factory=lambda _path: RecordingLock(events),
+    )
+    assert path == Path(replacement.task_name)
+    assert events[:3] == ["env", "state", "lock-enter"]
+    assert events[-1] == "lock-exit"
+    assert windows.parse_task_xml(runner.tasks[replacement.task_name], replacement) == "07:05"
+    create = next(command for command, _kwargs in runner.calls if command[1] == "/Create")
+    assert Path(create[create.index("/XML") + 1]).parent == tmp_path
+    assert list(tmp_path.glob("*.xml")) == []
+
+
+def test_windows_install_rolls_back_exact_prior_xml_and_sanitizes_failure(tmp_path, monkeypatch):
+    previous = _lifecycle_schedule()
+    replacement = _lifecycle_schedule(time="07:05")
+    prior_xml = windows.build_task_xml(previous)
+    runner = FakeTaskRunner({previous.task_name: prior_xml})
+    _value, runner, events, api, cfg = _lifecycle_args(tmp_path, monkeypatch, runner=runner, task=replacement)
+    seen_create = 0
+
+    def fail_verification(command, result):
+        nonlocal seen_create
+        if command[1] == "/Create":
+            seen_create += 1
+        if command[1] == "/Query" and "/XML" in command and seen_create == 1:
+            return subprocess.CompletedProcess(command, 0, b"bad xml secret-token", b"")
+        return result
+
+    runner.hook = fail_verification
+    with pytest.raises(RuntimeError, match="previous state restored") as error:
+        windows.install_schedule(cfg, 7, 5, replacement.executable, api=api, runner=runner,
+                                 state_dir=tmp_path, lock_factory=lambda _path: RecordingLock(events))
+    assert "secret-token" not in str(error.value)
+    assert runner.tasks[previous.task_name] == prior_xml
+
+
+def test_windows_remove_is_idempotent_and_restores_after_verification_failure(tmp_path, monkeypatch):
+    schedule = _lifecycle_schedule()
+    prior_xml = windows.build_task_xml(schedule)
+    runner = FakeTaskRunner({schedule.task_name: prior_xml})
+    _value, runner, events, api, _cfg = _lifecycle_args(tmp_path, monkeypatch, runner=runner, task=schedule)
+    deleted = False
+
+    def fail_absence_verification(command, result):
+        nonlocal deleted
+        if command[1] == "/Delete":
+            deleted = True
+        if command[1] == "/Query" and "/XML" in command and deleted and schedule.task_name not in runner.tasks:
+            return subprocess.CompletedProcess(command, 0, prior_xml, b"")
+        return result
+
+    runner.hook = fail_absence_verification
+    with pytest.raises(RuntimeError, match="previous state restored"):
+        windows.remove_schedule(api=api, runner=runner, state_dir=tmp_path,
+                                executable=schedule.executable, env_file=schedule.env_file,
+                                lock_factory=lambda _path: RecordingLock(events))
+    assert runner.tasks[schedule.task_name] == prior_xml
+    assert windows.remove_schedule(api=api, runner=FakeTaskRunner(), state_dir=tmp_path,
+                                   executable=schedule.executable, env_file=schedule.env_file,
+                                   lock_factory=lambda _path: RecordingLock([])) is False
+
+
+def test_windows_status_and_install_reject_managed_task_with_unexpected_action(tmp_path, monkeypatch):
+    expected = _lifecycle_schedule()
+    attacker = _lifecycle_schedule(
+        executable=r"C:\\Users\\Alex\\attacker.exe",
+        env_file=r"C:\\Users\\Alex\\evil.env",
+    )
+    runner = FakeTaskRunner({expected.task_name: windows.build_task_xml(attacker)})
+    _value, runner, events, api, cfg = _lifecycle_args(
+        tmp_path, monkeypatch, runner=runner, task=expected
+    )
+    with pytest.raises(RuntimeError, match="conflicts"):
+        windows.schedule_status(
+            api=api, runner=runner, executable=expected.executable,
+            env_file=expected.env_file,
+        )
+    with pytest.raises(RuntimeError, match="conflicts"):
+        windows.install_schedule(
+            cfg, 18, 20, expected.executable, api=api, runner=runner,
+            state_dir=tmp_path, lock_factory=lambda _path: RecordingLock(events),
+        )
+    assert not any(command[1] == "/Create" for command, _kwargs in runner.calls)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\xef\xbb\xbf\\TeamMem-Daily-abc,Task\r\n",
+        b"\xff\xfe" + "\\TeamMem-Daily-abc,Task\r\n".encode("utf-16-le"),
+        b"\xfe\xff" + "\\TeamMem-Daily-abc,Task\r\n".encode("utf-16-be"),
+    ],
+)
+def test_windows_csv_fallback_matches_exact_name_with_bom(payload):
+    assert windows._csv_contains_task(payload, r"\TeamMem-Daily-abc") is True
+
+
+def test_windows_state_directory_is_created_then_validated_and_rejects_racing_unsafe_creator():
+    path = Path(r"C:\Users\Alex\AppData\Local\TeamMemory")
+    api = FakeWindowsApi({})
+    assert provision_windows_state_dir(path, SID, api) == path
+    assert api.opened == [(path, True), (path, True)]
+
+    class UnsafeCreator(FakeWindowsApi):
+        def create_directory(self, created):
+            self.records[Path(created)] = _directory(aces=(("Everyone", "read"),))
+
+    with pytest.raises(ValueError, match="shared principal"):
+        provision_windows_state_dir(path, SID, UnsafeCreator({}))
+
+
+def test_windows_first_install_write_failure_with_absence_reports_restored(tmp_path, monkeypatch):
+    schedule, runner, events, api, cfg = _lifecycle_args(tmp_path, monkeypatch)
+    monkeypatch.setattr(windows, "_write_xml", lambda *_args: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(RuntimeError, match="previous state restored"):
+        windows.install_schedule(
+            cfg, 18, 20, schedule.executable, api=api, runner=runner,
+            state_dir=tmp_path, lock_factory=lambda _path: RecordingLock(events),
+        )
+    assert runner.tasks == {}
+    assert not any(command[1] == "/Delete" for command, _kwargs in runner.calls)
+
+
+def test_windows_cleanup_failure_restores_prior_task_and_surfaces_sanitized_error(tmp_path, monkeypatch):
+    previous = _lifecycle_schedule()
+    replacement = _lifecycle_schedule(time="07:05")
+    prior_xml = windows.build_task_xml(previous)
+    runner = FakeTaskRunner({previous.task_name: prior_xml})
+    _value, runner, events, api, cfg = _lifecycle_args(
+        tmp_path, monkeypatch, runner=runner, task=replacement
+    )
+    calls = 0
+
+    def fail_once(path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("private cleanup detail")
+        path.unlink()
+
+    monkeypatch.setattr(windows, "_remove_temp", fail_once)
+    with pytest.raises(RuntimeError, match="previous state restored") as error:
+        windows.install_schedule(
+            cfg, 7, 5, replacement.executable, api=api, runner=runner,
+            state_dir=tmp_path, lock_factory=lambda _path: RecordingLock(events),
+        )
+    assert "private cleanup detail" not in str(error.value)
+    assert runner.tasks[previous.task_name] == prior_xml
+    assert calls == 2
+
+
+@pytest.mark.parametrize("operation", ["install", "remove"])
+def test_windows_persistent_cleanup_failure_reports_rollback_failed(tmp_path, monkeypatch, operation):
+    schedule = _lifecycle_schedule()
+    prior_xml = windows.build_task_xml(schedule)
+    runner = FakeTaskRunner({schedule.task_name: prior_xml})
+    _value, runner, events, api, cfg = _lifecycle_args(
+        tmp_path, monkeypatch, runner=runner, task=schedule
+    )
+
+    def always_fail(_path):
+        raise OSError("private persistent cleanup detail")
+
+    monkeypatch.setattr(windows, "_remove_temp", always_fail)
+    if operation == "install":
+        call = lambda: windows.install_schedule(
+            cfg, 18, 20, schedule.executable, api=api, runner=runner,
+            state_dir=tmp_path, lock_factory=lambda _path: RecordingLock(events),
+        )
+    else:
+        call = lambda: windows.remove_schedule(
+            api=api, runner=runner, state_dir=tmp_path,
+            executable=schedule.executable, env_file=schedule.env_file,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+    with pytest.raises(RuntimeError, match="rollback failed") as error:
+        call()
+    assert "private persistent cleanup detail" not in str(error.value)
+
+
+def test_windows_lock_retries_contention_until_one_byte_lock_is_acquired():
+    calls = []
+    sleeps = []
+
+    def locking(descriptor, mode, length):
+        calls.append((descriptor, mode, length))
+        if len(calls) < 3:
+            raise OSError(13, "contended")
+
+    windows._lock_byte(locking, 42, sleeps.append)
+    assert calls == [(42, 2, 1), (42, 2, 1), (42, 2, 1)]
+    assert sleeps == [0.05, 0.05]
+
+
+@pytest.mark.parametrize("failure", [OSError(5, "access denied"), OSError(9, "bad handle")])
+def test_windows_lock_propagates_non_contention_errors_without_retry(failure):
+    calls = []
+    with pytest.raises(OSError) as error:
+        windows._lock_byte(
+            lambda *_args: calls.append(1) or (_ for _ in ()).throw(failure),
+            42,
+            lambda _delay: pytest.fail("non-contention errors must not sleep"),
+        )
+    assert error.value.errno == failure.errno
+    assert calls == [1]
+
+
+def test_windows_lock_gives_winerror_priority_over_errno_and_retries_lock_violation():
+    denied = OSError(13, "access denied")
+    denied.winerror = 5
+    with pytest.raises(OSError) as error:
+        windows._lock_byte(
+            lambda *_args: (_ for _ in ()).throw(denied),
+            42,
+            lambda _delay: pytest.fail("non-contention winerror must not sleep"),
+        )
+    assert error.value.winerror == 5
+
+    calls = []
+
+    def locking(*_args):
+        calls.append(1)
+        if len(calls) == 1:
+            contended = OSError(5, "lock violation")
+            contended.winerror = 33
+            raise contended
+
+    windows._lock_byte(locking, 42, lambda _delay: None)
+    assert calls == [1, 1]
+
+
+def test_windows_cleanup_requires_explicit_not_found_proof_after_unlink_error():
+    class InaccessibleTemp:
+        def unlink(self):
+            raise PermissionError(13, "denied")
+
+        def stat(self):
+            raise PermissionError(13, "stat denied")
+
+        def exists(self):
+            pytest.fail("cleanup must not rely on Path.exists")
+
+    assert windows._cleanup_temp(InaccessibleTemp()) is False
