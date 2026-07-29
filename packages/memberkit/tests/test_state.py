@@ -82,3 +82,52 @@ def test_repeated_push_does_not_accumulate_duplicate_approvals(tmp_path):
     assert state.snapshot()["approved"].count(
         event_fingerprint(duplicate, DATE)
     ) == 2
+
+
+def test_push_records_manual_duplicate_beyond_pending_multiplicity(tmp_path):
+    state = DraftState(tmp_path / "state.json")
+    duplicate = _event("same observation")
+    state.refresh(DATE, [duplicate, duplicate], current=None)
+
+    state.record_push(DATE, [duplicate, duplicate, duplicate])
+    assert state.snapshot()["approved"].count(
+        event_fingerprint(duplicate, DATE)
+    ) == 3
+    state.record_push(DATE, [duplicate, duplicate, duplicate])
+
+    assert state.snapshot()["approved"].count(
+        event_fingerprint(duplicate, DATE)
+    ) == 3
+    assert state.refresh(DATE, [duplicate, duplicate, duplicate], current=None) == []
+
+
+def test_push_reconciles_a_readded_excluded_duplicate(tmp_path):
+    state = DraftState(tmp_path / "state.json")
+    duplicate = _event("same observation")
+    state.refresh(DATE, [duplicate, duplicate], current=None)
+    state.refresh(DATE, [], current={"events": [duplicate]})
+
+    state.record_push(DATE, [duplicate, duplicate])
+
+    fingerprint = event_fingerprint(duplicate, DATE)
+    saved = state.snapshot()
+    assert saved["approved"].count(fingerprint) == 2
+    assert saved["excluded"].count(fingerprint) == 0
+    assert state.refresh(DATE, [duplicate, duplicate, duplicate], current=None) == [
+        duplicate
+    ]
+
+
+def test_push_excludes_missing_pending_duplicate_without_repeat_drift(tmp_path):
+    state = DraftState(tmp_path / "state.json")
+    duplicate = _event("same observation")
+    state.refresh(DATE, [duplicate, duplicate], current=None)
+
+    state.record_push(DATE, [duplicate])
+    state.record_push(DATE, [duplicate])
+
+    fingerprint = event_fingerprint(duplicate, DATE)
+    saved = state.snapshot()
+    assert saved["approved"].count(fingerprint) == 1
+    assert saved["excluded"].count(fingerprint) == 1
+    assert state.refresh(DATE, [duplicate, duplicate], current=None) == []

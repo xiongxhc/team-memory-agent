@@ -101,15 +101,17 @@ class DraftState:
         excluded = Counter(self._data["excluded"])
         previous = Counter(self._data["pending"].get(date) or [])
         included = Counter(event_fingerprint(event, date) for event in pushed)
-        approved_now = Counter()
         for fingerprint, count in included.items():
-            if previous[fingerprint]:
-                approved_now[fingerprint] = min(count, previous[fingerprint])
-            else:
-                approved_now[fingerprint] = max(0, count - approved[fingerprint])
+            approved[fingerprint] = max(approved[fingerprint], count)
 
-        approved.update(approved_now)
-        excluded.update(previous - approved_now)
+        excluded.update(previous - included)
+        for fingerprint, count in included.items():
+            readded = (
+                max(0, count - previous[fingerprint])
+                if previous[fingerprint]
+                else 0
+            )
+            excluded[fingerprint] -= min(excluded[fingerprint], readded)
         self._data["approved"] = sorted(approved.elements())
         self._data["excluded"] = sorted(excluded.elements())
         self._data["pending"].pop(date, None)
