@@ -46,6 +46,9 @@ environment overrides the private configuration file, invalid explicit names are
 rejected, and detected local time remains the default. Direct and scheduled
 drafts resolve this zone once per operation. Scheduled runs convert their clock
 to that zone before choosing yesterday and today.
+This does not dynamically alter a scheduler trigger: macOS launchd interprets
+`--time HH:MM` in the host's local timezone. The configured member timezone only
+governs the work performed after `scheduled-run` starts.
 
 Normalize candidates before grouping and deduplication:
 

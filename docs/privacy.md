@@ -116,8 +116,10 @@ the member's explicit `memberkit draft --force` action can replace an existing
 draft; `--all` does not imply `--force`.
 
 Package installation alone does not create a MemberKit schedule. `memberkit
-setup` asks the member to accept the proposed 17:30 local time, choose another
-time, or decline.
+setup` asks the member to accept the proposed 17:30 time in the Mac's local
+timezone, choose another time, or decline. `MEMBERKIT_TIMEZONE` controls
+member-calendar attribution after a run starts; it does not move that launchd
+trigger.
 
 The hub's `teammem run-daily` command also runs once and never installs a
 schedule. Package installation creates no background job. Only the explicit

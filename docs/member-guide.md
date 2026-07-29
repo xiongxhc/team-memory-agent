@@ -60,8 +60,9 @@ Inbox Git URL: git@forge.example:team/team-memory-inbox.git
 Daily reminder time [17:30], or 'no' to decline:
 ```
 
-Press Enter at the final prompt to accept 17:30 local time, enter another `HH:MM`,
-or enter `no`. Package installation alone never creates a schedule.
+Press Enter at the final prompt to accept 17:30 in the Mac's local timezone, enter
+another `HH:MM`, or enter `no`. Package installation alone never creates a
+schedule.
 
 The equivalent non-interactive setup is:
 
@@ -89,7 +90,7 @@ environment variables:
 |---|---|---|
 | `MEMBERKIT_DB` | `~/.claude-mem/claude-mem.db` | Read-only local observations database |
 | `MEMBERKIT_WORKDIR` | `~/.memberkit` | Drafts, state, inbox clone, and schedule logs |
-| `MEMBERKIT_TIMEZONE` | detected local timezone | Calendar-day attribution |
+| `MEMBERKIT_TIMEZONE` | detected local timezone | Observation dates, scheduled day selection, bounds, and event timestamps |
 
 Setup stores the required values in `~/.config/teammem/memberkit.env` with mode
 `0600`. Use an IANA name such as `Asia/Dubai` or `America/Los_Angeles`.
@@ -170,11 +171,17 @@ Removed and dismissed events remain excluded from later catch-up drafts.
 
 ## Timing and catch-up
 
-The default reminder time is 17:30 in the configured member timezone, or the
-detected local timezone when none is configured. Both direct drafts and scheduled
-runs use that same zone for day selection and event timestamps, even when the host
-timezone differs. Each event belongs to the calendar date in its member-local
-timestamp:
+On macOS, the default launchd trigger is 17:30 in the Mac's local timezone. It is
+static: `MEMBERKIT_TIMEZONE` does not dynamically move the trigger. Once the
+command runs, direct and scheduled drafts use the configured member timezone—or
+the detected local timezone when none is configured—for scheduled yesterday/today
+selection, observation bounds, and event timestamps.
+
+When the Mac and member zones are the same, the familiar catch-up rule applies:
+events after the 17:30 run stay attributable to their original member date when
+that draft is explicitly regenerated, while unfinished dates remain in later
+host-local reminders. When the zones differ, 17:30 host-local may be another hour
+for the member, but calendar attribution still follows the member-local timestamp:
 
 - events seen before the daily run appear in that day's draft;
 - events created after the daily run but before midnight remain attributable to
@@ -202,8 +209,8 @@ memberkit schedule install --time 17:30
 memberkit schedule remove
 ```
 
-Changing the time replaces the existing MemberKit LaunchAgent. MemberKit installs
-only one schedule:
+Changing the time replaces the existing MemberKit LaunchAgent. The value is
+interpreted in the Mac's local timezone. MemberKit installs only one schedule:
 
 ```text
 ~/Library/LaunchAgents/org.teammem.memberkit-daily.plist

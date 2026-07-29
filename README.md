@@ -42,7 +42,7 @@ memberkit setup
 ```
 
 Setup asks for the roster slug and inbox Git URL. On macOS it then proposes a daily
-17:30 reminder in the member's local timezone: press Enter to accept, enter another
+17:30 reminder in the Mac's local timezone: press Enter to accept, enter another
 `HH:MM`, or enter `no` to decline. The configuration is stored with user-only
 permissions at `~/.config/teammem/memberkit.env`.
 
@@ -58,7 +58,8 @@ memberkit setup \
 
 Use `--no-schedule` instead of `--time` to configure MemberKit without installing
 the macOS schedule. `--timezone` is optional; without it, MemberKit detects the
-machine's local timezone.
+machine's local timezone. It controls observation calendar attribution, not the
+launchd trigger clock.
 
 ### 3. Review before sharing
 
@@ -114,14 +115,15 @@ for the five required event fields.
 
 ### Schedule behavior
 
-A scheduled run checks yesterday and today in the configured member timezone,
-preserving every event's member-local calendar date even if the host is set to a
-different timezone. With the default 17:30 schedule, work from 17:30–23:59 is
-discovered for the earlier date when that draft is regenerated. Work at or after
-midnight belongs to the next calendar day. The schedule never changes an existing
-draft; finish reviewing it, then use an explicit `memberkit draft --force` if you
-want to include later observations from the same date. Older unfinished dates
-remain in later reminders.
+On macOS, launchd triggers at 17:30 in the Mac's local timezone. When the command
+runs, `MEMBERKIT_TIMEZONE` determines member-local yesterday and today, observation
+bounds, and emitted timestamps; it does not move the launchd trigger. In the normal
+same-zone case, work from 17:30–23:59 remains attributable to the earlier member
+date when that draft is explicitly regenerated. If the zones differ, the trigger
+may occur at another member-local hour, but the same member-calendar attribution
+applies. The schedule never changes an existing draft; finish reviewing it, then
+use an explicit `memberkit draft --force` if you want to include later observations
+from the same date. Older unfinished dates remain in later host-local reminders.
 
 ```bash
 memberkit schedule status
