@@ -119,20 +119,11 @@ def _notify_pending(dates: list[str]) -> None:
 
 
 def _valid_existing_draft(data: object, config: Config, date: str) -> bool:
-    if not isinstance(data, dict):
+    try:
+        bundle.validate_bundle(data, config.member, date)
+    except ValueError:
         return False
-    if (
-        data.get("schema") != bundle.SCHEMA
-        or data.get("member") != config.member
-        or data.get("date") != date
-        or not isinstance(data.get("events"), list)
-    ):
-        return False
-    required = {"ts", "kind", "summary", "project", "refs"}
-    return all(
-        isinstance(event, dict) and required <= event.keys()
-        for event in data["events"]
-    )
+    return True
 
 
 def scheduled_run(config: Config, now: datetime | None = None,
@@ -169,6 +160,7 @@ def scheduled_run(config: Config, now: datetime | None = None,
             date_text,
             timezone=timezone,
         )
+        bundle.validate_bundle(discovered, config.member, date_text)
         events = state.refresh(date_text, discovered["events"], current=None)
         if not events:
             continue
@@ -179,11 +171,9 @@ def scheduled_run(config: Config, now: datetime | None = None,
             "events": events,
             "journal_md": bundle.render_journal(events, date_text),
         }
+        bundle.validate_bundle(data, config.member, date_text)
         output_dir.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        bundle.write_bundle(path, data)
         pending_dates.append(date_text)
 
     pending_dates = sorted(set(pending_dates) | set(state.pending_dates()))

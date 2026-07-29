@@ -170,6 +170,78 @@ def test_draft_preserves_existing_bytes_unless_force_is_explicit(
     assert json.loads(out.read_text(encoding="utf-8")) == replacement
 
 
+def test_force_draft_validates_generated_bundle_before_overwriting(
+    tmp_path, monkeypatch,
+):
+    cfg = _setup_cfg(tmp_path)
+    cfg.db.touch()
+    out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    out.parent.mkdir(parents=True)
+    original = b'{"events": [member edit in progress'
+    out.write_bytes(original)
+    invalid = {
+        "schema": cli.bundle.SCHEMA,
+        "member": cfg.member,
+        "date": "2026-07-27",
+        "events": [{
+            "ts": "2026-07-27T10:00:00",
+            "kind": "journal-highlight",
+            "summary": "generated",
+            "project": "project-alpha",
+            "refs": ["private"],
+        }],
+        "journal_md": "stale",
+    }
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    monkeypatch.setattr(cli.bundle, "draft", lambda *args, **kwargs: invalid)
+
+    with pytest.raises(ValueError, match="refs must be null"):
+        cli.main(["draft", "--date", "2026-07-27", "--force"])
+
+    assert out.read_bytes() == original
+    assert sorted(item.name for item in out.parent.iterdir()) == [out.name]
+    assert DraftState(cfg.workdir / "state.json").snapshot() == {
+        "approved": [],
+        "excluded": [],
+        "pending": {},
+    }
+
+
+def test_force_draft_replace_failure_preserves_existing_bytes_and_cleans_temp(
+    tmp_path, monkeypatch,
+):
+    cfg = _setup_cfg(tmp_path)
+    cfg.db.touch()
+    out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    out.parent.mkdir(parents=True)
+    original = b'{"events": [member edit in progress'
+    out.write_bytes(original)
+    replacement = {
+        "schema": cli.bundle.SCHEMA,
+        "member": cfg.member,
+        "date": "2026-07-27",
+        "events": [],
+        "journal_md": "## 2026-07-27",
+    }
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    monkeypatch.setattr(
+        cli.bundle,
+        "draft",
+        lambda *args, **kwargs: replacement,
+    )
+    monkeypatch.setattr(
+        cli.bundle.os,
+        "replace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        cli.main(["draft", "--date", "2026-07-27", "--force"])
+
+    assert out.read_bytes() == original
+    assert sorted(item.name for item in out.parent.iterdir()) == [out.name]
+
+
 def _setup_cfg(tmp_path, *, timezone=None):
     return Config(
         member="alex",

@@ -161,6 +161,25 @@ def test_prepare_bundle_fsyncs_same_directory_temp_before_replace(
     assert order == ["fsync", "replace"]
 
 
+def test_write_bundle_fsync_failure_preserves_destination_and_cleans_temp(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "bundle-alex-2026-07-27.json"
+    original = b'{"member":"member-edited"}\n'
+    path.write_bytes(original)
+    monkeypatch.setattr(
+        bundle.os,
+        "fsync",
+        lambda descriptor: (_ for _ in ()).throw(OSError("fsync failed")),
+    )
+
+    with pytest.raises(OSError, match="fsync failed"):
+        bundle.write_bundle(path, valid_bundle())
+
+    assert path.read_bytes() == original
+    assert sorted(item.name for item in path.parent.iterdir()) == [path.name]
+
+
 def test_draft_selects_only_that_day_and_groups_journal(tmp_path):
     rows = [
         ("sdk", "Shipped marketplace", None, None, "feature",
