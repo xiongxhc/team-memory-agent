@@ -170,6 +170,23 @@ def test_push_adds_new_pending_duplicate_to_existing_approvals(tmp_path):
     assert state.refresh(DATE, [duplicate, duplicate, duplicate], current=None) == []
 
 
+def test_pending_bundle_multiplicity_is_additive_to_existing_approvals(tmp_path):
+    duplicate = _event("same observation")
+    fingerprint = event_fingerprint(duplicate, DATE)
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "approved": [fingerprint, fingerprint],
+        "excluded": [],
+        "pending": {DATE: [fingerprint]},
+    }))
+    state = DraftState(path)
+
+    state.record_push(DATE, [duplicate, duplicate, duplicate])
+
+    assert state.snapshot()["approved"].count(fingerprint) == 5
+    assert state.refresh(DATE, [duplicate] * 6, current=None) == [duplicate]
+
+
 def test_untracked_push_readds_excluded_duplicates_once(tmp_path):
     duplicate = _event("same observation")
     fingerprint = event_fingerprint(duplicate, DATE)

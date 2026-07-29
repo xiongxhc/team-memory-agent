@@ -149,7 +149,9 @@ def _legacy_events(rows: list[sqlite3.Row], zone) -> list[dict]:
             "ts": _event_timestamp(row, zone),
             "kind": "journal-highlight",
             "summary": (
-                row["title"] or (row["narrative"] or "").strip()[:SUMMARY_LIMIT]
+                row["title"]
+                if (row["title"] or "").strip()
+                else (row["narrative"] or "").strip()[:SUMMARY_LIMIT]
             ),
             "project": row["project"],
             "refs": None,

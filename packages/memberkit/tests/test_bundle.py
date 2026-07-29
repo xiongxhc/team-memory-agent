@@ -216,6 +216,26 @@ def test_draft_drops_rows_without_legacy_content(tmp_path):
     assert out["journal_md"] == "## 2026-07-24"
 
 
+def test_draft_treats_whitespace_only_title_as_absent(tmp_path):
+    rows = [
+        (
+            "sdk",
+            "   ",
+            None,
+            "Useful narrative fallback",
+            "change",
+            "2026-07-24T10:00:00",
+            epoch("2026-07-24T10:00:00"),
+        ),
+    ]
+
+    out = bundle.draft(make_db(tmp_path, rows), "alex", "2026-07-24")
+
+    assert [event["summary"] for event in out["events"]] == [
+        "Useful narrative fallback"
+    ]
+
+
 def test_default_and_all_preserve_every_eligible_observation(tmp_path):
     rows = [
         rich_row("sdk", "session-a", "same", "2026-07-24T09:00:00"),
