@@ -95,9 +95,12 @@ Setup stores the required values in `~/.config/teammem/memberkit.env` with mode
 
 ## Daily workflow
 
-The installed macOS schedule runs `memberkit scheduled-run`. It creates or updates
+The installed macOS schedule runs `memberkit scheduled-run`. It creates
 local drafts for yesterday and today and shows a notification for every unfinished
-date. It does not invoke Git or transmit anything.
+date. It does not invoke Git or transmit anything. New drafts contain a
+deterministic local curation of normally three to seven highlights per project,
+or fewer when there are fewer distinct work-session outcomes. The per-project cap
+is seven. Curation makes no LLM or network call.
 
 Review a date:
 
@@ -116,6 +119,17 @@ The JSON file is:
 ```text
 ~/.memberkit/out/bundle-<member>-<YYYY-MM-DD>.json
 ```
+
+If a useful observation seems to be missing, inspect the raw compatibility mode:
+
+```bash
+memberkit draft --all --force --date YYYY-MM-DD
+```
+
+`--all` restores the original one-row-per-observation projection in timestamp
+order. `--force` is a separate, explicit overwrite choice. Without `--force`,
+`memberkit draft` does not replace any existing file, including valid,
+member-edited, malformed, or partially written JSON.
 
 To redact an item:
 
@@ -152,14 +166,16 @@ The default reminder time is 17:30 in the member's local timezone. Each event
 belongs to the calendar date in its local timestamp:
 
 - events seen before the daily run appear in that day's draft;
-- events created after the daily run but before midnight are discovered on the
-  next run and added to the earlier day's catch-up draft;
+- events created after the daily run but before midnight remain attributable to
+  the earlier date when the member explicitly regenerates that existing draft;
 - events created at or after midnight belong to the new calendar day;
 - unfinished older dates remain in later reminders until pushed or dismissed.
 
-A malformed or partially edited draft is never overwritten by the schedule. It
-remains pending so the member can repair it. To discard a malformed draft, delete
-that local draft file first, then run:
+The schedule never overwrites an existing draft, whether valid, manually edited,
+malformed, or partially written. After reviewing an existing draft, use explicit
+`memberkit draft --force --date YYYY-MM-DD` if you want to regenerate it with
+later observations. A malformed draft remains pending so the member can repair
+it. To discard one, delete that local draft file first, then run:
 
 ```bash
 memberkit dismiss --date YYYY-MM-DD
@@ -204,6 +220,17 @@ automatically.
 
 The configured source database is opened read-only. Scheduled runs never push,
 commit, or transmit.
+
+To verify drafting against your configured real database without writing the
+normal `~/.memberkit` directory, use a temporary work directory:
+
+```bash
+MEMBERKIT_WORKDIR="$(mktemp -d)" memberkit draft --date YYYY-MM-DD
+```
+
+This opens the configured observation database read-only and writes the draft and
+review-state files only under the printed temporary directory. It is a local
+inspection, not a push.
 
 ## Upgrade or remove
 

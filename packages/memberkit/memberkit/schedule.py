@@ -144,9 +144,7 @@ def scheduled_run(config: Config, now: datetime | None = None,
 
     for day in ((now.date() - timedelta(days=1)), now.date()):
         date_text = day.isoformat()
-        discovered = bundle.draft(config.db, config.member, date_text)
         path = output_dir / f"bundle-{config.member}-{date_text}.json"
-        current = None
         if path.exists():
             try:
                 current = json.loads(path.read_text(encoding="utf-8"))
@@ -156,7 +154,11 @@ def scheduled_run(config: Config, now: datetime | None = None,
             if not _valid_existing_draft(current, config, date_text):
                 pending_dates.append(date_text)
                 continue
-        events = state.refresh(date_text, discovered["events"], current)
+            if state.refresh(date_text, discovered=[], current=current):
+                pending_dates.append(date_text)
+            continue
+        discovered = bundle.draft(config.db, config.member, date_text)
+        events = state.refresh(date_text, discovered["events"], current=None)
         if not events:
             continue
         data = {

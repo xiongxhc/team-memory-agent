@@ -34,7 +34,7 @@ def _cfg(tmp_path, rows=()):
 def _row(title, iso):
     return (
         "project-alpha", title, None, None, "feature", iso,
-        int(datetime.fromisoformat(iso).astimezone().timestamp()),
+        int(datetime.fromisoformat(iso).astimezone().timestamp() * 1000),
     )
 
 
@@ -126,6 +126,29 @@ def test_scheduled_run_never_overwrites_invalid_member_edited_draft(tmp_path):
     path = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
     path.parent.mkdir(parents=True)
     edited = b'{"events": [member edit in progress'
+    path.write_bytes(edited)
+
+    pending = scheduled_run(
+        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+    )
+
+    assert "2026-07-27" in pending
+    assert path.read_bytes() == edited
+
+
+def test_scheduled_run_never_overwrites_valid_member_edited_draft(tmp_path):
+    cfg = _cfg(
+        tmp_path,
+        [_row("Newly discovered", "2026-07-27T10:00:00")],
+    )
+    path = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    path.parent.mkdir(parents=True)
+    edited = (
+        b'{"schema":"teammem-bundle/v1","member":"alex",'
+        b'"date":"2026-07-27","events":[{"ts":"2026-07-27T09:00:00",'
+        b'"kind":"journal-highlight","summary":"Manual decision",'
+        b'"project":"project-alpha","refs":null}],"journal_md":"manual"}\n'
+    )
     path.write_bytes(edited)
 
     pending = scheduled_run(
