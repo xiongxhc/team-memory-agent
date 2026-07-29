@@ -6,6 +6,7 @@ the member-visible JSON draft files.
 
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 
@@ -52,29 +53,42 @@ class DraftState:
 
     def refresh(self, date: str, discovered: list[dict],
                 current: dict | None) -> list[dict]:
-        approved = set(self._data["approved"])
-        excluded = set(self._data["excluded"])
-        previous = set(self._data["pending"].get(date) or [])
+        approved = Counter(self._data["approved"])
+        excluded = Counter(self._data["excluded"])
+        previous = Counter(self._data["pending"].get(date) or [])
         current_events = list((current or {}).get("events") or [])
-        current_fingerprints = {
+        current_fingerprints = Counter(
             event_fingerprint(event, date) for event in current_events
-        }
+        )
 
         if current is not None:
             excluded.update(previous - current_fingerprints)
 
+        source = current_events if current_events else list(discovered)
         output: list[dict] = []
-        output_fingerprints: set[str] = set()
-        for event in [*current_events, *discovered]:
+        output_fingerprints: list[str] = []
+        emitted = Counter()
+        blocked = approved if current_events else approved + excluded
+        available = Counter(
+            {
+                fingerprint: max(
+                    0,
+                    count - blocked[fingerprint],
+                )
+                for fingerprint, count in Counter(
+                    event_fingerprint(event, date) for event in source
+                ).items()
+            }
+        )
+        for event in source:
             fingerprint = event_fingerprint(event, date)
-            if fingerprint in approved or fingerprint in excluded:
-                continue
-            if fingerprint not in output_fingerprints:
+            if emitted[fingerprint] < available[fingerprint]:
                 output.append(event)
-                output_fingerprints.add(fingerprint)
+                output_fingerprints.append(fingerprint)
+                emitted[fingerprint] += 1
 
-        self._data["approved"] = sorted(approved)
-        self._data["excluded"] = sorted(excluded)
+        self._data["approved"] = sorted(approved.elements())
+        self._data["excluded"] = sorted(excluded.elements())
         if output_fingerprints:
             self._data["pending"][date] = sorted(output_fingerprints)
         else:
@@ -83,22 +97,27 @@ class DraftState:
         return output
 
     def record_push(self, date: str, pushed: list[dict]) -> None:
-        approved = set(self._data["approved"])
-        excluded = set(self._data["excluded"])
-        previous = set(self._data["pending"].get(date) or [])
-        included = {event_fingerprint(event, date) for event in pushed}
+        approved = Counter(self._data["approved"])
+        excluded = Counter(self._data["excluded"])
+        previous = Counter(self._data["pending"].get(date) or [])
+        included = Counter(event_fingerprint(event, date) for event in pushed)
+        approved_now = Counter()
+        for fingerprint, count in included.items():
+            if previous[fingerprint]:
+                approved_now[fingerprint] = min(count, previous[fingerprint])
+            else:
+                approved_now[fingerprint] = max(0, count - approved[fingerprint])
 
-        approved.update(included)
-        excluded.update(previous - included)
-        excluded.difference_update(included)
-        self._data["approved"] = sorted(approved)
-        self._data["excluded"] = sorted(excluded)
+        approved.update(approved_now)
+        excluded.update(previous - approved_now)
+        self._data["approved"] = sorted(approved.elements())
+        self._data["excluded"] = sorted(excluded.elements())
         self._data["pending"].pop(date, None)
         self._save()
 
     def dismiss(self, date: str) -> None:
-        excluded = set(self._data["excluded"])
+        excluded = Counter(self._data["excluded"])
         excluded.update(self._data["pending"].get(date) or [])
-        self._data["excluded"] = sorted(excluded)
+        self._data["excluded"] = sorted(excluded.elements())
         self._data["pending"].pop(date, None)
         self._save()

@@ -100,6 +100,29 @@ def test_default_and_all_preserve_every_eligible_observation(tmp_path):
     assert [event["summary"] for event in default["events"]].count("same") == 2
 
 
+def test_draft_uses_only_frozen_v1_fields_from_rich_observation_rows(tmp_path):
+    row = (
+        "sdk", "SESSION_SENTINEL", "Visible title", "SUBTITLE_SENTINEL",
+        "NARRATIVE_SENTINEL", "FACTS_SENTINEL", "TYPE_SENTINEL",
+        "2026-07-24T09:00:00", epoch("2026-07-24T09:00:00"),
+    )
+
+    out = bundle.draft(
+        make_rich_db(tmp_path, [row]), "alex", "2026-07-24",
+        timezone=ZoneInfo("Asia/Dubai"),
+    )
+
+    assert out["events"] == [{
+        "ts": "2026-07-24T09:00:00.000+04:00",
+        "kind": "journal-highlight",
+        "summary": "Visible title",
+        "project": "sdk",
+        "refs": None,
+    }]
+    assert set(out["events"][0]) == {"ts", "kind", "summary", "project", "refs"}
+    assert "SENTINEL" not in repr(out)
+
+
 def test_draft_uses_member_timezone_for_day_bounds_and_event_timestamps(tmp_path):
     zone = ZoneInfo("America/Los_Angeles")
     rows = [
@@ -160,3 +183,18 @@ def test_equal_timestamps_use_stable_id_tiebreaker_for_both_modes(tmp_path):
         "First by identifier", "Second by identifier"
     ]
     assert default["events"] == compat["events"]
+
+
+def test_equal_timestamps_without_id_preserve_rowid_insertion_order(tmp_path):
+    rows = [
+        ("sdk", "Inserted first", None, None, "change",
+         "2026-07-24T10:00:00", epoch("2026-07-24T10:00:00")),
+        ("sdk", "Inserted second", None, None, "change",
+         "2026-07-24T10:00:00", epoch("2026-07-24T10:00:00")),
+    ]
+
+    out = bundle.draft(make_db(tmp_path, rows), "alex", "2026-07-24")
+
+    assert [event["summary"] for event in out["events"]] == [
+        "Inserted first", "Inserted second"
+    ]
