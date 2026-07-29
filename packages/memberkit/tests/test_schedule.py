@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from memberkit import bundle
 from memberkit.config import Config
 from memberkit.schedule import (
@@ -238,3 +240,99 @@ def test_scheduled_run_never_overwrites_valid_member_edited_draft(tmp_path):
 
     assert "2026-07-27" in pending
     assert path.read_bytes() == edited
+
+
+@pytest.mark.parametrize("invalid_event", ["extra-key", "wrong-kind"])
+def test_scheduled_run_preserves_and_reports_non_frozen_existing_draft(
+    tmp_path, invalid_event,
+):
+    cfg = _cfg(tmp_path)
+    path = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    path.parent.mkdir(parents=True)
+    event = {
+        "ts": "2026-07-27T09:00:00",
+        "kind": "journal-highlight",
+        "summary": "Manual decision",
+        "project": "project-alpha",
+        "refs": None,
+    }
+    if invalid_event == "extra-key":
+        event["source"] = "private"
+    else:
+        event["kind"] = "raw-observation"
+    edited = (json.dumps({
+        "schema": bundle.SCHEMA,
+        "member": cfg.member,
+        "date": "2026-07-27",
+        "events": [event],
+        "journal_md": "manual",
+    }, separators=(",", ":")) + "\n").encode()
+    path.write_bytes(edited)
+
+    pending = scheduled_run(
+        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+    )
+
+    assert "2026-07-27" in pending
+    assert path.read_bytes() == edited
+    assert DraftState(cfg.workdir / "state.json").snapshot() == {
+        "approved": [],
+        "excluded": [],
+        "pending": {},
+    }
+
+
+def test_scheduled_run_validates_generated_bundle_before_creating_file(
+    tmp_path, monkeypatch,
+):
+    cfg = _cfg(tmp_path)
+    invalid = {
+        "schema": bundle.SCHEMA,
+        "member": cfg.member,
+        "date": "2026-07-27",
+        "events": [{
+            "ts": "2026-07-27T10:00:00",
+            "kind": "journal-highlight",
+            "summary": "generated",
+            "project": "project-alpha",
+            "refs": ["private"],
+        }],
+        "journal_md": "stale",
+    }
+    monkeypatch.setattr(bundle, "draft", lambda *args, **kwargs: invalid)
+
+    with pytest.raises(ValueError, match="refs must be null"):
+        scheduled_run(
+            cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+        )
+
+    output_dir = cfg.workdir / "out"
+    assert not output_dir.exists() or list(output_dir.iterdir()) == []
+    assert DraftState(cfg.workdir / "state.json").snapshot() == {
+        "approved": [],
+        "excluded": [],
+        "pending": {},
+    }
+
+
+def test_scheduled_run_replace_failure_leaves_no_bundle_or_temp(
+    tmp_path, monkeypatch,
+):
+    cfg = _cfg(
+        tmp_path,
+        [_row("Generated", "2026-07-27T10:00:00")],
+    )
+    monkeypatch.setattr(
+        bundle.os,
+        "replace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        scheduled_run(
+            cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+        )
+
+    output_dir = cfg.workdir / "out"
+    assert output_dir.exists()
+    assert list(output_dir.iterdir()) == []

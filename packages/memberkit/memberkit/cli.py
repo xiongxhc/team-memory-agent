@@ -1,7 +1,6 @@
 """memberkit CLI: draft -> review -> push. Push only after the member reviews."""
 
 import argparse
-import json
 from datetime import datetime
 from pathlib import Path
 
@@ -129,15 +128,14 @@ def main(argv: list[str] | None = None) -> int:
             all_observations=args.all,
             timezone=timezone,
         )
+        bundle.validate_bundle(data, cfg.member, date_text)
         data["events"] = DraftState(cfg.workdir / "state.json").refresh(
             date_text, data["events"], current=None
         )
         data["journal_md"] = bundle.render_journal(data["events"], date_text)
+        bundle.validate_bundle(data, cfg.member, date_text)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        bundle.write_bundle(out, data)
         print(f"drafted {len(data['events'])} events -> {out}")
         print("review before pushing: memberkit review")
     elif args.cmd == "review":
