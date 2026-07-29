@@ -1,6 +1,6 @@
 # MemberKit Evidence-First Drafts Design
 
-**Status:** Proposed — awaiting written-spec review
+**Status:** Approved
 **Date:** 2026-07-29
 **Supersedes:** [MemberKit Curated Drafts Design](2026-07-29-memberkit-curated-drafts-design.md)
 
