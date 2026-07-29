@@ -82,7 +82,8 @@ MemberKit never overwrites an existing or partially edited draft by default.
 Raw mode deliberately preserves legacy, unfiltered title/narrative summaries for
 local inspection. It may reveal sensitive observation text, so review and redact
 every raw event before any push; curated path filtering does not apply to
-`--all`.
+`--all`. The `ts` field is normalized from the observation epoch into the
+member's local timezone so every event remains valid for the bundle date.
 
 To remove private items, edit the `events` list in
 `~/.memberkit/out/bundle-<member>-<YYYY-MM-DD>.json`, save valid JSON, and review

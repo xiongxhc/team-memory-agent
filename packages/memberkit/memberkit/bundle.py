@@ -50,17 +50,23 @@ _SIGNALS = (
 )
 _MECHANICS_PREFIX = (
     re.compile(r"^(?:progress|update)\b", re.IGNORECASE),
-    re.compile(r"^tests? pass(?:ed)?\b", re.IGNORECASE),
-    re.compile(r"^code review\b", re.IGNORECASE),
-    re.compile(r"^review dispatched\b", re.IGNORECASE),
-    re.compile(r"^verification checks?\b", re.IGNORECASE),
-    re.compile(r"^pre-push verification\b", re.IGNORECASE),
+    re.compile(
+        r"^(?:tests?|test suite|pytest|unit tests?|integration tests?|"
+        r"e2e tests?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^(?:review|code[- ]review)\b", re.IGNORECASE),
+    re.compile(
+        r"^(?:(?:privacy|security|credential|secret|public-source) scan|"
+        r"check-public)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^(?:verification|pre-push verification)\b", re.IGNORECASE),
     re.compile(r"^diff inspection\b.*$", re.IGNORECASE),
-    re.compile(r"^(?:public-source scan|check-public)\b.*$", re.IGNORECASE),
-    re.compile(r"^commit staged\b", re.IGNORECASE),
+    re.compile(r"^(?:staging|commit)\b", re.IGNORECASE),
     re.compile(r"^(?:red|green)\b", re.IGNORECASE),
     re.compile(
-        r"^(?:implementation initiated|task started|tdd approach)\b.*$",
+        r"^(?:initiation|implementation initiated|task started|tdd)\b.*$",
         re.IGNORECASE,
     ),
 )
@@ -110,18 +116,25 @@ def _local_timezone():
         return datetime.now().astimezone().tzinfo
 
 
-def _day_epochs(date: str) -> tuple[int, int]:
+def _day_epochs(date: str, zone=None) -> tuple[int, int]:
     day = datetime.strptime(date, "%Y-%m-%d").date()
-    zone = _local_timezone()
+    zone = zone or _local_timezone()
     start = datetime.combine(day, time.min, tzinfo=zone)
     end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=zone)
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
-def _legacy_events(rows: list[sqlite3.Row]) -> list[dict]:
+def _event_timestamp(row: sqlite3.Row, zone) -> str:
+    return datetime.fromtimestamp(
+        row["created_at_epoch"] / 1000,
+        tz=zone,
+    ).isoformat(timespec="milliseconds")
+
+
+def _legacy_events(rows: list[sqlite3.Row], zone) -> list[dict]:
     return [
         {
-            "ts": row["created_at"],
+            "ts": _event_timestamp(row, zone),
             "kind": "journal-highlight",
             "summary": (
                 row["title"] or (row["narrative"] or "").strip()[:SUMMARY_LIMIT]
@@ -229,7 +242,7 @@ def _has_substantive_marker(summary: str) -> bool:
     return False
 
 
-def _curated_events(rows: list[sqlite3.Row]) -> list[dict]:
+def _curated_events(rows: list[sqlite3.Row], zone) -> list[dict]:
     candidates: list[dict] = []
     seen: set[tuple[str | None, str]] = set()
     for index, row in enumerate(rows):
@@ -244,7 +257,7 @@ def _curated_events(rows: list[sqlite3.Row]) -> list[dict]:
             "session": row["memory_session_id"] or f"__row_{index}",
             "score": _score(row, summary),
             "event": {
-                "ts": row["created_at"],
+                "ts": _event_timestamp(row, zone),
                 "kind": "journal-highlight",
                 "summary": summary,
                 "project": row["project"],
@@ -295,7 +308,8 @@ def draft(
     *,
     all_observations: bool = False,
 ) -> dict:
-    lo, hi = _day_epochs(date)
+    zone = _local_timezone()
+    lo, hi = _day_epochs(date, zone)
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     try:
@@ -327,7 +341,11 @@ def draft(
     finally:
         con.close()
 
-    events = _legacy_events(rows) if all_observations else _curated_events(rows)
+    events = (
+        _legacy_events(rows, zone)
+        if all_observations
+        else _curated_events(rows, zone)
+    )
 
     return {"schema": SCHEMA, "member": member, "date": date,
             "events": events, "journal_md": render_journal(events, date)}
