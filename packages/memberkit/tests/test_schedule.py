@@ -219,6 +219,30 @@ def test_scheduled_run_never_overwrites_invalid_member_edited_draft(tmp_path):
     assert path.read_bytes() == edited
 
 
+def test_scheduled_run_preserves_non_utf8_draft_and_processes_other_date(
+    tmp_path,
+):
+    cfg = _cfg(
+        tmp_path,
+        [_row("Tuesday eligible", "2026-07-28T09:00:00")],
+    )
+    malformed = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    malformed.parent.mkdir(parents=True)
+    original = b"\xff\xfe\x00member edit in progress"
+    malformed.write_bytes(original)
+
+    pending = scheduled_run(
+        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+    )
+
+    assert pending == ["2026-07-27", "2026-07-28"]
+    assert malformed.read_bytes() == original
+    created = (
+        cfg.workdir / "out" / "bundle-alex-2026-07-28.json"
+    ).read_text(encoding="utf-8")
+    assert "Tuesday eligible" in created
+
+
 def test_scheduled_run_never_overwrites_valid_member_edited_draft(tmp_path):
     cfg = _cfg(
         tmp_path,
