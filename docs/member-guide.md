@@ -69,6 +69,7 @@ The equivalent non-interactive setup is:
 memberkit setup \
   --member alex \
   --inbox-url git@forge.example:team/team-memory-inbox.git \
+  --timezone Asia/Dubai \
   --time 17:30
 ```
 
@@ -91,7 +92,9 @@ environment variables:
 | `MEMBERKIT_TIMEZONE` | detected local timezone | Calendar-day attribution |
 
 Setup stores the required values in `~/.config/teammem/memberkit.env` with mode
-`0600`.
+`0600`. Use an IANA name such as `Asia/Dubai` or `America/Los_Angeles`.
+An invalid explicit name is rejected. A process `MEMBERKIT_TIMEZONE` overrides
+the private file for that invocation.
 
 ## Daily workflow
 
@@ -108,7 +111,7 @@ Review a date:
 memberkit review --date YYYY-MM-DD
 ```
 
-The date defaults to today:
+The date defaults to today in the configured member timezone:
 
 ```bash
 memberkit review
@@ -167,8 +170,11 @@ Removed and dismissed events remain excluded from later catch-up drafts.
 
 ## Timing and catch-up
 
-The default reminder time is 17:30 in the member's local timezone. Each event
-belongs to the calendar date in its local timestamp:
+The default reminder time is 17:30 in the configured member timezone, or the
+detected local timezone when none is configured. Both direct drafts and scheduled
+runs use that same zone for day selection and event timestamps, even when the host
+timezone differs. Each event belongs to the calendar date in its member-local
+timestamp:
 
 - events seen before the daily run appear in that day's draft;
 - events created after the daily run but before midnight remain attributable to

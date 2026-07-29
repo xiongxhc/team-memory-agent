@@ -94,6 +94,9 @@ read-only verification test)
   output is capped at seven and favors meaningful outcomes. Sparse project/days
   remain sparse.
 - Millisecond epoch date filtering is correct.
+- An optional validated `MEMBERKIT_TIMEZONE` controls direct and scheduled day
+  selection and timestamp serialization; process environment overrides the
+  private file, while detected local time remains the default.
 - `--all` precisely preserves the old row selection, title/narrative summaries,
   and epoch order while normalizing `ts` to the same member timezone used for
   day selection.

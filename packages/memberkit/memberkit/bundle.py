@@ -63,7 +63,10 @@ _MECHANICS_PREFIX = (
     ),
     re.compile(r"^(?:verification|pre-push verification)\b", re.IGNORECASE),
     re.compile(r"^diff inspection\b.*$", re.IGNORECASE),
-    re.compile(r"^(?:staging|commit)\b", re.IGNORECASE),
+    re.compile(
+        r"^(?:stage|staged|staging|commit|committed|committing|worktree)\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"^(?:red|green)\b", re.IGNORECASE),
     re.compile(
         r"^(?:initiation|implementation initiated|task started|tdd)\b.*$",
@@ -72,7 +75,7 @@ _MECHANICS_PREFIX = (
 )
 _SUBSTANTIVE_MARKER = re.compile(
     r"\b(?:decision|decided|approved|risk|blocker|blocked|defect|unresolved|"
-    r"release|released|resolved|fixed|implemented|enforced|prevented|shipped|"
+    r"released|resolved|fixed|implemented|enforced|prevented|shipped|"
     r"published|deployed|merged)\b",
     re.IGNORECASE,
 )
@@ -104,8 +107,12 @@ def _local_timezone():
     if configured:
         try:
             return ZoneInfo(configured.removeprefix(":"))
-        except ZoneInfoNotFoundError:
-            pass
+        except ZoneInfoNotFoundError as exc:
+            if os.environ.get("MEMBERKIT_TIMEZONE"):
+                raise ValueError(
+                    f"invalid MEMBERKIT_TIMEZONE {configured!r}: "
+                    "use an IANA timezone such as Asia/Dubai"
+                ) from exc
 
     try:
         resolved = Path("/etc/localtime").resolve()
@@ -307,8 +314,9 @@ def draft(
     date: str,
     *,
     all_observations: bool = False,
+    timezone=None,
 ) -> dict:
-    zone = _local_timezone()
+    zone = timezone or _local_timezone()
     lo, hi = _day_epochs(date, zone)
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row

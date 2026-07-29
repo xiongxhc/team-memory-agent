@@ -461,8 +461,12 @@ def test_incidental_mechanics_words_do_not_hide_meaningful_outcomes(
 @pytest.mark.parametrize("summary", [
     "Progress update one",
     "Tests passed",
+    "Tests passed for release candidate",
     "Review dispatched",
     "Commit staged",
+    "Staged changes for Task 4",
+    "Committed Task 4 implementation",
+    "Worktree created for Task 4",
     "RED mechanics",
     "GREEN mechanics",
 ])
@@ -477,6 +481,25 @@ def test_true_mechanics_only_summaries_are_filtered(tmp_path, summary):
     out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
 
     assert out["events"] == []
+
+
+@pytest.mark.parametrize("summary", [
+    "Committed and released package 0.2.0",
+    "Review found unresolved privacy leak",
+])
+def test_mechanics_prefix_preserves_concrete_outcomes_and_findings(
+    tmp_path, summary,
+):
+    rows = [
+        rich_row(
+            "sdk", "session-a", summary, "2026-07-24T09:00:00",
+            kind="discovery",
+        ),
+    ]
+
+    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
+
+    assert [event["summary"] for event in out["events"]] == [summary]
 
 
 @pytest.mark.parametrize("summary", [

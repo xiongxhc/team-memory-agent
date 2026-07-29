@@ -38,6 +38,10 @@ local reminder. Press Enter to accept, enter another `HH:MM`, or enter `no` to
 decline. It stores private configuration at
 `~/.config/teammem/memberkit.env`.
 
+For a machine whose host timezone differs from the member, pass an IANA timezone
+such as `memberkit setup --timezone Asia/Dubai`. Invalid explicit timezone names
+are rejected.
+
 ## Review workflow
 
 ```bash
@@ -46,7 +50,7 @@ memberkit review --date YYYY-MM-DD
 memberkit push --date YYYY-MM-DD
 ```
 
-The date defaults to today. Drafts are stored at
+The date defaults to today in the configured member timezone. Drafts are stored at
 `~/.memberkit/out/bundle-<member>-<YYYY-MM-DD>.json`. Remove a private item from
 the JSON `events` list, save valid JSON, and run `memberkit review` again before
 pushing. Editing only `journal_md` does not remove an event because that preview is
@@ -88,10 +92,11 @@ memberkit scheduled-run
 
 MemberKit supports macOS launchd for automatic schedule installation. Other
 platforms can schedule the portable `memberkit scheduled-run` command. A scheduled
-run checks yesterday and today. Late work remains attributed to its original local
-date, work after midnight belongs to the new day, and unfinished dates remain in
-later reminders. Scheduling uses curated mode. It never replaces an existing
-draft; explicitly regenerate with `memberkit draft --force` after review if later
+run checks yesterday and today in the configured member timezone, even if the host
+timezone differs. Late work remains attributed to its member-local date, work
+after midnight belongs to the new day, and unfinished dates remain in later
+reminders. Scheduling uses curated mode. It never replaces an existing draft;
+explicitly regenerate with `memberkit draft --force` after review if later
 observations need to be included.
 
 ## Upgrade and uninstall

@@ -2,6 +2,7 @@ import plistlib
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from memberkit import bundle
 from memberkit.config import Config
@@ -103,6 +104,40 @@ def test_scheduled_run_catches_up_original_date_without_transmitting(tmp_path):
     assert "Monday late" in monday and "Monday early" not in monday
     assert "Tuesday" in tuesday
     assert not (cfg.workdir / "inbox").exists()
+
+
+def test_scheduled_run_uses_member_timezone_for_dates_bounds_and_timestamps(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    rows = [
+        _row("Member Sunday", "2026-07-27T06:00:00Z"),
+        _row("Member Tuesday", "2026-07-28T08:00:00Z"),
+    ]
+    base = _cfg(tmp_path, rows)
+    cfg = Config(
+        member=base.member,
+        db=base.db,
+        inbox_url=base.inbox_url,
+        workdir=base.workdir,
+        timezone=ZoneInfo("America/Los_Angeles"),
+    )
+
+    pending = scheduled_run(
+        cfg,
+        datetime.fromisoformat("2026-07-28T01:00:00+00:00"),
+        notify=False,
+    )
+
+    assert pending == ["2026-07-26"]
+    sunday = (
+        cfg.workdir / "out" / "bundle-alex-2026-07-26.json"
+    ).read_text(encoding="utf-8")
+    assert "Member Sunday" in sunday
+    assert "2026-07-26T23:00:00.000-07:00" in sunday
+    assert not (
+        cfg.workdir / "out" / "bundle-alex-2026-07-28.json"
+    ).exists()
 
 
 def test_scheduled_run_keeps_reminding_for_older_pending_date(tmp_path):

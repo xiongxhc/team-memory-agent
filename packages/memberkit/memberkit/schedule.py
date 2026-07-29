@@ -136,8 +136,14 @@ def _valid_existing_draft(data: object, config: Config, date: str) -> bool:
 
 
 def scheduled_run(config: Config, now: datetime | None = None,
-                  notify: bool = True) -> list[str]:
-    now = now or datetime.now().astimezone()
+                  notify: bool = True, timezone=None) -> list[str]:
+    timezone = timezone or config.timezone or bundle._local_timezone()
+    if now is None:
+        now = datetime.now(timezone)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone)
+    else:
+        now = now.astimezone(timezone)
     state = DraftState(config.workdir / "state.json")
     output_dir = config.workdir / "out"
     pending_dates: list[str] = []
@@ -157,7 +163,12 @@ def scheduled_run(config: Config, now: datetime | None = None,
             if state.refresh(date_text, discovered=[], current=current):
                 pending_dates.append(date_text)
             continue
-        discovered = bundle.draft(config.db, config.member, date_text)
+        discovered = bundle.draft(
+            config.db,
+            config.member,
+            date_text,
+            timezone=timezone,
+        )
         events = state.refresh(date_text, discovered["events"], current=None)
         if not events:
             continue
