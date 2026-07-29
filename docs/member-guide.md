@@ -132,7 +132,9 @@ order. `--force` is a separate, explicit overwrite choice. Without `--force`,
 member-edited, malformed, or partially written JSON. Raw mode is for local
 inspection and deliberately preserves unfiltered legacy title/narrative
 summaries. It may expose sensitive observation text. Curated path filtering does
-not apply, so review and redact every raw event before pushing.
+not apply, so review and redact every raw event before pushing. Raw mode retains
+the same rows, summaries, and epoch order, while `ts` is normalized from each
+epoch into the member's local timezone to satisfy the bundle-date contract.
 
 To redact an item:
 

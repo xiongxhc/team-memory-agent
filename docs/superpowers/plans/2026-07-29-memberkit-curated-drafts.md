@@ -21,7 +21,9 @@ ones.
 - [ ] Add `draft(..., all_observations=True)` (or equivalent keyword mode) tests that
       assert `--all` returns precisely one event per eligible legacy row, in
       ascending `created_at_epoch` order, with the current title/narrative
-      projection and frozen v1 event shape.
+      projection and frozen v1 event shape. Assert `ts` is the contract-required
+      member-local ISO 8601 conversion of that epoch, not the source timestamp
+      string.
 - [ ] Correct query bounds to milliseconds and retain `mode=ro`; keep the legacy
       projection in a separately testable helper so curated rules cannot change
       it.
@@ -92,6 +94,8 @@ read-only verification test)
   output is capped at seven and favors meaningful outcomes. Sparse project/days
   remain sparse.
 - Millisecond epoch date filtering is correct.
-- `--all` precisely preserves the old one-row projection/order.
+- `--all` precisely preserves the old row selection, title/narrative summaries,
+  and epoch order while normalizing `ts` to the same member timezone used for
+  day selection.
 - No automatic path overwrites a valid/manual or malformed draft; only explicit
   `draft --force` replaces a draft.

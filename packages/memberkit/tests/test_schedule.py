@@ -3,6 +3,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+from memberkit import bundle
 from memberkit.config import Config
 from memberkit.schedule import (
     install_schedule,
@@ -36,6 +37,13 @@ def _row(title, iso):
         "project-alpha", title, None, None, "feature", iso,
         int(datetime.fromisoformat(iso).astimezone().timestamp() * 1000),
     )
+
+
+def _local_ts(iso):
+    return datetime.fromtimestamp(
+        _row("", iso)[-1] / 1000,
+        tz=bundle._local_timezone(),
+    ).isoformat(timespec="milliseconds")
 
 
 def test_install_defaults_to_1730_and_calls_only_scheduled_run(tmp_path):
@@ -76,7 +84,7 @@ def test_scheduled_run_catches_up_original_date_without_transmitting(tmp_path):
     cfg = _cfg(tmp_path, rows)
     state = DraftState(cfg.workdir / "state.json")
     early = {
-        "ts": "2026-07-27T10:00:00",
+        "ts": _local_ts("2026-07-27T10:00:00"),
         "kind": "journal-highlight",
         "summary": "Monday early",
         "project": "project-alpha",

@@ -23,6 +23,13 @@ def epoch(iso):
     return int(datetime.fromisoformat(iso).astimezone().timestamp() * 1000)
 
 
+def local_ts(iso):
+    return datetime.fromtimestamp(
+        epoch(iso) / 1000,
+        tz=bundle._local_timezone(),
+    ).isoformat(timespec="milliseconds")
+
+
 def make_rich_db(tmp_path, rows):
     db = tmp_path / "claude-mem-rich.db"
     con = sqlite3.connect(db)
@@ -99,6 +106,37 @@ def test_midnight_assigns_events_to_their_local_calendar_date(tmp_path):
     assert [event["summary"] for event in day_two["events"]] == ["After midnight"]
 
 
+def test_utc_source_timestamps_use_member_timezone_across_spring_dst(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("TZ", "America/New_York")
+    rows = [
+        rich_row(
+            "sdk", "session-a", "Before DST jump",
+            "2026-03-08T06:30:00Z", kind="change",
+        ),
+        rich_row(
+            "sdk", "session-b", "After DST jump",
+            "2026-03-08T07:30:00Z", kind="change",
+        ),
+    ]
+    db = make_rich_db(tmp_path, rows)
+
+    curated = bundle.draft(db, "alex", "2026-03-08")
+    raw = bundle.draft(
+        db, "alex", "2026-03-08", all_observations=True
+    )
+
+    expected = [
+        "2026-03-08T01:30:00.000-05:00",
+        "2026-03-08T03:30:00.000-04:00",
+    ]
+    assert [event["ts"] for event in curated["events"]] == expected
+    assert [event["ts"] for event in raw["events"]] == expected
+    assert all(event["ts"][:10] == "2026-03-08" for event in curated["events"])
+    assert all(event["ts"][:10] == "2026-03-08" for event in raw["events"])
+
+
 def test_day_window_follows_dst_aware_local_midnights(monkeypatch):
     monkeypatch.setenv("TZ", "America/New_York")
 
@@ -126,7 +164,7 @@ def test_all_observations_preserves_legacy_projection_and_order(tmp_path):
         "Earlier title", "raw narrative"
     ]
     assert out["events"][0] == {
-        "ts": "2026-07-24T10:00:00",
+        "ts": local_ts("2026-07-24T10:00:00"),
         "kind": "journal-highlight",
         "summary": "Earlier title",
         "project": "sdk",
@@ -214,7 +252,7 @@ def test_curated_draft_deduplicates_normalized_summaries_keeping_earliest(tmp_pa
     out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
 
     assert [(event["ts"], event["summary"]) for event in out["events"]] == [
-        ("2026-07-24T09:00:00", "Shipped retry fix")
+        (local_ts("2026-07-24T09:00:00"), "Shipped retry fix")
     ]
 
 
@@ -453,6 +491,30 @@ def test_true_mechanics_only_summaries_are_filtered(tmp_path, summary):
     "Diff inspection shows clean implementation with secret isolation in tests",
 ])
 def test_mechanics_prefix_is_not_rescued_by_incidental_security_words(
+    tmp_path, summary,
+):
+    rows = [
+        rich_row(
+            "sdk", "session-a", summary, "2026-07-24T09:00:00",
+            kind="discovery",
+        ),
+    ]
+
+    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
+
+    assert out["events"] == []
+
+
+@pytest.mark.parametrize("summary", [
+    "Test suite passed for privacy checks",
+    "Pytest passed for security suite",
+    "Review completed for privacy changes",
+    "Security scan found no secrets",
+    "Privacy scan clean",
+    "Credential scan passed",
+    "Code-review completed for security changes",
+])
+def test_mechanics_prefix_families_filter_security_word_variants(
     tmp_path, summary,
 ):
     rows = [

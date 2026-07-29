@@ -21,8 +21,11 @@ push boundary.
 - The normal path produces three to seven truthful highlights for each
   `(project, local day)` total; a sparse project/day produces fewer. Seven is a
   hard per-project/day cap.
-- `memberkit draft --all` is the compatibility mode: it preserves the exact
-  current one-row-per-observation projection and `created_at_epoch` order.
+- `memberkit draft --all` is the compatibility mode: it preserves the same
+  one-row-per-observation selection, title/narrative summary, and
+  `created_at_epoch` order. Its `ts` is normalized from that epoch into the
+  member timezone because frozen v1 requires every event date to match the
+  bundle date.
 - Existing valid member-edited or manually-created drafts are preserved by both
   `draft` and `scheduled-run`; only `memberkit draft --force` may replace one.
 
@@ -33,6 +36,11 @@ the current epoch-unit defect: `created_at_epoch` is milliseconds, so bounds are
 epoch seconds multiplied by 1000. It reads only fields required for a safe
 highlight: project, memory session, title, subtitle, narrative, type, timestamp,
 and epoch. SQLite connection mode remains `mode=ro`.
+
+The same resolved member timezone used for those day bounds converts every
+selected `created_at_epoch` to an ISO 8601 `ts` with an offset. The source
+`created_at` string is not serialized because it may be UTC even when the
+selected event belongs to the member's previous local date.
 
 Normalize candidates before grouping and deduplication:
 
@@ -59,8 +67,9 @@ this curated default.
 
 ## Draft and CLI behavior
 
-`memberkit draft` uses curated selection; `memberkit draft --all` uses the legacy
-projection exactly. Both generate the same frozen v1 envelope and journal.
+`memberkit draft` uses curated selection; `memberkit draft --all` keeps the
+legacy row selection, title/narrative summary, and epoch order. Both normalize
+`ts` to member-local time and generate the same frozen v1 envelope and journal.
 `memberkit draft --force` is required to overwrite any existing draft. Without
 it, a valid draft is left byte-for-byte intact and an invalid/member-edited file
 is never repaired or replaced automatically. `scheduled-run` likewise preserves
