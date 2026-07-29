@@ -52,11 +52,13 @@ For unattended setup:
 memberkit setup \
   --member alex \
   --inbox-url git@forge.example:team/team-memory-inbox.git \
+  --timezone Asia/Dubai \
   --time 17:30
 ```
 
 Use `--no-schedule` instead of `--time` to configure MemberKit without installing
-the macOS schedule.
+the macOS schedule. `--timezone` is optional; without it, MemberKit detects the
+machine's local timezone.
 
 ### 3. Review before sharing
 
@@ -97,8 +99,9 @@ memberkit push --date YYYY-MM-DD
 memberkit dismiss --date YYYY-MM-DD
 ```
 
-The date defaults to today for `draft`, `review`, `push`, and `dismiss`. Removed or
-dismissed events remain excluded from later catch-up drafts.
+The date defaults to today in the configured member timezone for `draft`, `review`,
+`push`, and `dismiss`. Removed or dismissed events remain excluded from later
+catch-up drafts.
 
 For work from WhatsApp, Telegram, LINE, email, meetings, or another source that
 the hub does not support, MemberKit remains the reviewed manual fallback. Add a
@@ -111,13 +114,14 @@ for the five required event fields.
 
 ### Schedule behavior
 
-A scheduled run checks yesterday and today, preserving every event's original local
-calendar date. With the default 17:30 schedule, work from 17:30–23:59 is discovered
-for the earlier date when that draft is regenerated. Work at or after midnight
-belongs to the next calendar day. The schedule never changes an existing draft;
-finish reviewing it, then use an explicit `memberkit draft --force` if you want to
-include later observations from the same date. Older unfinished dates remain in
-later reminders.
+A scheduled run checks yesterday and today in the configured member timezone,
+preserving every event's member-local calendar date even if the host is set to a
+different timezone. With the default 17:30 schedule, work from 17:30–23:59 is
+discovered for the earlier date when that draft is regenerated. Work at or after
+midnight belongs to the next calendar day. The schedule never changes an existing
+draft; finish reviewing it, then use an explicit `memberkit draft --force` if you
+want to include later observations from the same date. Older unfinished dates
+remain in later reminders.
 
 ```bash
 memberkit schedule status

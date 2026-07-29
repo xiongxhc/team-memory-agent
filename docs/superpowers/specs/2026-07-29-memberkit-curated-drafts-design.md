@@ -41,6 +41,11 @@ The same resolved member timezone used for those day bounds converts every
 selected `created_at_epoch` to an ISO 8601 `ts` with an offset. The source
 `created_at` string is not serialized because it may be UTC even when the
 selected event belongs to the member's previous local date.
+`MEMBERKIT_TIMEZONE` may explicitly select an IANA timezone; the process
+environment overrides the private configuration file, invalid explicit names are
+rejected, and detected local time remains the default. Direct and scheduled
+drafts resolve this zone once per operation. Scheduled runs convert their clock
+to that zone before choosing yesterday and today.
 
 Normalize candidates before grouping and deduplication:
 

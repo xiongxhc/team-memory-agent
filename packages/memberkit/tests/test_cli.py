@@ -5,6 +5,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from memberkit import cli
 from memberkit.config import Config
@@ -48,8 +49,8 @@ def test_draft_all_requests_legacy_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli.bundle,
         "draft",
-        lambda db, member, date, *, all_observations=False: (
-            calls.append(all_observations)
+        lambda db, member, date, *, all_observations=False, timezone=None: (
+            calls.append((all_observations, timezone))
             or {
                 "schema": cli.bundle.SCHEMA,
                 "member": member,
@@ -61,7 +62,37 @@ def test_draft_all_requests_legacy_mode(tmp_path, monkeypatch):
     )
 
     assert cli.main(["draft", "--date", "2026-07-27", "--all"]) == 0
-    assert calls == [True]
+    assert calls == [(True, cli.bundle._local_timezone())]
+
+
+def test_direct_draft_uses_configured_member_timezone_not_host_timezone(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    cfg = _setup_cfg(tmp_path, timezone=ZoneInfo("America/Los_Angeles"))
+    con = sqlite3.connect(cfg.db)
+    con.execute(
+        "CREATE TABLE observations (project TEXT, title TEXT, subtitle TEXT,"
+        " narrative TEXT, type TEXT, created_at TEXT, created_at_epoch INTEGER)"
+    )
+    timestamp = "2026-07-28T06:00:00Z"
+    con.execute(
+        "INSERT INTO observations VALUES (?,?,?,?,?,?,?)",
+        (
+            "project-alpha", "Shipped timezone boundary", None, None,
+            "feature", timestamp,
+            int(datetime.fromisoformat(timestamp).timestamp() * 1000),
+        ),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+
+    assert cli.main(["draft", "--date", "2026-07-27"]) == 0
+
+    out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["events"][0]["ts"] == "2026-07-27T23:00:00.000-07:00"
 
 
 def test_draft_preserves_existing_bytes_unless_force_is_explicit(
@@ -100,12 +131,13 @@ def test_draft_preserves_existing_bytes_unless_force_is_explicit(
     assert json.loads(out.read_text(encoding="utf-8")) == replacement
 
 
-def _setup_cfg(tmp_path):
+def _setup_cfg(tmp_path, *, timezone=None):
     return Config(
         member="alex",
         db=tmp_path / "claude-mem.db",
         inbox_url="git@example.test:team/inbox.git",
         workdir=tmp_path / "work",
+        timezone=timezone,
     )
 
 
