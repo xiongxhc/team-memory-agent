@@ -1,7 +1,13 @@
 # MemberKit Curated Drafts Design
 
-**Status:** Approved
+**Status:** Superseded by
+[MemberKit Evidence-First Drafts Design](2026-07-29-memberkit-evidence-first-drafts-design.md)
 **Date:** 2026-07-29
+
+This design is retained as historical context only. Its scoring, session
+consolidation, and three-to-seven event cap must be removed before release.
+MemberKit instead preserves every eligible v1 observation event for member
+review; TeamMem performs synthesis after import.
 
 ## Problem
 
