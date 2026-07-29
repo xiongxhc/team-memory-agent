@@ -42,6 +42,16 @@ _MECHANICS = (
     "worktree", "implementation initiated", "task started", "tdd approach",
     "red phase", "green phase",
 )
+_OUTCOME_SIGNALS = (
+    "enforc", "prevent", "resolv", "fixed", "implemented", "completed",
+    "shipped", "published",
+)
+_TYPE_OUTCOME_SCORE = {
+    "bugfix": 50,
+    "decision": 40,
+    "change": 30,
+    "feature": 20,
+}
 
 
 def render_journal(events: list[dict], date: str) -> str:
@@ -132,12 +142,7 @@ def _safe_narrative(text: str | None) -> str:
 
 
 def _combine_summary(title: str, subtitle: str) -> str:
-    combined = f"{title} — {subtitle}"
-    if len(combined) <= SUMMARY_LIMIT:
-        return combined
-    title_part = _truncate(title, 80)
-    subtitle_part = _truncate(subtitle, SUMMARY_LIMIT - len(title_part) - 3)
-    return f"{title_part} — {subtitle_part}"
+    return _truncate(f"{title} — {subtitle}", SUMMARY_LIMIT)
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -158,21 +163,25 @@ def _summary(row: sqlite3.Row) -> str:
     return (title or subtitle or narrative)[:SUMMARY_LIMIT]
 
 
-def _score(row: sqlite3.Row, summary: str) -> int:
+def _score(row: sqlite3.Row, summary: str) -> tuple[int, int]:
     text = " ".join([
         summary,
         _normalize(row["type"]),
     ]).casefold()
-    score = 0
+    primary = 0
     for value, signals in _SIGNALS:
         if any(signal in text for signal in signals):
-            score = value
+            primary = value
             break
-    if (row["type"] or "").casefold() == "decision":
-        score = max(score, 400)
+    observation_type = (row["type"] or "").casefold()
+    if observation_type == "decision":
+        primary = max(primary, 400)
     if any(signal in text for signal in _MECHANICS):
-        score = min(score, -100)
-    return score
+        return (-100, 0)
+    secondary = _TYPE_OUTCOME_SCORE.get(observation_type, 0)
+    if any(signal in summary.casefold() for signal in _OUTCOME_SIGNALS):
+        secondary += 100
+    return primary, secondary
 
 
 def _curated_events(rows: list[sqlite3.Row]) -> list[dict]:
@@ -215,10 +224,14 @@ def _curated_events(rows: list[sqlite3.Row]) -> list[dict]:
         ranked = sorted(
             (
                 candidate for candidate in candidates_for_project
-                if candidate["score"] >= 0
+                if candidate["score"][0] >= 0
             ),
-            key=lambda candidate: (-candidate["score"], candidate["epoch"],
-                                   candidate["index"]),
+            key=lambda candidate: (
+                -candidate["score"][0],
+                -candidate["score"][1],
+                candidate["epoch"],
+                candidate["index"],
+            ),
         )
         selected.extend(ranked[:PROJECT_LIMIT])
 
