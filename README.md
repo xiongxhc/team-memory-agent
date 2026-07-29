@@ -67,6 +67,19 @@ today's draft:
 memberkit review
 ```
 
+By default, a draft contains at most seven curated highlights per project (normally
+three to seven, or fewer when the day is sparse). Curation is deterministic and
+local: it keeps the best outcome from each work session and makes no network or
+LLM call. If something appears to be missing, explicitly regenerate the raw
+one-row-per-observation view:
+
+```bash
+memberkit draft --all --force --date YYYY-MM-DD
+```
+
+`--all` is the raw compatibility mode. `--force` is separately required because
+MemberKit never overwrites an existing or partially edited draft by default.
+
 To remove private items, edit the `events` list in
 `~/.memberkit/out/bundle-<member>-<YYYY-MM-DD>.json`, save valid JSON, and review
 again. `journal_md` is only a preview and is regenerated from the reviewed event
@@ -95,9 +108,11 @@ for the five required event fields.
 
 A scheduled run checks yesterday and today, preserving every event's original local
 calendar date. With the default 17:30 schedule, work from 17:30–23:59 is discovered
-the next day but remains in the earlier day's catch-up draft. Work at or after
-midnight belongs to the next calendar day. Older unfinished dates remain in later
-reminders.
+for the earlier date when that draft is regenerated. Work at or after midnight
+belongs to the next calendar day. The schedule never changes an existing draft;
+finish reviewing it, then use an explicit `memberkit draft --force` if you want to
+include later observations from the same date. Older unfinished dates remain in
+later reminders.
 
 ```bash
 memberkit schedule status

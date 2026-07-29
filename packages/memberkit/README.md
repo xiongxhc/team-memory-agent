@@ -9,6 +9,10 @@ MemberKit prepares reviewable local drafts from configured observations. Schedul
 runs create drafts and reminders only. Nothing is transmitted until the member
 explicitly runs `memberkit push`.
 
+The default draft is a deterministic local curation of normally three to seven
+highlights per project (fewer for a sparse day), with at most one best outcome per
+work session and a hard cap of seven. It makes no LLM or network call.
+
 ## Before installing
 
 MemberKit requires Python 3.11 or newer, `pipx`, Git, and a local
@@ -37,6 +41,7 @@ decline. It stores private configuration at
 ## Review workflow
 
 ```bash
+memberkit draft --date YYYY-MM-DD
 memberkit review --date YYYY-MM-DD
 memberkit push --date YYYY-MM-DD
 ```
@@ -46,6 +51,17 @@ The date defaults to today. Drafts are stored at
 the JSON `events` list, save valid JSON, and run `memberkit review` again before
 pushing. Editing only `journal_md` does not remove an event because that preview is
 regenerated from `events` at push time.
+
+If the curated draft may have omitted something important, use the raw
+one-row-per-observation compatibility mode:
+
+```bash
+memberkit draft --all --force --date YYYY-MM-DD
+```
+
+`--all` changes selection; `--force` explicitly permits replacement of an
+existing draft. Without `--force`, `memberkit draft` preserves any existing file,
+including malformed or partially edited JSON, byte-for-byte.
 
 To exclude an unfinished date without transmitting it:
 
@@ -69,7 +85,9 @@ MemberKit supports macOS launchd for automatic schedule installation. Other
 platforms can schedule the portable `memberkit scheduled-run` command. A scheduled
 run checks yesterday and today. Late work remains attributed to its original local
 date, work after midnight belongs to the new day, and unfinished dates remain in
-later reminders.
+later reminders. Scheduling uses curated mode. It never replaces an existing
+draft; explicitly regenerate with `memberkit draft --force` after review if later
+observations need to be included.
 
 ## Upgrade and uninstall
 

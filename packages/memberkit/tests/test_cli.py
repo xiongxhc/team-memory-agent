@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import subprocess
 import sys
@@ -21,7 +22,7 @@ def test_draft_command_records_pending_review_state(tmp_path, monkeypatch):
     con.execute(
         "INSERT INTO observations VALUES (?,?,?,?,?,?,?)",
         ("project-alpha", "Shipped", None, None, "feature", iso,
-         int(datetime.fromisoformat(iso).astimezone().timestamp())),
+         int(datetime.fromisoformat(iso).astimezone().timestamp() * 1000)),
     )
     con.commit()
     con.close()
@@ -37,6 +38,66 @@ def test_draft_command_records_pending_review_state(tmp_path, monkeypatch):
 
     saved = DraftState(cfg.workdir / "state.json").snapshot()
     assert saved["pending"]["2026-07-27"]
+
+
+def test_draft_all_requests_legacy_mode(tmp_path, monkeypatch):
+    cfg = _setup_cfg(tmp_path)
+    cfg.db.touch()
+    calls = []
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    monkeypatch.setattr(
+        cli.bundle,
+        "draft",
+        lambda db, member, date, *, all_observations=False: (
+            calls.append(all_observations)
+            or {
+                "schema": cli.bundle.SCHEMA,
+                "member": member,
+                "date": date,
+                "events": [],
+                "journal_md": f"## {date}",
+            }
+        ),
+    )
+
+    assert cli.main(["draft", "--date", "2026-07-27", "--all"]) == 0
+    assert calls == [True]
+
+
+def test_draft_preserves_existing_bytes_unless_force_is_explicit(
+    tmp_path, monkeypatch,
+):
+    cfg = _setup_cfg(tmp_path)
+    cfg.db.touch()
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    out.parent.mkdir(parents=True)
+    original = b'{"events": [member edit in progress'
+    out.write_bytes(original)
+
+    try:
+        cli.main(["draft", "--date", "2026-07-27"])
+    except SystemExit as exc:
+        assert "use --force" in str(exc)
+    else:
+        raise AssertionError("draft should refuse to overwrite an existing file")
+    assert out.read_bytes() == original
+
+    replacement = {
+        "schema": cli.bundle.SCHEMA,
+        "member": cfg.member,
+        "date": "2026-07-27",
+        "events": [],
+        "journal_md": "## 2026-07-27",
+    }
+    monkeypatch.setattr(
+        cli.bundle,
+        "draft",
+        lambda *args, **kwargs: replacement,
+    )
+
+    assert cli.main(["draft", "--date", "2026-07-27", "--force"]) == 0
+    assert json.loads(out.read_text(encoding="utf-8")) == replacement
 
 
 def _setup_cfg(tmp_path):

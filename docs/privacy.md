@@ -70,9 +70,17 @@ local bundle containing one-line structured highlights and a derived Markdown
 preview. The member can remove any event before pushing. The preview is
 regenerated from the reviewed event list at push time.
 
-MemberKit does not include raw observations, database rows, local files, direct
-messages, or credentials. Local review state remembers approved and excluded
-event fingerprints so catch-up runs cannot silently restore a redacted event.
+The default draft deterministically selects normally three to seven highlights
+per project, or fewer for sparse days, with no LLM or network call. It keeps at
+most one best outcome per local work session and caps each project at seven.
+`memberkit draft --all` is an explicit raw-observation selection mode for checking
+whether curation omitted something, but it still emits only the frozen
+`teammem-bundle/v1` event shape.
+
+MemberKit does not include raw database rows, session identifiers, fact arrays,
+source metadata, local file paths, direct messages, or credentials in the bundle.
+Local review state remembers approved and excluded event fingerprints so later
+runs cannot silently restore a redacted event.
 
 Member drafts, review state, and the inbox clone remain under the configured
 MemberKit work directory (`~/.memberkit` by default). Private configuration is
@@ -97,6 +105,9 @@ The optional MemberKit schedule drafts and reminds. It never imports the push
 module, invokes Git, commits, or transmits. Repeated reminders continue for every
 pending date until it is reviewed or dismissed. A malformed or partially edited
 existing draft is left byte-for-byte untouched and remains in the reminder list.
+Valid and manually edited drafts are also never overwritten automatically. Only
+the member's explicit `memberkit draft --force` action can replace an existing
+draft; `--all` does not imply `--force`.
 
 Package installation alone does not create a MemberKit schedule. `memberkit
 setup` asks the member to accept the proposed 17:30 local time, choose another

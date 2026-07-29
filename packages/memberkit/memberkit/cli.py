@@ -21,6 +21,11 @@ def main(argv: list[str] | None = None) -> int:
                        help="YYYY-MM-DD (default: today)")
     sub.choices["draft"].add_argument("--force", action="store_true",
                                       help="overwrite an existing bundle")
+    sub.choices["draft"].add_argument(
+        "--all",
+        action="store_true",
+        help="include every observation instead of the curated 3–7 per project",
+    )
     p_setup = sub.add_parser("setup", help="configure MemberKit and its local reminder")
     p_setup.add_argument("--member")
     p_setup.add_argument("--inbox-url")
@@ -101,7 +106,12 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"no claude-mem db at {cfg.db} — is claude-mem installed?")
         if out.exists() and not args.force:
             raise SystemExit(f"{out} exists (possibly member-edited) — use --force to overwrite")
-        data = bundle.draft(cfg.db, cfg.member, args.date)
+        data = bundle.draft(
+            cfg.db,
+            cfg.member,
+            args.date,
+            all_observations=args.all,
+        )
         data["events"] = DraftState(cfg.workdir / "state.json").refresh(
             args.date, data["events"], current=None
         )

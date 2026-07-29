@@ -24,7 +24,7 @@ def test_memberkit_bundle_imports_idempotently_and_renders(tmp_path):
     source.execute(
         "INSERT INTO observations VALUES (?,?,?,?,?,?,?)",
         ("project-alpha", "Shipped retry fix", None, None, "feature", timestamp,
-         int(datetime.fromisoformat(timestamp).astimezone().timestamp())),
+         int(datetime.fromisoformat(timestamp).astimezone().timestamp() * 1000)),
     )
     source.commit()
     source.close()
