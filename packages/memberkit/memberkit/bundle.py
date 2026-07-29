@@ -17,6 +17,7 @@ _GENERIC_TITLE = re.compile(
     re.IGNORECASE,
 )
 _PATH_LIKE = (
+    re.compile(r"\bfile://[^\s,;!?]+", re.IGNORECASE),
     re.compile(r"(?<![A-Za-z0-9_:/])/(?!/)[^\s,;:!?]+"),
     re.compile(r"(?<!\w)~[\\/][^\s,;:!?]+"),
     re.compile(r"(?<!\w)[A-Za-z]:[\\/][^\s,;:!?]+"),
@@ -26,6 +27,12 @@ _PATH_LIKE = (
     re.compile(
         r"(?<![\w./\\])(?:[A-Za-z0-9_.-]+[\\/])+"
         r"[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}(?!\w)"
+    ),
+    re.compile(
+        r"(?<![\w./\\])(?:src|lib|bin|docs|tests?|packages?|apps?|config|"
+        r"scripts?|\.github|node_modules|vendor)"
+        r"(?:[\\/][A-Za-z0-9_.-]+)+(?![\w/\\])",
+        re.IGNORECASE,
     ),
 )
 _SIGNALS = (

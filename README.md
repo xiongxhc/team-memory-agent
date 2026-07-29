@@ -79,6 +79,10 @@ memberkit draft --all --force --date YYYY-MM-DD
 
 `--all` is the raw compatibility mode. `--force` is separately required because
 MemberKit never overwrites an existing or partially edited draft by default.
+Raw mode deliberately preserves legacy, unfiltered title/narrative summaries for
+local inspection. It may reveal sensitive observation text, so review and redact
+every raw event before any push; curated path filtering does not apply to
+`--all`.
 
 To remove private items, edit the `events` list in
 `~/.memberkit/out/bundle-<member>-<YYYY-MM-DD>.json`, save valid JSON, and review
