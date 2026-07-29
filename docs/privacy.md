@@ -75,13 +75,18 @@ per project, or fewer for sparse days, with no LLM or network call. It keeps at
 most one best outcome per local work session and caps each project at seven.
 `memberkit draft --all` is an explicit raw-observation selection mode for checking
 whether curation omitted something, but it still emits only the frozen
-`teammem-bundle/v1` event shape.
+`teammem-bundle/v1` event shape. That shape is not a content-safety guarantee:
+`--all` deliberately preserves legacy, unfiltered title/narrative summaries for
+local inspection and may reveal sensitive observation text. Curated path
+filtering does not apply. The member must review and redact every raw event before
+push.
 
-MemberKit does not read or emit the observation database's internal `facts`
-column. It does not include raw database rows, session identifiers, source
-metadata, path-like local file references, direct messages, or credentials in the
-bundle. Local review state remembers approved and excluded event fingerprints so
-later runs cannot silently restore a redacted event.
+Neither mode reads or emits the observation database's internal `facts` column.
+The curated default never serializes raw database rows, session identifiers, or
+source metadata, and it rejects candidate text containing path-like local file
+references. Member review remains the final privacy boundary. Local review state
+remembers approved and excluded event fingerprints so later runs cannot silently
+restore a redacted event.
 
 Member drafts, review state, and the inbox clone remain under the configured
 MemberKit work directory (`~/.memberkit` by default). Private configuration is

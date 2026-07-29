@@ -129,7 +129,10 @@ memberkit draft --all --force --date YYYY-MM-DD
 `--all` restores the original one-row-per-observation projection in timestamp
 order. `--force` is a separate, explicit overwrite choice. Without `--force`,
 `memberkit draft` does not replace any existing file, including valid,
-member-edited, malformed, or partially written JSON.
+member-edited, malformed, or partially written JSON. Raw mode is for local
+inspection and deliberately preserves unfiltered legacy title/narrative
+summaries. It may expose sensitive observation text. Curated path filtering does
+not apply, so review and redact every raw event before pushing.
 
 To redact an item:
 

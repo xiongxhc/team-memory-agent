@@ -61,7 +61,10 @@ memberkit draft --all --force --date YYYY-MM-DD
 
 `--all` changes selection; `--force` explicitly permits replacement of an
 existing draft. Without `--force`, `memberkit draft` preserves any existing file,
-including malformed or partially edited JSON, byte-for-byte.
+including malformed or partially edited JSON, byte-for-byte. Raw mode deliberately
+preserves legacy, unfiltered title/narrative summaries for local inspection and
+may reveal sensitive observation text. Review and redact every raw event before
+push; curated path filtering does not apply to `--all`.
 
 To exclude an unfinished date without transmitting it:
 

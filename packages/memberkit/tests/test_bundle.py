@@ -134,6 +134,31 @@ def test_all_observations_preserves_legacy_projection_and_order(tmp_path):
     }
 
 
+def test_all_observations_keeps_unfiltered_legacy_path_text(tmp_path):
+    rows = [
+        (
+            "sdk",
+            "Reviewed file:///private/memberkit.db",
+            None,
+            "Changed packages/memberkit/memberkit",
+            "discovery",
+            "2026-07-24T10:00:00",
+            epoch("2026-07-24T10:00:00"),
+        ),
+    ]
+    db = make_db(tmp_path, rows)
+
+    curated = bundle.draft(db, "alex", "2026-07-24")
+    raw = bundle.draft(
+        db, "alex", "2026-07-24", all_observations=True
+    )
+
+    assert curated["events"] == []
+    assert raw["events"][0]["summary"] == (
+        "Reviewed file:///private/memberkit.db"
+    )
+
+
 def test_curated_draft_uses_one_best_outcome_per_session_and_safe_v1_shape(tmp_path):
     rows = [
         rich_row(
@@ -255,10 +280,15 @@ def test_curated_draft_caps_each_project_at_seven_and_renders_chronologically(
     "/Volumes/Team/memberkit.db",
     r"C:\Users\example\memberkit.db",
     r"\\server\share\memberkit.db",
+    "file:///private/memberkit/state.json",
+    "file://localhost/var/log/memberkit.log",
     "~/.memberkit/state.json",
     "./src/module.py",
     "../src/module.py",
     "src/module.py",
+    "packages/memberkit/memberkit",
+    "docs/privacy",
+    ".github/workflows",
 ])
 def test_path_like_detector_rejects_local_paths_but_not_provider_names(unsafe):
     assert bundle._contains_path_like(unsafe)
