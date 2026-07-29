@@ -66,6 +66,33 @@ def test_push_same_bundle_twice_is_noop(tmp_path):
     push.push(cfg, "2026-07-24")   # must not raise "nothing to commit"
 
 
+def test_push_preserves_pending_multiplicity_after_existing_approvals(tmp_path):
+    date = "2026-07-24"
+    bare = tmp_path / "inbox.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True)
+    cfg = make_cfg(tmp_path, str(bare))
+    duplicate = event("same observation", date)
+    fingerprint = event_fingerprint(duplicate, date)
+    state_path = cfg.workdir / "state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({
+        "approved": [fingerprint, fingerprint],
+        "excluded": [],
+        "pending": {date: [fingerprint]},
+    }))
+    write_bundle(cfg, date, events=[duplicate])
+
+    push.push(cfg, date)
+
+    saved = DraftState(state_path).snapshot()
+    assert saved["approved"].count(fingerprint) == 3
+    assert date not in saved["pending"]
+
+    push.push(cfg, date)
+    repeated = DraftState(state_path).snapshot()
+    assert repeated["approved"].count(fingerprint) == 3
+
+
 def test_push_rejects_wrong_schema_before_git_or_inbox_creation(
     tmp_path, monkeypatch,
 ):
