@@ -112,18 +112,21 @@ summaries. The command prints one result per stage and exits non-zero when a
 configured connector or required stage fails.
 
 Hub scheduling is a separate, explicit lifecycle around the one-shot command.
-`teammem schedule install --time 18:20` writes a macOS user LaunchAgent or Linux
-systemd user service/timer and enables it; `schedule status` inspects it and
-`schedule remove` disables and removes it. Package installation and every other
-CLI command leave scheduler state unchanged.
+The portable `teammem.schedule` facade selects a macOS user LaunchAgent, Linux
+systemd user service/timer, or Windows Task Scheduler backend. `teammem schedule
+install --time 18:20` writes and enables the selected definition; `schedule
+status` inspects it and `schedule remove` disables and removes it. Package
+installation and every other CLI command leave scheduler state unchanged.
 
 The scheduled process is exactly the resolved executable plus `--env-file`, the
 private environment-file path, and `run-daily`. Credential values are not copied
-into scheduler definitions. The default calendar time is 18:20 in the host's
-local timezone. The scheduler provides process activation only: it does not
-pull the private MemberKit Git inbox or produce a disposable export. When bundle
-paths are configured, the operator refreshes that staging export separately
-before the run or omits the paths.
+into scheduler definitions. On Windows, the generated Task Scheduler XML holds
+only the executable path, environment-file path, and current-user SID; it uses a
+direct executable action, `InteractiveToken`, and least privilege. The default
+calendar time is 18:20 in the host's local timezone. The scheduler provides
+process activation only: it does not pull the private MemberKit Git inbox or
+produce a disposable export. When bundle paths are configured, the operator
+refreshes that staging export separately before the run or omits the paths.
 
 ## Unsupported-source fallback
 

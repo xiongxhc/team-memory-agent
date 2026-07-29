@@ -4,7 +4,7 @@ Team Memory Agent has two installation locations:
 
 | Location | Package | Responsibility |
 |---|---|---|
-| Always-on, operator-controlled Mac mini, Linux server, or VPS | `teammem` | Poll enabled central providers, import reviewed bundles, own the ledger, and render shared views |
+| Always-on, operator-controlled Mac mini, Linux server, VPS, or logged-in Windows machine | `teammem` | Poll enabled central providers, import reviewed bundles, own the ledger, and render shared views |
 | Each participating member's workstation | `teammem-memberkit` | Prepare local drafts, support manual highlights, remind, review, and explicitly push |
 
 Install and configure the hub, validate it, and run it manually before scheduling
@@ -42,6 +42,14 @@ the environment file. Keep secrets, ledgers, inboxes, archives, quarantine
 records, snapshots, and rendered views outside the checkout. Keep this virtual
 environment activated when installing the schedule so the scheduler records the
 correct `teammem` executable.
+
+The shell commands above describe macOS and Linux. On Windows, use a Python
+virtual environment or an installed package, and keep the default environment
+file at `%APPDATA%\\TeamMemory\\hub.env`. It must be a regular,
+non-reparse-point file owned by the current user, with no allow rule granting
+read access to Everyone, Authenticated Users, or the built-in Users group. This
+Windows owner/DACL contract replaces Unix mode `0600`; do not copy Unix `chmod`
+instructions to Windows.
 
 For a scheduled source installation, remove the old schedule before upgrading.
 Review the target revision, reinstall, validate, run once manually, and then
@@ -100,10 +108,12 @@ retention policy.
 
 ## Hub runtime configuration
 
-`~/.config/teammem/hub.env` accepts literal `KEY=VALUE` lines and must remain
-user-only (`0600`). It does not perform shell expansion: use absolute paths, not
-`~`, `$HOME`, or command substitutions. Process environment values override file
-values for one run.
+On macOS and Linux, `~/.config/teammem/hub.env` accepts literal `KEY=VALUE`
+lines and must remain user-only (`0600`). On Windows, the default is
+`%APPDATA%\\TeamMemory\\hub.env` and must satisfy the current-user owner/DACL
+and non-reparse-point contract above. Environment files do not perform shell
+expansion: use absolute paths, not `~`, `$HOME`, or command substitutions.
+Process environment values override file values for one run.
 
 | Variable | Required when | Purpose |
 |---|---|---|
@@ -233,8 +243,8 @@ The time is the operator host's local timezone. Package installation alone does
 nothing in the background; only `schedule install` writes and enables the job.
 The schedule's invocation contains only the resolved `teammem` executable,
 `--env-file`, the environment-file path, and `run-daily`. Credential values
-remain in the user-owned `0600` environment file and are never copied into the
-launchd or systemd definition.
+remain in the separately protected environment file and are never copied into a
+launchd, systemd, or Windows Task Scheduler definition.
 
 Polling needs outbound provider HTTPS access and Git access when the operator
 performs inbox or vault transport. It opens no inbound public port.
@@ -335,6 +345,69 @@ teammem schedule remove
 
 Use the same remove, upgrade, validate, manual-run, and reinstall order shown for
 macOS. Remove the timer before uninstalling `teammem`.
+
+### Windows: Task Scheduler
+
+Windows scheduling is a current-user, least-privilege, logged-in-only Task
+Scheduler task. It runs with `InteractiveToken`: a screen lock is fine, but
+logout prevents runs. It does not wake a sleeping or powered-off computer, so
+the machine must remain powered and normally available.
+
+Create the private environment file, configure it, and make one observed pass
+before installing the schedule:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\\TeamMemory"
+notepad "$env:APPDATA\\TeamMemory\\hub.env"
+teammem --env-file "$env:APPDATA\\TeamMemory\\hub.env" run-daily
+teammem schedule install --time 18:20
+teammem schedule status
+```
+
+Package installation alone creates no task. The default is 18:20 in the local
+Windows timezone. The task's `StartWhenAvailable` setting catches a missed daily
+trigger when the interactive user is next available; it does not make a logged
+out user available and it cannot run while the machine is powered off.
+
+The generated XML directly starts the installed `teammem.exe` with the
+environment-file path and `run-daily`. It is deliberately no password, no S4U,
+and no shell wrapper: Task Scheduler stores no provider token, Git credential,
+Windows credential, or environment-file contents. Password, service-account,
+and logged-out operation are unsupported.
+
+For scheduling evidence, enable and inspect Task Scheduler History, then check
+the task's **Last Run Time** and **Last Run Result**. Use `teammem schedule
+status` to validate the installed definition. Task Scheduler does not capture
+direct-action stdout/stderr without a wrapper, so use the manual command below
+for detailed application output:
+
+```powershell
+teammem --env-file "$env:APPDATA\\TeamMemory\\hub.env" run-daily
+```
+
+Remove the current-user task before uninstalling:
+
+```powershell
+teammem schedule remove
+```
+
+For an upgrade, remove the old task, upgrade the package, validate connectors,
+run one manual daily pass, and install the task again so it records the current
+executable and configuration paths:
+
+```powershell
+teammem schedule remove
+python -m pip install --upgrade teammem
+teammem connectors check
+teammem --env-file "$env:APPDATA\\TeamMemory\\hub.env" run-daily
+teammem schedule install --time 18:20
+```
+
+If status reports a conflict, do not delete a same-named task manually: inspect
+its ownership and definition in Task Scheduler first. A foreign or altered task
+is intentionally not treated as a TeamMem schedule. If the environment file is
+rejected, keep it under the current user's `%APPDATA%\\TeamMemory` directory and
+remove shared read access rather than loosening the security check.
 
 ### Local-filesystem requirement
 
