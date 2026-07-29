@@ -157,7 +157,7 @@ def _legacy_events(rows: list[sqlite3.Row], zone) -> list[dict]:
             "refs": None,
         }
         for row in rows
-        if row["title"] or (row["narrative"] or "").strip()
+        if (row["title"] or "").strip() or (row["narrative"] or "").strip()
     ]
 
 

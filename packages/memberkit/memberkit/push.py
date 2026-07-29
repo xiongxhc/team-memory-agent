@@ -29,7 +29,6 @@ def push(cfg: Config, date: str) -> Path:
     except ValueError as exc:
         raise SystemExit(f"{src}: {exc}") from exc
     state = DraftState(cfg.workdir / "state.json")
-    state.refresh(date, discovered=[], current=data)
 
     clone = cfg.workdir / "inbox"
     if not clone.exists():

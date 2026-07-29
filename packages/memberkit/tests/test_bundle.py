@@ -208,6 +208,8 @@ def test_draft_drops_rows_without_legacy_content(tmp_path):
          "2026-07-24T10:00:00", epoch("2026-07-24T10:00:00")),
         ("sdk", None, None, "   ", "feature",
          "2026-07-24T11:00:00", epoch("2026-07-24T11:00:00")),
+        ("sdk", " \t ", None, " \n ", "feature",
+         "2026-07-24T12:00:00", epoch("2026-07-24T12:00:00")),
     ]
 
     out = bundle.draft(make_db(tmp_path, rows), "alex", "2026-07-24")
