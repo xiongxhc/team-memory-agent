@@ -43,28 +43,38 @@ def test_draft_command_records_pending_review_state(tmp_path, monkeypatch):
     assert saved["pending"]["2026-07-27"]
 
 
-def test_draft_all_requests_legacy_mode(tmp_path, monkeypatch):
+def test_draft_and_all_write_the_same_evidence_bundle(tmp_path, monkeypatch):
     cfg = _setup_cfg(tmp_path)
-    cfg.db.touch()
-    calls = []
-    monkeypatch.setattr(cli.config, "load", lambda: cfg)
-    monkeypatch.setattr(
-        cli.bundle,
-        "draft",
-        lambda db, member, date, *, all_observations=False, timezone=None: (
-            calls.append((all_observations, timezone))
-            or {
-                "schema": cli.bundle.SCHEMA,
-                "member": member,
-                "date": date,
-                "events": [],
-                "journal_md": f"## {date}",
-            }
-        ),
+    con = sqlite3.connect(cfg.db)
+    con.execute(
+        "CREATE TABLE observations (project TEXT, title TEXT, subtitle TEXT,"
+        " narrative TEXT, type TEXT, created_at TEXT, created_at_epoch INTEGER)"
     )
+    con.executemany(
+        "INSERT INTO observations VALUES (?,?,?,?,?,?,?)",
+        [
+            (
+                "project-alpha", f"Observation {index}", None, None, "change",
+                f"2026-07-27T{index + 8:02d}:00:00",
+                int(datetime.fromisoformat(
+                    f"2026-07-27T{index + 8:02d}:00:00"
+                ).astimezone().timestamp() * 1000),
+            )
+            for index in range(8)
+        ],
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
 
-    assert cli.main(["draft", "--date", "2026-07-27", "--all"]) == 0
-    assert calls == [(True, cli.bundle._local_timezone())]
+    assert cli.main(["draft", "--date", "2026-07-27"]) == 0
+    out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    default = json.loads(out.read_text(encoding="utf-8"))
+    assert cli.main(["draft", "--date", "2026-07-27", "--all", "--force"]) == 0
+    compat = json.loads(out.read_text(encoding="utf-8"))
+
+    assert len(default["events"]) == 8
+    assert default["events"] == compat["events"]
 
 
 def test_direct_draft_uses_configured_member_timezone_not_host_timezone(

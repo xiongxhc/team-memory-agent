@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.choices["draft"].add_argument(
         "--all",
         action="store_true",
-        help="include every observation instead of the curated 3–7 per project",
+        help="compatibility alias; drafts already include every eligible observation",
     )
     p_setup = sub.add_parser("setup", help="configure MemberKit and its local reminder")
     p_setup.add_argument("--member")
