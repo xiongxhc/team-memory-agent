@@ -133,6 +133,19 @@ def _move_directive(text, prefix, section):
     return "\n".join(lines) + "\n"
 
 
+def _duplicate_xml_plist_key(definition, key, indent, container=None):
+    text = definition.decode()
+    marker = f"{indent}<key>{key}</key>\n"
+    start = text.index(marker)
+    value_start = start + len(marker)
+    if container is None:
+        end = text.index("\n", value_start) + 1
+    else:
+        closing = f"{indent}</{container}>\n"
+        end = text.index(closing, value_start) + len(closing)
+    return (text[:end] + text[start:end] + text[end:]).encode()
+
+
 @pytest.mark.parametrize("value", ["25:00", "18:99", "6:20", "18:2", "18:20:00"])
 def test_schedule_time_requires_strict_24_hour_hhmm(tmp_path, value):
     runner = RecordingRunner()
@@ -890,6 +903,40 @@ def test_launchd_status_rejects_noncanonical_or_unsafe_definition(
 
 
 @pytest.mark.parametrize(
+    ("key", "indent", "container"),
+    [
+        pytest.param(
+            "StartCalendarInterval", "\t", "dict", id="duplicate-trigger"
+        ),
+        pytest.param(
+            "ProgramArguments", "\t", "array", id="duplicate-arguments"
+        ),
+        pytest.param("Hour", "\t\t", None, id="duplicate-calendar-key"),
+    ],
+)
+def test_launchd_status_rejects_duplicate_xml_keys(
+    tmp_path, key, indent, container
+):
+    agents_dir = tmp_path / "LaunchAgents"
+    path = _install_launchd(
+        tmp_path,
+        agents_dir,
+        RecordingRunner({tuple(_launchctl_print()): 1}),
+    )
+    path.write_bytes(
+        _duplicate_xml_plist_key(path.read_bytes(), key, indent, container)
+    )
+    runner = RecordingRunner()
+
+    status = schedule_status(
+        platform="darwin", agents_dir=agents_dir, runner=runner
+    )
+
+    assert status.installed is False
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
     ("state", "enabled", "active", "expected_time", "query_manager"),
     [
         ("disabled", False, False, "18:20", True),
@@ -1017,6 +1064,61 @@ def test_systemd_status_rejects_noncanonical_or_unsafe_definition(
 
     assert status.installed is False
     assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "unsafe_path"),
+    [
+        pytest.param("executable", "/opt/%h/teammem", id="executable-home"),
+        pytest.param("executable", "/opt/%u/teammem", id="executable-user"),
+        pytest.param("env", "/private/%E/hub.env", id="env-config"),
+        pytest.param("executable", "/opt/100%/teammem", id="executable-single"),
+        pytest.param("env", "/private/100%/hub.env", id="env-single"),
+    ],
+)
+def test_systemd_status_rejects_raw_percent_in_exec_paths(
+    tmp_path, field, unsafe_path
+):
+    systemd_dir, service_path, _ = _installed_systemd(tmp_path)
+    service = service_path.read_text()
+    original = (
+        "/opt/pipx/bin/teammem"
+        if field == "executable"
+        else str(tmp_path / "hub.env")
+    )
+    service_path.write_text(service.replace(original, unsafe_path, 1))
+    runner = RecordingRunner(_manager_returncodes(True, True))
+
+    status = schedule_status(
+        platform="linux", systemd_dir=systemd_dir, runner=runner
+    )
+
+    assert status.installed is False
+    assert runner.calls == []
+
+
+def test_systemd_status_accepts_generated_literal_percent_paths(tmp_path):
+    systemd_dir = tmp_path / "systemd" / "user"
+    cfg = _cfg(tmp_path)
+    cfg.env_file = tmp_path / "env%dir" / "hub.env"
+    install_schedule(
+        cfg,
+        platform="linux",
+        systemd_dir=systemd_dir,
+        executable="/opt/%h/teammem",
+        runner=RecordingRunner(),
+    )
+    service_path = systemd_dir / "teammem-daily.service"
+    runner = RecordingRunner(_manager_returncodes(True, True))
+
+    status = schedule_status(
+        platform="linux", systemd_dir=systemd_dir, runner=runner
+    )
+
+    assert "/opt/%%h/teammem" in service_path.read_text()
+    assert "env%%dir" in service_path.read_text()
+    assert status.installed is True
+    assert runner.commands == _manager_queries()
 
 
 def test_status_does_not_report_invalid_definition_time(tmp_path):

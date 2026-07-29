@@ -391,6 +391,8 @@ def _parse_launchd(definition: bytes | None) -> tuple[bool, str | None]:
         return False, None
     try:
         data = plistlib.loads(definition)
+        if definition != plistlib.dumps(data, sort_keys=True):
+            return False, None
         if not isinstance(data, dict):
             return False, None
         expected_keys = {
@@ -470,6 +472,17 @@ def _parse_unit(
     return sections
 
 
+def _parse_systemd_exec(command: str | None) -> list[str]:
+    try:
+        raw_arguments = shlex.split(command) if command is not None else []
+    except ValueError:
+        return []
+    if any("%" in argument.replace("%%", "") for argument in raw_arguments):
+        return []
+    arguments = [argument.replace("%%", "%") for argument in raw_arguments]
+    return arguments if command == _systemd_exec(arguments) else []
+
+
 def _parse_systemd(
     service_definition: bytes | None, timer_definition: bytes | None
 ) -> tuple[bool, str | None]:
@@ -485,10 +498,7 @@ def _parse_systemd(
         if hour <= 23 and minute <= 59:
             time = f"{hour:02d}:{minute:02d}"
     command = service.get("Service", {}).get("ExecStart") if service else None
-    try:
-        arguments = shlex.split(command) if command is not None else []
-    except ValueError:
-        arguments = []
+    arguments = _parse_systemd_exec(command)
     expected_service = {
         "Unit": {"Description": "Run Team Memory Agent daily workflow"},
         "Service": {"Type": "oneshot", "ExecStart": command},
