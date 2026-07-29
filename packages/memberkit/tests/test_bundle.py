@@ -441,6 +441,32 @@ def test_true_mechanics_only_summaries_are_filtered(tmp_path, summary):
     assert out["events"] == []
 
 
+@pytest.mark.parametrize("summary", [
+    "Tests passed for privacy suite",
+    "Code review completed for security changes",
+    "Verification checks found no secret leaks",
+    "Public-source scan found no credentials",
+    (
+        "Pre-push verification gate completed successfully — "
+        "All tests passed; privacy scan clean"
+    ),
+    "Diff inspection shows clean implementation with secret isolation in tests",
+])
+def test_mechanics_prefix_is_not_rescued_by_incidental_security_words(
+    tmp_path, summary,
+):
+    rows = [
+        rich_row(
+            "sdk", "session-a", summary, "2026-07-24T09:00:00",
+            kind="discovery",
+        ),
+    ]
+
+    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
+
+    assert out["events"] == []
+
+
 def test_long_title_and_subtitle_are_composed_then_truncated_once(tmp_path):
     title = "Detailed privacy boundary decision " * 4
     subtitle = "Prevents unsupported direct-message ingestion " * 4

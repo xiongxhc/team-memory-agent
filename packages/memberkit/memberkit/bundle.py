@@ -48,20 +48,27 @@ _SIGNALS = (
     (200, ("release", "released", "publish", "published", "shipped", "deployed", "merged")),
     (100, ("added", "fixed", "completed", "resolved", "implemented", "verified", "prevent")),
 )
-_MECHANICS_ONLY = (
-    re.compile(r"^progress(?: update)?(?: [a-z0-9_-]+)?[.!]?$", re.IGNORECASE),
-    re.compile(r"^tests? pass(?:ed)?[.!]?$", re.IGNORECASE),
-    re.compile(r"^review dispatched[.!]?$", re.IGNORECASE),
-    re.compile(r"^commit staged[.!]?$", re.IGNORECASE),
-    re.compile(r"^(?:red|green)(?: phase| mechanics)?[.!]?$", re.IGNORECASE),
+_MECHANICS_PREFIX = (
+    re.compile(r"^(?:progress|update)\b", re.IGNORECASE),
+    re.compile(r"^tests? pass(?:ed)?\b", re.IGNORECASE),
+    re.compile(r"^code review\b", re.IGNORECASE),
+    re.compile(r"^review dispatched\b", re.IGNORECASE),
+    re.compile(r"^verification checks?\b", re.IGNORECASE),
+    re.compile(r"^pre-push verification\b", re.IGNORECASE),
     re.compile(r"^diff inspection\b.*$", re.IGNORECASE),
-    re.compile(r"^verification checks?\b.*$", re.IGNORECASE),
     re.compile(r"^(?:public-source scan|check-public)\b.*$", re.IGNORECASE),
-    re.compile(r"^code review completed\b.*$", re.IGNORECASE),
+    re.compile(r"^commit staged\b", re.IGNORECASE),
+    re.compile(r"^(?:red|green)\b", re.IGNORECASE),
     re.compile(
         r"^(?:implementation initiated|task started|tdd approach)\b.*$",
         re.IGNORECASE,
     ),
+)
+_SUBSTANTIVE_MARKER = re.compile(
+    r"\b(?:decision|decided|approved|risk|blocker|blocked|defect|unresolved|"
+    r"release|released|resolved|fixed|implemented|enforced|prevented|shipped|"
+    r"published|deployed|merged)\b",
+    re.IGNORECASE,
 )
 _OUTCOME_SIGNALS = (
     "enforc", "prevent", "resolv", "fixed", "implemented", "completed",
@@ -189,6 +196,12 @@ def _score(row: sqlite3.Row, summary: str) -> tuple[int, int]:
         summary,
         _normalize(row["type"]),
     ]).casefold()
+    mechanics_prefix = any(
+        pattern.search(summary.strip()) for pattern in _MECHANICS_PREFIX
+    )
+    if mechanics_prefix and not _has_substantive_marker(summary):
+        return (-100, 0)
+
     primary = 0
     for value, signals in _SIGNALS:
         if any(signal in text for signal in signals):
@@ -197,14 +210,23 @@ def _score(row: sqlite3.Row, summary: str) -> tuple[int, int]:
     observation_type = (row["type"] or "").casefold()
     if observation_type == "decision":
         primary = max(primary, 400)
-    if primary == 0 and any(
-        pattern.fullmatch(summary.strip()) for pattern in _MECHANICS_ONLY
-    ):
-        return (-100, 0)
     secondary = _TYPE_OUTCOME_SCORE.get(observation_type, 0)
     if any(signal in summary.casefold() for signal in _OUTCOME_SIGNALS):
         secondary += 100
     return primary, secondary
+
+
+def _has_substantive_marker(summary: str) -> bool:
+    for match in _SUBSTANTIVE_MARKER.finditer(summary):
+        before = summary[max(0, match.start() - 32):match.start()]
+        if re.search(
+            r"\b(?:no|not|without)\s+(?:[a-z-]+\s+){0,2}$",
+            before,
+            re.IGNORECASE,
+        ):
+            continue
+        return True
+    return False
 
 
 def _curated_events(rows: list[sqlite3.Row]) -> list[dict]:
