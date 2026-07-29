@@ -5,7 +5,6 @@ import os
 import plistlib
 import re
 import secrets
-import shlex
 import shutil
 import stat
 import subprocess
@@ -281,7 +280,19 @@ def _install_launchd(
 
 
 def _systemd_exec(arguments: Sequence[str]) -> str:
-    return shlex.join([argument.replace("%", "%%") for argument in arguments])
+    return " ".join(_systemd_quote(argument) for argument in arguments)
+
+
+def _systemd_quote(argument: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in argument):
+        raise ValueError("unsafe systemd argument")
+    escaped = (
+        argument.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "$$")
+        .replace("%", "%%")
+    )
+    return f'"{escaped}"'
 
 
 def _systemd_state(runner: Runner | None) -> tuple[bool, bool]:
@@ -438,7 +449,7 @@ def _parse_launchd(definition: bytes | None) -> tuple[bool, str | None]:
             == str(Path.home() / ".local" / "state" / "teammem" / "schedule.err")
         )
         return valid, time
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, OverflowError, TypeError, ValueError):
         return False, None
 
 
@@ -473,14 +484,43 @@ def _parse_unit(
 
 
 def _parse_systemd_exec(command: str | None) -> list[str]:
+    if command is None:
+        return []
+    arguments: list[str] = []
+    position = 0
+    while position < len(command):
+        if command[position] != '"':
+            return []
+        position += 1
+        argument: list[str] = []
+        while position < len(command) and command[position] != '"':
+            character = command[position]
+            if character == "\\":
+                position += 1
+                if position == len(command) or command[position] not in '\\"':
+                    return []
+                argument.append(command[position])
+            elif character in "$%":
+                if position + 1 == len(command) or command[position + 1] != character:
+                    return []
+                argument.append(character)
+                position += 1
+            else:
+                argument.append(character)
+            position += 1
+        if position == len(command):
+            return []
+        arguments.append("".join(argument))
+        position += 1
+        if position < len(command):
+            if command[position] != " ":
+                return []
+            position += 1
     try:
-        raw_arguments = shlex.split(command) if command is not None else []
+        canonical = _systemd_exec(arguments)
     except ValueError:
         return []
-    if any("%" in argument.replace("%%", "") for argument in raw_arguments):
-        return []
-    arguments = [argument.replace("%%", "%") for argument in raw_arguments]
-    return arguments if command == _systemd_exec(arguments) else []
+    return arguments if command == canonical else []
 
 
 def _parse_systemd(

@@ -111,6 +111,16 @@ def _installed_systemd(tmp_path):
     )
 
 
+def _installed_launchd_definition(tmp_path):
+    directory = tmp_path / "LaunchAgents"
+    path = _install_launchd(
+        tmp_path,
+        directory,
+        RecordingRunner({tuple(_launchctl_print()): 1}),
+    )
+    return directory, path
+
+
 def _manager_returncodes(enabled=False, active=False):
     return {
         tuple(_systemctl("is-enabled", "teammem-daily.timer")): 0 if enabled else 1,
@@ -521,7 +531,8 @@ def test_systemd_timer_is_persistent_and_uses_local_1820(tmp_path):
     assert "Persistent=true" in timer
     assert "WantedBy=timers.target" in timer
     assert (
-        f"ExecStart=/opt/pipx/bin/teammem --env-file {cfg.env_file} run-daily"
+        f'ExecStart="/opt/pipx/bin/teammem" "--env-file" '
+        f'"{cfg.env_file}" "run-daily"'
         in service
     )
     assert "Type=oneshot" in service
@@ -936,6 +947,80 @@ def test_launchd_status_rejects_duplicate_xml_keys(
     assert runner.calls == []
 
 
+def test_launchd_status_rejects_unserializable_integer_without_manager_query(
+    tmp_path,
+):
+    agents_dir, path = _installed_launchd_definition(tmp_path)
+    xml = path.read_text().replace(
+        "<integer>18</integer>",
+        "<integer>18446744073709551616</integer>",
+        1,
+    )
+    path.write_text(xml)
+    runner = RecordingRunner()
+
+    status = schedule_status(
+        platform="darwin", agents_dir=agents_dir, runner=runner
+    )
+
+    assert status.installed is False
+    assert status.time is None
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/opt/Team Mem/teammem",
+        "/opt/team'mem/teammem",
+        '/opt/"quoted"/teammem',
+        r"C:\\tools\\teammem",
+        "/opt/$USER/teammem",
+        "/opt/100%/teammem",
+        "/opt/团队/teammem",
+    ],
+)
+def test_systemd_exec_round_trips_generator_values(value):
+    command = schedule_module._systemd_exec(
+        [value, "--env-file", "/tmp/hub.env", "run-daily"]
+    )
+
+    assert schedule_module._parse_systemd_exec(command) == [
+        value,
+        "--env-file",
+        "/tmp/hub.env",
+        "run-daily",
+    ]
+
+
+@pytest.mark.parametrize("value", ["line\nbreak", "nul\0byte", "tab\tvalue"])
+def test_systemd_exec_rejects_control_characters(value):
+    with pytest.raises(ValueError, match="unsafe systemd argument"):
+        schedule_module._systemd_exec([value])
+
+
+def test_systemd_exec_escapes_literal_dollar_and_percent():
+    assert schedule_module._systemd_exec(["/opt/$USER/100%/teammem"]) == (
+        '"/opt/$$USER/100%%/teammem"'
+    )
+
+
+def test_systemd_exec_escapes_and_decodes_literal_double_quotes():
+    value = '/opt/"quoted"/teammem'
+    command = schedule_module._systemd_exec([value])
+
+    assert command == r'"/opt/\"quoted\"/teammem"'
+    assert schedule_module._parse_systemd_exec(command) == [value]
+
+
+def test_systemd_exec_rejects_raw_systemd_specifier():
+    assert schedule_module._parse_systemd_exec('"/opt/%h/teammem"') == []
+
+
+def test_systemd_exec_rejects_noncanonical_hand_written_quoting():
+    assert schedule_module._parse_systemd_exec("'/opt/Team Mem/teammem'") == []
+
+
 @pytest.mark.parametrize(
     ("state", "enabled", "active", "expected_time", "query_manager"),
     [
@@ -1035,7 +1120,7 @@ def test_systemd_status_rejects_misplaced_directives(
         ),
         pytest.param("timer", None, "\n[Timer]\n", id="duplicate-timer"),
         pytest.param(
-            "service", "ExecStart=/opt/pipx/bin/teammem",
+            "service", 'ExecStart="/opt/pipx/bin/teammem"',
             "ExecStart=teammem", id="relative-executable",
         ),
         pytest.param(
