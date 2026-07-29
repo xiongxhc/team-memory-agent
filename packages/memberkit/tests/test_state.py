@@ -30,6 +30,24 @@ def test_refresh_adds_unseen_without_restoring_removed_pending_event(tmp_path):
     assert event_fingerprint(private, DATE) in saved["excluded"]
 
 
+def test_refresh_current_records_removed_even_when_return_filters_approved(tmp_path):
+    kept, removed = _event("kept"), _event("removed")
+    kept_fingerprint = event_fingerprint(kept, DATE)
+    removed_fingerprint = event_fingerprint(removed, DATE)
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "approved": [kept_fingerprint],
+        "excluded": [],
+        "pending": {DATE: [removed_fingerprint]},
+    }))
+    state = DraftState(path)
+
+    output = state.refresh(DATE, discovered=[], current={"events": [kept]})
+
+    assert output == []
+    assert removed_fingerprint in state.snapshot()["excluded"]
+
+
 def test_record_push_marks_included_approved_and_missing_excluded(tmp_path):
     state = DraftState(tmp_path / "state.json")
     kept, removed = _event("kept"), _event("removed")

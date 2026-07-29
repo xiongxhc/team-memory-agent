@@ -143,13 +143,16 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "review":
         if not out.exists():
             raise SystemExit(f"no bundle at {out} — run `memberkit draft` first")
-        data = json.loads(out.read_text(encoding="utf-8"))
-        print(bundle.render_journal(data["events"], data["date"]))
+        data = bundle.prepare_bundle(out, cfg.member, date_text)
+        DraftState(cfg.workdir / "state.json").refresh(
+            date_text, discovered=[], current=data
+        )
+        print(data["journal_md"])
         print()
         for e in data["events"]:
             print(f"  [{e['ts']}] {e['project'] or 'general'}: {e['summary']}")
         print(f"\n[{len(data['events'])} events — remove private items by deleting them from"
-              f" the 'events' list in {out}; journal_md is regenerated from events at push]")
+              f" the 'events' list in {out}; journal_md is regenerated during review]")
     else:
         from . import push as push_mod
 
