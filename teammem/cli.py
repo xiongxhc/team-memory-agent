@@ -172,6 +172,8 @@ def _schedule_backend() -> str:
         return "launchd"
     if sys.platform.startswith("linux"):
         return "systemd"
+    if sys.platform == "win32":
+        return "windows"
     raise RuntimeError(f"unsupported scheduling platform: {sys.platform}")
 
 

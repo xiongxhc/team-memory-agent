@@ -830,7 +830,7 @@ def test_schedule_remove_is_idempotent_and_reports_absence(
 def test_schedule_unsupported_platform_returns_2_with_direct_message(
     tmp_path, monkeypatch, capsys
 ):
-    monkeypatch.setattr(cli_module.sys, "platform", "win32")
+    monkeypatch.setattr(cli_module.sys, "platform", "freebsd")
     monkeypatch.setattr(
         cli_module,
         "_schedule_api",
@@ -843,7 +843,7 @@ def test_schedule_unsupported_platform_returns_2_with_direct_message(
     ]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "unsupported scheduling platform: win32\n"
+    assert captured.err == "unsupported scheduling platform: freebsd\n"
 
 
 def test_schedule_install_requires_existing_valid_env_before_loading_scheduler(
@@ -955,14 +955,14 @@ import builtins
 import os
 import subprocess
 import sys
+import types
+from pathlib import Path
 
 real_import = builtins.__import__
 sys.modules.pop("fcntl", None)
 
 def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-    if name == "fcntl" or name == "teammem.schedule" or (
-        name == "schedule" and level == 1
-    ):
+    if name in {{"fcntl", "teammem.schedule_unix"}}:
         raise AssertionError("Unix scheduler imported")
     return real_import(name, globals, locals, fromlist, level)
 
@@ -972,11 +972,18 @@ for attribute in ("O_DIRECTORY", "O_NOFOLLOW"):
         delattr(os, attribute)
 
 from teammem.cli import main
+from teammem.schedule import ScheduleStatus
+
+windows = types.ModuleType("teammem.schedule_windows")
+windows.schedule_status = lambda **kwargs: ScheduleStatus(
+    False, None, "windows", Path(r"\\TeamMem-Daily-test")
+)
+sys.modules["teammem.schedule_windows"] = windows
 
 first = main(["--env-file", {str(missing_env)!r}, "connectors", "list"])
 sys.platform = "win32"
 second = main(["--env-file", {str(missing_env)!r}, "schedule", "status"])
-if (first, second) != (0, 2):
+if (first, second) != (0, 0):
     raise SystemExit(f"unexpected exit codes: {{first}}, {{second}}")
 """
     environment = os.environ.copy()
@@ -990,7 +997,10 @@ if (first, second) != (0, 2):
     )
 
     assert result.returncode == 0, result.stderr
-    assert "unsupported scheduling platform: win32" in result.stderr
+    assert (
+        "not installed: backend=windows path=\\TeamMem-Daily-test time=unknown"
+        in result.stdout
+    )
     assert "Unix scheduler imported" not in result.stderr
 
 

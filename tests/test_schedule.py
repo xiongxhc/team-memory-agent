@@ -1,3 +1,4 @@
+import builtins
 import fcntl
 import os
 import plistlib
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import teammem.schedule as schedule_module
+import teammem.schedule_unix as schedule_unix
 from teammem.config import Config
 from teammem.schedule import (
     LABEL,
@@ -169,6 +171,30 @@ def test_schedule_time_requires_strict_24_hour_hhmm(tmp_path, value):
     assert not (tmp_path / "LaunchAgents").exists()
 
 
+def test_facade_selects_windows_without_importing_unix(monkeypatch):
+    imported = []
+    real_import = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        imported.append(name)
+        if name in {"fcntl", "teammem.schedule_unix"}:
+            raise AssertionError("Unix backend imported")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+
+    assert schedule_module._backend("win32") == "windows"
+    assert "fcntl" not in imported
+    assert "teammem.schedule_unix" not in imported
+
+
+def test_unknown_platform_does_not_fall_through_to_systemd():
+    with pytest.raises(
+        RuntimeError, match="unsupported scheduling platform: freebsd"
+    ):
+        schedule_module._backend("freebsd")
+
+
 def test_launchd_schedule_runs_only_run_daily_with_env_file(tmp_path):
     agents_dir = tmp_path / "LaunchAgents"
     runner = RecordingRunner({tuple(_launchctl_print()): 1})
@@ -290,7 +316,7 @@ def test_launchd_install_failure_restores_prior_definition_and_job(
                 raise OSError("simulated write failure")
             real_replace(source, destination, *args, **kwargs)
 
-        monkeypatch.setattr("teammem.schedule.os.replace", fail_once)
+        monkeypatch.setattr("teammem.schedule_unix.os.replace", fail_once)
         runner = RecordingRunner()
     else:
         runner = RecordingRunner({bootstrap: [9, 0]})
@@ -435,7 +461,7 @@ def test_launchd_remove_failure_restores_exact_definition_and_loaded_state(
                 raise original_failure
             return real_unlink(name, *args, **kwargs)
 
-        monkeypatch.setattr(schedule_module.os, "unlink", fail_target_unlink)
+        monkeypatch.setattr(schedule_unix.os, "unlink", fail_target_unlink)
     else:
         real_fsync = os.fsync
         failed = False
@@ -447,7 +473,7 @@ def test_launchd_remove_failure_restores_exact_definition_and_loaded_state(
                 raise original_failure
             return real_fsync(descriptor)
 
-        monkeypatch.setattr(schedule_module.os, "fsync", fail_first_fsync)
+        monkeypatch.setattr(schedule_unix.os, "fsync", fail_first_fsync)
     runner = RecordingRunner(
         {tuple(_launchctl_print()): 0 if loaded else 1}
     )
@@ -489,9 +515,9 @@ def test_launchd_remove_rollback_failure_is_sanitized_and_chained(
             raise original_failure
         return real_unlink(name, *args, **kwargs)
 
-    monkeypatch.setattr(schedule_module.os, "unlink", fail_target_unlink)
+    monkeypatch.setattr(schedule_unix.os, "unlink", fail_target_unlink)
     monkeypatch.setattr(
-        schedule_module.os,
+        schedule_unix.os,
         "replace",
         lambda *args, **kwargs: (_ for _ in ()).throw(rollback_failure),
     )
@@ -659,7 +685,7 @@ def test_systemd_install_failure_restores_files_and_manager_state(
                 raise OSError("simulated timer write failure")
             real_replace(source, destination, *args, **kwargs)
 
-        monkeypatch.setattr("teammem.schedule.os.replace", fail_second_replace)
+        monkeypatch.setattr("teammem.schedule_unix.os.replace", fail_second_replace)
     elif failure_stage == "reload":
         returncodes[reload_command] = [7, 0]
     else:
@@ -836,7 +862,7 @@ finally:
     os.close(fd)
 """
 
-    with schedule_module._locked_directory(directory, True):
+    with schedule_unix._locked_directory(directory, True):
         result = subprocess.run(
             [sys.executable, "-c", probe, str(directory)],
             check=True,
@@ -981,11 +1007,11 @@ def test_launchd_status_rejects_unserializable_integer_without_manager_query(
     ],
 )
 def test_systemd_exec_round_trips_generator_values(value):
-    command = schedule_module._systemd_exec(
+    command = schedule_unix._systemd_exec(
         [value, "--env-file", "/tmp/hub.env", "run-daily"]
     )
 
-    assert schedule_module._parse_systemd_exec(command) == [
+    assert schedule_unix._parse_systemd_exec(command) == [
         value,
         "--env-file",
         "/tmp/hub.env",
@@ -996,29 +1022,29 @@ def test_systemd_exec_round_trips_generator_values(value):
 @pytest.mark.parametrize("value", ["line\nbreak", "nul\0byte", "tab\tvalue"])
 def test_systemd_exec_rejects_control_characters(value):
     with pytest.raises(ValueError, match="unsafe systemd argument"):
-        schedule_module._systemd_exec([value])
+        schedule_unix._systemd_exec([value])
 
 
 def test_systemd_exec_escapes_literal_dollar_and_percent():
-    assert schedule_module._systemd_exec(["/opt/$USER/100%/teammem"]) == (
+    assert schedule_unix._systemd_exec(["/opt/$USER/100%/teammem"]) == (
         '"/opt/$$USER/100%%/teammem"'
     )
 
 
 def test_systemd_exec_escapes_and_decodes_literal_double_quotes():
     value = '/opt/"quoted"/teammem'
-    command = schedule_module._systemd_exec([value])
+    command = schedule_unix._systemd_exec([value])
 
     assert command == r'"/opt/\"quoted\"/teammem"'
-    assert schedule_module._parse_systemd_exec(command) == [value]
+    assert schedule_unix._parse_systemd_exec(command) == [value]
 
 
 def test_systemd_exec_rejects_raw_systemd_specifier():
-    assert schedule_module._parse_systemd_exec('"/opt/%h/teammem"') == []
+    assert schedule_unix._parse_systemd_exec('"/opt/%h/teammem"') == []
 
 
 def test_systemd_exec_rejects_noncanonical_hand_written_quoting():
-    assert schedule_module._parse_systemd_exec("'/opt/Team Mem/teammem'") == []
+    assert schedule_unix._parse_systemd_exec("'/opt/Team Mem/teammem'") == []
 
 
 @pytest.mark.parametrize(
@@ -1363,7 +1389,7 @@ def test_systemd_status_pins_bytes_when_path_swaps_after_descriptor_open(
 
     outside_bytes = outside.read_bytes()
     outside_mode = stat.S_IMODE(outside.stat().st_mode)
-    monkeypatch.setattr("teammem.schedule.os.open", swap_after_open)
+    monkeypatch.setattr("teammem.schedule_unix.os.open", swap_after_open)
     runner = RecordingRunner(_manager_returncodes(True, True))
     status = schedule_status(
         platform="linux", systemd_dir=systemd_dir, runner=runner
@@ -1406,15 +1432,15 @@ def test_atomic_write_closes_temporary_descriptor_when_fchmod_fails(
             temporary_descriptors.append(descriptor)
         return descriptor
 
-    monkeypatch.setattr(schedule_module.os, "open", record_open)
+    monkeypatch.setattr(schedule_unix.os, "open", record_open)
     monkeypatch.setattr(
-        schedule_module.os,
+        schedule_unix.os,
         "fchmod",
         lambda descriptor, mode: (_ for _ in ()).throw(OSError("fchmod failed")),
     )
     try:
         with pytest.raises(OSError, match="fchmod failed"):
-            schedule_module._write_atomic(
+            schedule_unix._write_atomic(
                 directory_fd, "teammem-daily.timer", b"timer"
             )
         assert len(temporary_descriptors) == 1
@@ -1460,8 +1486,8 @@ def test_atomic_write_never_chmods_a_replaced_definition_path(
         fsync_kinds.append(stat.S_ISDIR(os.fstat(descriptor).st_mode))
         real_fsync(descriptor)
 
-    monkeypatch.setattr("teammem.schedule.os.replace", swap_after_replace)
-    monkeypatch.setattr("teammem.schedule.os.fsync", record_fsync)
+    monkeypatch.setattr("teammem.schedule_unix.os.replace", swap_after_replace)
+    monkeypatch.setattr("teammem.schedule_unix.os.fsync", record_fsync)
     runner = RecordingRunner({tuple(_launchctl_print()): 1})
     _install_launchd(tmp_path, agents_dir, runner)
 
@@ -1498,7 +1524,7 @@ def test_concurrent_systemd_installs_cannot_publish_a_mixed_pair(
             boundary.put("lock")
         return real_flock(descriptor, operation)
 
-    monkeypatch.setattr("teammem.schedule.os.replace", controlled_replace)
+    monkeypatch.setattr("teammem.schedule_unix.os.replace", controlled_replace)
     monkeypatch.setattr(fcntl, "flock", observed_flock)
 
     def run(marker, time):
@@ -1539,11 +1565,11 @@ def test_unsupported_platform_has_no_side_effects(tmp_path):
     runner = RecordingRunner()
 
     with pytest.raises(
-        RuntimeError, match="^unsupported scheduling platform: win32$"
+        RuntimeError, match="^unsupported scheduling platform: freebsd$"
     ):
         install_schedule(
             _cfg(tmp_path),
-            platform="win32",
+            platform="freebsd",
             agents_dir=tmp_path / "LaunchAgents",
             systemd_dir=tmp_path / "systemd",
             executable="/opt/pipx/bin/teammem",
