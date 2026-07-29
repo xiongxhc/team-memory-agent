@@ -1,11 +1,10 @@
 """Push a reviewed bundle into the team inbox repo. The bundle file is the
 privacy boundary: only what the member reviewed leaves the machine."""
 
-import json
 import subprocess
 from pathlib import Path
 
-from .bundle import SCHEMA, render_journal
+from . import bundle
 from .config import Config
 from .state import DraftState
 
@@ -25,9 +24,12 @@ def push(cfg: Config, date: str) -> Path:
     src = cfg.workdir / "out" / f"bundle-{cfg.member}-{date}.json"
     if not src.exists():
         raise SystemExit(f"no bundle at {src} — run `memberkit draft` first")
-    data = json.loads(src.read_text(encoding="utf-8"))
-    if data.get("schema") != SCHEMA:
-        raise SystemExit(f"{src} is not a {SCHEMA} bundle")
+    try:
+        data = bundle.prepare_bundle(src, cfg.member, date)
+    except ValueError as exc:
+        raise SystemExit(f"{src}: {exc}") from exc
+    state = DraftState(cfg.workdir / "state.json")
+    state.refresh(date, discovered=[], current=data)
 
     clone = cfg.workdir / "inbox"
     if not clone.exists():
@@ -42,10 +44,7 @@ def push(cfg: Config, date: str) -> Path:
 
     dest = clone / cfg.member / src.name
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if data.get("events") is None or data.get("date") is None:
-        raise SystemExit(f"{src} is missing 'events' or 'date' — restore them or re-draft")
-    data["journal_md"] = render_journal(data["events"], data["date"])
-    dest.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    bundle.write_bundle(dest, data)
     if _git(clone, "status", "--porcelain").stdout.strip():
         _git(clone, "add", f"{cfg.member}/{src.name}")
         _git(clone, "commit", "-m", f"bundle: {cfg.member} {date}")
@@ -53,8 +52,8 @@ def push(cfg: Config, date: str) -> Path:
         ["git", "-C", str(clone), "rev-list", "@{u}..HEAD"],
         capture_output=True, text=True)
     if ahead.returncode == 0 and not ahead.stdout.strip():
-        DraftState(cfg.workdir / "state.json").record_push(date, data["events"])
+        state.record_push(date, data["events"])
         return dest
     _git(clone, "push")
-    DraftState(cfg.workdir / "state.json").record_push(date, data["events"])
+    state.record_push(date, data["events"])
     return dest
