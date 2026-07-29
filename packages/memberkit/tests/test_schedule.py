@@ -1,3 +1,4 @@
+import json
 import plistlib
 import sqlite3
 from datetime import datetime
@@ -104,6 +105,28 @@ def test_scheduled_run_catches_up_original_date_without_transmitting(tmp_path):
     assert "Monday late" in monday and "Monday early" not in monday
     assert "Tuesday" in tuesday
     assert not (cfg.workdir / "inbox").exists()
+
+
+def test_scheduled_run_writes_every_eligible_observation(tmp_path):
+    rows = [
+        _row(f"Observation {index}", f"2026-07-27T{index + 8:02d}:00:00")
+        for index in range(8)
+    ]
+    cfg = _cfg(tmp_path, rows)
+
+    pending = scheduled_run(
+        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+    )
+
+    assert pending == ["2026-07-27"]
+    payload = json.loads(
+        (cfg.workdir / "out" / "bundle-alex-2026-07-27.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [event["summary"] for event in payload["events"]] == [
+        f"Observation {index}" for index in range(8)
+    ]
 
 
 def test_scheduled_run_uses_member_timezone_for_dates_bounds_and_timestamps(

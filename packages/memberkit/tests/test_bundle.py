@@ -1,9 +1,12 @@
 import sqlite3
 from datetime import datetime
-
-import pytest
+from zoneinfo import ZoneInfo
 
 from memberkit import bundle
+
+
+def epoch(iso):
+    return int(datetime.fromisoformat(iso).astimezone().timestamp() * 1000)
 
 
 def make_db(tmp_path, rows):
@@ -17,17 +20,6 @@ def make_db(tmp_path, rows):
     con.commit()
     con.close()
     return db
-
-
-def epoch(iso):
-    return int(datetime.fromisoformat(iso).astimezone().timestamp() * 1000)
-
-
-def local_ts(iso):
-    return datetime.fromtimestamp(
-        epoch(iso) / 1000,
-        tz=bundle._local_timezone(),
-    ).isoformat(timespec="milliseconds")
 
 
 def make_rich_db(tmp_path, rows):
@@ -44,11 +36,8 @@ def make_rich_db(tmp_path, rows):
     return db
 
 
-def rich_row(project, session, title, iso, *, subtitle=None, narrative=None,
-             facts=None, kind="discovery"):
-    return (
-        project, session, title, subtitle, narrative, facts, kind, iso, epoch(iso)
-    )
+def rich_row(project, session, title, iso):
+    return (project, session, title, None, None, None, "change", iso, epoch(iso))
 
 
 def test_draft_selects_only_that_day_and_groups_journal(tmp_path):
@@ -62,79 +51,78 @@ def test_draft_selects_only_that_day_and_groups_journal(tmp_path):
         ("sdk", "Yesterday's work", None, None, "feature",
          "2026-07-23T10:00:00", epoch("2026-07-23T10:00:00")),
     ]
+
     out = bundle.draft(make_db(tmp_path, rows), "alex", "2026-07-24")
+
     assert out["schema"] == bundle.SCHEMA == "teammem-bundle/v1"
     assert out["member"] == "alex" and out["date"] == "2026-07-24"
-    assert len(out["events"]) == 3          # yesterday's row excluded
-    assert out["events"][0]["summary"] == "Shipped marketplace"
-    assert out["events"][0]["kind"] == "journal-highlight"
-    assert len(out["events"][2]["summary"]) <= 120   # narrative truncated
+    assert [event["summary"] for event in out["events"]] == [
+        "Shipped marketplace", "Fixed sync script", "long narrative " * 8,
+    ]
     assert "### sdk" in out["journal_md"] and "### other" in out["journal_md"]
-    assert "- Shipped marketplace" in out["journal_md"]
 
 
-def test_draft_empty_day(tmp_path):
-    out = bundle.draft(make_db(tmp_path, []), "alex", "2026-07-24")
-    assert out["events"] == [] and out["journal_md"].startswith("## 2026-07-24")
-
-
-def test_draft_drops_rows_without_content(tmp_path):
+def test_draft_drops_rows_without_legacy_content(tmp_path):
     rows = [
         ("sdk", None, None, None, "feature",
          "2026-07-24T10:00:00", epoch("2026-07-24T10:00:00")),
         ("sdk", None, None, "   ", "feature",
          "2026-07-24T11:00:00", epoch("2026-07-24T11:00:00")),
     ]
+
     out = bundle.draft(make_db(tmp_path, rows), "alex", "2026-07-24")
+
     assert out["events"] == []
     assert out["journal_md"] == "## 2026-07-24"
 
 
-def test_midnight_assigns_events_to_their_local_calendar_date(tmp_path):
+def test_default_and_all_preserve_every_eligible_observation(tmp_path):
     rows = [
-        ("sdk", "Before midnight", None, None, "feature",
-         "2026-07-24T23:59:59", epoch("2026-07-24T23:59:59")),
-        ("sdk", "After midnight", None, None, "feature",
-         "2026-07-25T00:00:00", epoch("2026-07-25T00:00:00")),
+        rich_row("sdk", "session-a", "same", "2026-07-24T09:00:00"),
+        rich_row("sdk", "session-a", "same", "2026-07-24T09:01:00"),
+        rich_row("sdk", "session-b", "two", "2026-07-24T09:02:00"),
+        rich_row("sdk", "session-c", "three", "2026-07-24T09:03:00"),
+        rich_row("sdk", "session-d", "four", "2026-07-24T09:04:00"),
+        rich_row("sdk", "session-e", "five", "2026-07-24T09:05:00"),
+        rich_row("sdk", "session-f", "six", "2026-07-24T09:06:00"),
+        rich_row("sdk", "session-g", "seven", "2026-07-24T09:07:00"),
+    ]
+    db = make_rich_db(tmp_path, rows)
+    zone = ZoneInfo("Asia/Dubai")
+
+    default = bundle.draft(db, "alex", "2026-07-24", timezone=zone)
+    compat = bundle.draft(
+        db, "alex", "2026-07-24", all_observations=True, timezone=zone,
+    )
+
+    assert len(default["events"]) == 8
+    assert default["events"] == compat["events"]
+    assert [event["summary"] for event in default["events"]].count("same") == 2
+
+
+def test_draft_uses_member_timezone_for_day_bounds_and_event_timestamps(tmp_path):
+    zone = ZoneInfo("America/Los_Angeles")
+    rows = [
+        ("sdk", "Before local midnight", None, None, "feature",
+         "2026-07-28T06:30:00Z", epoch("2026-07-28T06:30:00Z")),
+        ("sdk", "After local midnight", None, None, "feature",
+         "2026-07-28T07:30:00Z", epoch("2026-07-28T07:30:00Z")),
     ]
     db = make_db(tmp_path, rows)
 
-    day_one = bundle.draft(db, "alex", "2026-07-24")
-    day_two = bundle.draft(db, "alex", "2026-07-25")
+    july_27 = bundle.draft(db, "alex", "2026-07-27", timezone=zone)
+    july_28 = bundle.draft(db, "alex", "2026-07-28", timezone=zone)
 
-    assert [event["summary"] for event in day_one["events"]] == ["Before midnight"]
-    assert [event["summary"] for event in day_two["events"]] == ["After midnight"]
-
-
-def test_utc_source_timestamps_use_member_timezone_across_spring_dst(
-    tmp_path, monkeypatch,
-):
-    monkeypatch.setenv("TZ", "America/New_York")
-    rows = [
-        rich_row(
-            "sdk", "session-a", "Before DST jump",
-            "2026-03-08T06:30:00Z", kind="change",
-        ),
-        rich_row(
-            "sdk", "session-b", "After DST jump",
-            "2026-03-08T07:30:00Z", kind="change",
-        ),
+    assert july_27["events"] == [{
+        "ts": "2026-07-27T23:30:00.000-07:00",
+        "kind": "journal-highlight",
+        "summary": "Before local midnight",
+        "project": "sdk",
+        "refs": None,
+    }]
+    assert [event["summary"] for event in july_28["events"]] == [
+        "After local midnight"
     ]
-    db = make_rich_db(tmp_path, rows)
-
-    curated = bundle.draft(db, "alex", "2026-03-08")
-    raw = bundle.draft(
-        db, "alex", "2026-03-08", all_observations=True
-    )
-
-    expected = [
-        "2026-03-08T01:30:00.000-05:00",
-        "2026-03-08T03:30:00.000-04:00",
-    ]
-    assert [event["ts"] for event in curated["events"]] == expected
-    assert [event["ts"] for event in raw["events"]] == expected
-    assert all(event["ts"][:10] == "2026-03-08" for event in curated["events"])
-    assert all(event["ts"][:10] == "2026-03-08" for event in raw["events"])
 
 
 def test_day_window_follows_dst_aware_local_midnights(monkeypatch):
@@ -147,470 +135,28 @@ def test_day_window_follows_dst_aware_local_midnights(monkeypatch):
     assert fall_end - fall_start == 25 * 60 * 60 * 1000
 
 
-def test_all_observations_preserves_legacy_projection_and_order(tmp_path):
-    rows = [
-        ("sdk", None, None, "  raw narrative  ", "discovery",
-         "2026-07-24T11:00:00", epoch("2026-07-24T11:00:00")),
-        ("sdk", "Earlier title", "ignored subtitle", "ignored narrative", "change",
-         "2026-07-24T10:00:00", epoch("2026-07-24T10:00:00")),
-    ]
-
-    out = bundle.draft(
-        make_db(tmp_path, rows), "alex", "2026-07-24",
-        all_observations=True,
-    )
-
-    assert [event["summary"] for event in out["events"]] == [
-        "Earlier title", "raw narrative"
-    ]
-    assert out["events"][0] == {
-        "ts": local_ts("2026-07-24T10:00:00"),
-        "kind": "journal-highlight",
-        "summary": "Earlier title",
-        "project": "sdk",
-        "refs": None,
-    }
-
-
-def test_all_observations_keeps_unfiltered_legacy_path_text(tmp_path):
-    rows = [
-        (
-            "sdk",
-            "Reviewed file:///private/memberkit.db",
-            None,
-            "Changed packages/memberkit/memberkit",
-            "discovery",
-            "2026-07-24T10:00:00",
-            epoch("2026-07-24T10:00:00"),
-        ),
-    ]
-    db = make_db(tmp_path, rows)
-
-    curated = bundle.draft(db, "alex", "2026-07-24")
-    raw = bundle.draft(
-        db, "alex", "2026-07-24", all_observations=True
-    )
-
-    assert curated["events"] == []
-    assert raw["events"][0]["summary"] == (
-        "Reviewed file:///private/memberkit.db"
-    )
-
-
-def test_curated_draft_uses_one_best_outcome_per_session_and_safe_v1_shape(tmp_path):
-    rows = [
-        rich_row(
-            "sdk", "session-a", "Task 2", "2026-07-24T09:00:00",
-            subtitle="Schedule lifecycle — added install, status, and remove",
-            narrative="Internal path /home/example/private was inspected.",
-            facts='["/home/example/private/secret.txt"]',
-            kind="change",
-        ),
-        rich_row(
-            "sdk", "session-a", "Tests passed", "2026-07-24T10:00:00",
-            narrative="Ran the focused suite.", kind="discovery",
-        ),
-        rich_row(
-            "sdk", "session-b", "Progress", "2026-07-24T11:00:00",
-            narrative="Privacy checks now reject direct-message ingestion. Follow-up detail.",
-            kind="decision",
-        ),
-        rich_row(
-            "sdk", "session-c", "Work", "2026-07-24T12:00:00",
-            narrative="Internal file /home/example/private.txt was inspected.",
-            facts='["FACT_SENTINEL_MUST_NEVER_APPEAR"]',
-            kind="discovery",
-        ),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert [event["summary"] for event in out["events"]] == [
-        "Schedule lifecycle — added install, status, and remove",
-        "Privacy checks now reject direct-message ingestion.",
-    ]
-    assert all(
-        set(event) == {"ts", "kind", "summary", "project", "refs"}
-        for event in out["events"]
-    )
-    assert all(len(event["summary"]) <= 120 for event in out["events"])
-    encoded = repr(out)
-    assert "session-a" not in encoded
-    assert "/home/example/private" not in encoded
-    assert "secret.txt" not in encoded
-    assert "FACT_SENTINEL_MUST_NEVER_APPEAR" not in encoded
-
-
-def test_curated_draft_deduplicates_normalized_summaries_keeping_earliest(tmp_path):
-    rows = [
-        rich_row("sdk", "session-a", "Shipped   retry fix",
-                 "2026-07-24T09:00:00", kind="change"),
-        rich_row("sdk", "session-b", "  shipped retry FIX  ",
-                 "2026-07-24T10:00:00", kind="decision"),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert [(event["ts"], event["summary"]) for event in out["events"]] == [
-        (local_ts("2026-07-24T09:00:00"), "Shipped retry fix")
-    ]
-
-
-def test_curated_draft_caps_each_project_at_seven_and_renders_chronologically(
-    tmp_path,
-):
-    rows = [
-        rich_row(
-            "sdk", f"session-{index}", title,
-            f"2026-07-24T{index + 8:02d}:00:00", kind=kind,
-        )
-        for index, (title, kind) in enumerate([
-            ("Progress update one", "discovery"),
-            ("Progress update two", "discovery"),
-            ("Progress update three", "discovery"),
-            ("Progress update four", "discovery"),
-            ("Privacy boundary secured", "discovery"),
-            ("Architecture decision approved", "decision"),
-            ("Unresolved release blocker", "discovery"),
-            ("Published package release", "change"),
-            ("Implemented connector validation", "change"),
-        ])
-    ]
-    rows.extend([
-        rich_row("other", "other-a", "Shipped other one",
-                 "2026-07-24T10:30:00", kind="change"),
-        rich_row("other", "other-b", "Shipped other two",
-                 "2026-07-24T11:30:00", kind="change"),
-    ])
-    rows.extend([
-        rich_row(
-            "cap", f"cap-{index}", f"Implemented cap outcome {index}",
-            f"2026-07-24T{index + 8:02d}:30:00", kind="change",
-        )
-        for index in range(9)
-    ])
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-    sdk = [event for event in out["events"] if event["project"] == "sdk"]
-    other = [event for event in out["events"] if event["project"] == "other"]
-    capped = [event for event in out["events"] if event["project"] == "cap"]
-
-    assert len(sdk) == 5
-    assert len(other) == 2
-    assert len(capped) == 7
-    assert [event["ts"] for event in sdk] == sorted(event["ts"] for event in sdk)
-    assert not any(
-        event["summary"].startswith("Progress update") for event in sdk
-    )
-    assert {
-        "Privacy boundary secured",
-        "Architecture decision approved",
-        "Unresolved release blocker",
-        "Published package release",
-        "Implemented connector validation",
-    } <= {event["summary"] for event in sdk}
-
-
-@pytest.mark.parametrize("unsafe", [
-    "/private/memberkit/state.json",
-    "/var/log/memberkit.log",
-    "/opt/memberkit/bin/tool",
-    "/Volumes/Team/memberkit.db",
-    r"C:\Users\example\memberkit.db",
-    r"\\server\share\memberkit.db",
-    "file:///private/memberkit/state.json",
-    "file://localhost/var/log/memberkit.log",
-    "~/.memberkit/state.json",
-    "./src/module.py",
-    "../src/module.py",
-    "src/module.py",
-    "packages/memberkit/memberkit",
-    "docs/privacy",
-    ".github/workflows",
-])
-def test_path_like_detector_rejects_local_paths_but_not_provider_names(unsafe):
-    assert bundle._contains_path_like(unsafe)
-    assert not bundle._contains_path_like("Slack/Discord connector decision")
-
-
-@pytest.mark.parametrize("unsafe", [
-    "README.md",
-    "README.rst",
-    "pyproject.toml",
-    ".env",
-    ".env.local",
-    "Dockerfile",
-    "Dockerfile.dev",
-    "docker-compose.yml",
-])
-def test_path_like_detector_rejects_bare_root_files_without_blocking_prose(
-    unsafe,
-):
-    assert bundle._contains_path_like(unsafe)
-    assert not bundle._contains_path_like(
-        "The project readme explains ordinary configuration"
-    )
-
-
-def test_curated_summary_combines_safe_title_and_subtitle_and_skips_unsafe_text(
-    tmp_path,
-):
-    rows = [
-        rich_row(
-            "sdk", "session-a", "Schedule lifecycle",
-            "2026-07-24T09:00:00",
-            subtitle="Added install, status, and remove",
-            narrative="Hidden narrative should not replace the public summary.",
-            kind="change",
-        ),
-        rich_row(
-            "sdk", "session-b", "Safe title", "2026-07-24T10:00:00",
-            subtitle="Changed src/private.py",
-            narrative="Also inspected /private/memberkit.db.",
-        ),
-        rich_row(
-            "sdk", "session-c", "Task 2", "2026-07-24T11:00:00",
-            subtitle="Read ../private/settings.py",
-            narrative=(
-                "Read /private/memberkit.db. "
-                "Resolved the review blocker without exposing a path."
-            ),
-        ),
-        rich_row(
-            "sdk", "session-d", "/opt/private/tool", "2026-07-24T12:00:00",
-            subtitle="./private.py",
-            narrative="Read src/private.py.",
-        ),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert [event["summary"] for event in out["events"]] == [
-        "Schedule lifecycle — Added install, status, and remove",
-        "Safe title",
-        "Resolved the review blocker without exposing a path.",
-    ]
-    assert all(len(event["summary"]) <= 120 for event in out["events"])
-
-
-def test_hidden_narrative_does_not_boost_a_different_displayed_title(tmp_path):
-    rows = [
-        rich_row(
-            "sdk", "session-a", "Repository activity",
-            "2026-07-24T09:00:00",
-            narrative="Critical privacy security decision and release blocker.",
-            kind="discovery",
-        ),
-        rich_row(
-            "sdk", "session-a", "Implemented connector validation",
-            "2026-07-24T10:00:00",
-            narrative="Routine implementation detail.",
-            kind="change",
-        ),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert [event["summary"] for event in out["events"]] == [
-        "Implemented connector validation"
-    ]
-
-
-def test_same_session_security_resolution_beats_earlier_security_discovery(
-    tmp_path,
-):
-    rows = [
-        rich_row(
-            "sdk", "session-a", "Slack privacy gap discovered",
-            "2026-07-24T09:00:00", kind="discovery",
-        ),
-        rich_row(
-            "sdk", "session-a", "Slack DM exclusion enforced",
-            "2026-07-24T10:00:00", kind="bugfix",
-        ),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert [event["summary"] for event in out["events"]] == [
-        "Slack DM exclusion enforced"
-    ]
-
-
-@pytest.mark.parametrize("summary", [
-    "Important uncommitted release risk",
-    "Code review found unresolved privacy leak",
-    "Security fix committed and verified",
-    "Implemented progressive disclosure",
-])
-def test_incidental_mechanics_words_do_not_hide_meaningful_outcomes(
-    tmp_path, summary,
-):
-    rows = [
-        rich_row(
-            "sdk", "session-a", summary, "2026-07-24T09:00:00",
-            kind="discovery",
-        ),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert [event["summary"] for event in out["events"]] == [summary]
-
-
-@pytest.mark.parametrize("summary", [
-    "Progress update one",
-    "Tests passed",
-    "Tests passed for release candidate",
-    "Review dispatched",
-    "Commit staged",
-    "Staged changes for Task 4",
-    "Committed Task 4 implementation",
-    "Worktree created for Task 4",
-    "RED mechanics",
-    "GREEN mechanics",
-])
-def test_true_mechanics_only_summaries_are_filtered(tmp_path, summary):
-    rows = [
-        rich_row(
-            "sdk", "session-a", summary, "2026-07-24T09:00:00",
-            kind="discovery",
-        ),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert out["events"] == []
-
-
-@pytest.mark.parametrize("summary", [
-    "Committed and released package 0.2.0",
-    "Review found unresolved privacy leak",
-])
-def test_mechanics_prefix_preserves_concrete_outcomes_and_findings(
-    tmp_path, summary,
-):
-    rows = [
-        rich_row(
-            "sdk", "session-a", summary, "2026-07-24T09:00:00",
-            kind="discovery",
-        ),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert [event["summary"] for event in out["events"]] == [summary]
-
-
-@pytest.mark.parametrize("summary", [
-    "Tests passed for privacy suite",
-    "Code review completed for security changes",
-    "Verification checks found no secret leaks",
-    "Public-source scan found no credentials",
-    (
-        "Pre-push verification gate completed successfully — "
-        "All tests passed; privacy scan clean"
-    ),
-    "Diff inspection shows clean implementation with secret isolation in tests",
-])
-def test_mechanics_prefix_is_not_rescued_by_incidental_security_words(
-    tmp_path, summary,
-):
-    rows = [
-        rich_row(
-            "sdk", "session-a", summary, "2026-07-24T09:00:00",
-            kind="discovery",
-        ),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert out["events"] == []
-
-
-@pytest.mark.parametrize("summary", [
-    "Test suite passed for privacy checks",
-    "Pytest passed for security suite",
-    "Review completed for privacy changes",
-    "Security scan found no secrets",
-    "Privacy scan clean",
-    "Credential scan passed",
-    "Code-review completed for security changes",
-])
-def test_mechanics_prefix_families_filter_security_word_variants(
-    tmp_path, summary,
-):
-    rows = [
-        rich_row(
-            "sdk", "session-a", summary, "2026-07-24T09:00:00",
-            kind="discovery",
-        ),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert out["events"] == []
-
-
-def test_long_title_and_subtitle_are_composed_then_truncated_once(tmp_path):
-    title = "Detailed privacy boundary decision " * 4
-    subtitle = "Prevents unsupported direct-message ingestion " * 4
-    rows = [
-        rich_row(
-            "sdk", "session-a", title, "2026-07-24T09:00:00",
-            subtitle=subtitle, kind="decision",
-        ),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-    normalized = f"{' '.join(title.split())} — {' '.join(subtitle.split())}"
-
-    assert out["events"][0]["summary"] == bundle._truncate(
-        normalized, bundle.SUMMARY_LIMIT
-    )
-
-
-def test_curated_equal_timestamp_rows_use_real_id_as_stable_tiebreaker(tmp_path):
+def test_equal_timestamps_use_stable_id_tiebreaker_for_both_modes(tmp_path):
     db = tmp_path / "claude-mem-with-id.db"
     con = sqlite3.connect(db)
     con.execute(
-        "CREATE TABLE observations (id TEXT, project TEXT,"
-        " memory_session_id TEXT, title TEXT, subtitle TEXT, narrative TEXT,"
-        " facts TEXT, type TEXT, created_at TEXT, created_at_epoch INTEGER)"
+        "CREATE TABLE observations (id TEXT, project TEXT, title TEXT,"
+        " narrative TEXT, created_at TEXT, created_at_epoch INTEGER)"
     )
     iso = "2026-07-24T10:00:00"
-    rows = [
-        ("b", "sdk", "session-b", "Second by identifier", None, None,
-         "FACT_B", "change", iso, epoch(iso)),
-        ("a", "sdk", "session-a", "First by identifier", None, None,
-         "FACT_A", "change", iso, epoch(iso)),
-    ]
-    con.executemany("INSERT INTO observations VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    con.executemany(
+        "INSERT INTO observations VALUES (?,?,?,?,?,?)",
+        [
+            ("b", "sdk", "Second by identifier", None, iso, epoch(iso)),
+            ("a", "sdk", "First by identifier", None, iso, epoch(iso)),
+        ],
+    )
     con.commit()
     con.close()
 
-    out = bundle.draft(db, "alex", "2026-07-24")
-    legacy = bundle.draft(
-        db, "alex", "2026-07-24", all_observations=True
-    )
+    default = bundle.draft(db, "alex", "2026-07-24")
+    compat = bundle.draft(db, "alex", "2026-07-24", all_observations=True)
 
-    assert [event["summary"] for event in out["events"]] == [
+    assert [event["summary"] for event in default["events"]] == [
         "First by identifier", "Second by identifier"
     ]
-    assert [event["summary"] for event in legacy["events"]] == [
-        "Second by identifier", "First by identifier"
-    ]
-
-
-def test_curated_equal_timestamp_fixture_falls_back_to_rowid(tmp_path):
-    iso = "2026-07-24T10:00:00"
-    rows = [
-        rich_row("sdk", "session-b", "Inserted first", iso, kind="change"),
-        rich_row("sdk", "session-a", "Inserted second", iso, kind="change"),
-    ]
-
-    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
-
-    assert [event["summary"] for event in out["events"]] == [
-        "Inserted first", "Inserted second"
-    ]
+    assert default["events"] == compat["events"]
