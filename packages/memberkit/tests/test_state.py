@@ -48,3 +48,37 @@ def test_approved_and_excluded_events_do_not_reappear(tmp_path):
     state.record_push(DATE, [kept])
 
     assert state.refresh(DATE, [kept, removed], current=None) == []
+
+
+def test_duplicate_events_preserve_multiplicity_through_redaction_and_push(tmp_path):
+    state = DraftState(tmp_path / "state.json")
+    duplicate = _event("same observation")
+
+    assert state.refresh(DATE, [duplicate, duplicate], current=None) == [
+        duplicate, duplicate
+    ]
+    assert state.snapshot()["pending"][DATE].count(
+        event_fingerprint(duplicate, DATE)
+    ) == 2
+
+    assert state.refresh(DATE, [], current={"events": [duplicate]}) == [duplicate]
+    assert state.snapshot()["excluded"].count(
+        event_fingerprint(duplicate, DATE)
+    ) == 1
+
+    state.record_push(DATE, [duplicate])
+
+    assert state.refresh(DATE, [duplicate, duplicate], current=None) == []
+
+
+def test_repeated_push_does_not_accumulate_duplicate_approvals(tmp_path):
+    state = DraftState(tmp_path / "state.json")
+    duplicate = _event("same observation")
+    state.refresh(DATE, [duplicate, duplicate], current=None)
+
+    state.record_push(DATE, [duplicate, duplicate])
+    state.record_push(DATE, [duplicate, duplicate])
+
+    assert state.snapshot()["approved"].count(
+        event_fingerprint(duplicate, DATE)
+    ) == 2

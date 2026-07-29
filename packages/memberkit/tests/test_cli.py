@@ -77,6 +77,33 @@ def test_draft_and_all_write_the_same_evidence_bundle(tmp_path, monkeypatch):
     assert default["events"] == compat["events"]
 
 
+def test_draft_preserves_exact_duplicate_observations(tmp_path, monkeypatch):
+    cfg = _setup_cfg(tmp_path)
+    con = sqlite3.connect(cfg.db)
+    con.execute(
+        "CREATE TABLE observations (project TEXT, title TEXT, subtitle TEXT,"
+        " narrative TEXT, type TEXT, created_at TEXT, created_at_epoch INTEGER)"
+    )
+    iso = "2026-07-27T10:00:00"
+    row = (
+        "project-alpha", "Same observation", None, None, "change", iso,
+        int(datetime.fromisoformat(iso).astimezone().timestamp() * 1000),
+    )
+    con.executemany("INSERT INTO observations VALUES (?,?,?,?,?,?,?)", [row, row])
+    con.commit()
+    con.close()
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+
+    assert cli.main(["draft", "--date", "2026-07-27"]) == 0
+    out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    first = json.loads(out.read_text(encoding="utf-8"))
+    assert cli.main(["draft", "--date", "2026-07-27", "--force"]) == 0
+    repeated = json.loads(out.read_text(encoding="utf-8"))
+
+    assert len(first["events"]) == 2
+    assert first["events"] == repeated["events"]
+
+
 def test_direct_draft_uses_configured_member_timezone_not_host_timezone(
     tmp_path, monkeypatch,
 ):

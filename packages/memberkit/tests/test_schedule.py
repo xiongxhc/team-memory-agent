@@ -129,6 +129,21 @@ def test_scheduled_run_writes_every_eligible_observation(tmp_path):
     ]
 
 
+def test_scheduled_run_preserves_exact_duplicate_observations(tmp_path):
+    row = _row("Same observation", "2026-07-27T10:00:00")
+    cfg = _cfg(tmp_path, [row, row])
+    now = datetime.fromisoformat("2026-07-28T17:30:00")
+
+    assert scheduled_run(cfg, now, notify=False) == ["2026-07-27"]
+    path = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    first = json.loads(path.read_text(encoding="utf-8"))
+    assert scheduled_run(cfg, now, notify=False) == ["2026-07-27"]
+    repeated = json.loads(path.read_text(encoding="utf-8"))
+
+    assert len(first["events"]) == 2
+    assert first["events"] == repeated["events"]
+
+
 def test_scheduled_run_uses_member_timezone_for_dates_bounds_and_timestamps(
     tmp_path, monkeypatch,
 ):
