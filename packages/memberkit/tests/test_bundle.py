@@ -329,6 +329,45 @@ def test_hidden_narrative_does_not_boost_a_different_displayed_title(tmp_path):
     ]
 
 
+def test_same_session_security_resolution_beats_earlier_security_discovery(
+    tmp_path,
+):
+    rows = [
+        rich_row(
+            "sdk", "session-a", "Slack privacy gap discovered",
+            "2026-07-24T09:00:00", kind="discovery",
+        ),
+        rich_row(
+            "sdk", "session-a", "Slack DM exclusion enforced",
+            "2026-07-24T10:00:00", kind="bugfix",
+        ),
+    ]
+
+    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
+
+    assert [event["summary"] for event in out["events"]] == [
+        "Slack DM exclusion enforced"
+    ]
+
+
+def test_long_title_and_subtitle_are_composed_then_truncated_once(tmp_path):
+    title = "Detailed privacy boundary decision " * 4
+    subtitle = "Prevents unsupported direct-message ingestion " * 4
+    rows = [
+        rich_row(
+            "sdk", "session-a", title, "2026-07-24T09:00:00",
+            subtitle=subtitle, kind="decision",
+        ),
+    ]
+
+    out = bundle.draft(make_rich_db(tmp_path, rows), "alex", "2026-07-24")
+    normalized = f"{' '.join(title.split())} — {' '.join(subtitle.split())}"
+
+    assert out["events"][0]["summary"] == bundle._truncate(
+        normalized, bundle.SUMMARY_LIMIT
+    )
+
+
 def test_curated_equal_timestamp_rows_use_real_id_as_stable_tiebreaker(tmp_path):
     db = tmp_path / "claude-mem-with-id.db"
     con = sqlite3.connect(db)
