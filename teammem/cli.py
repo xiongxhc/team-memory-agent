@@ -234,14 +234,20 @@ def main(argv: list[str] | None = None) -> int:
         schedule = _schedule_api()
         try:
             if args.schedule_cmd == "status":
-                status = schedule.schedule_status()
+                status = schedule.schedule_status(
+                    **({"windows_env_file": args.env_file}
+                       if backend == "windows" else {})
+                )
                 state = "installed" if status.installed else "not installed"
                 print(
                     f"{state}: backend={status.backend} path={status.path} "
                     f"time={status.time or 'unknown'}"
                 )
                 return 0
-            removed = schedule.remove_schedule()
+            removed = schedule.remove_schedule(
+                **({"windows_env_file": args.env_file}
+                   if backend == "windows" else {})
+            )
             print("removed" if removed else "not installed")
             return 0
         except _SCHEDULE_FAILURES as failure:

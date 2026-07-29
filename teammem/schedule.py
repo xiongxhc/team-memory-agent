@@ -8,7 +8,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import Config
+from .config import Config, default_env_file
 
 
 LABEL = "org.teammem.hub-daily"
@@ -101,6 +101,8 @@ def schedule_status(
     windows_runner: Runner | None = None,
     windows_state_dir: Path | None = None,
     windows_task_name: str | None = None,
+    windows_executable: str | None = None,
+    windows_env_file: Path | None = None,
 ) -> ScheduleStatus:
     """Read status without creating artifacts or changing scheduler state."""
     backend = _backend(platform)
@@ -109,9 +111,11 @@ def schedule_status(
             backend=backend, agents_dir=agents_dir, systemd_dir=systemd_dir,
             runner=runner,
         )
+    command = _executable(windows_executable)
+    env_file = windows_env_file or default_env_file(platform=platform)
     return _windows_backend().schedule_status(
         api=windows_api, runner=windows_runner, state_dir=windows_state_dir,
-        task_name_override=windows_task_name,
+        task_name_override=windows_task_name, executable=command, env_file=env_file,
     )
 
 
@@ -124,6 +128,8 @@ def remove_schedule(
     windows_runner: Runner | None = None,
     windows_state_dir: Path | None = None,
     windows_task_name: str | None = None,
+    windows_executable: str | None = None,
+    windows_env_file: Path | None = None,
 ) -> bool:
     """Remove an installed schedule, returning false when none exists."""
     backend = _backend(platform)
@@ -132,7 +138,9 @@ def remove_schedule(
             backend=backend, agents_dir=agents_dir, systemd_dir=systemd_dir,
             runner=runner,
         )
+    command = _executable(windows_executable)
+    env_file = windows_env_file or default_env_file(platform=platform)
     return _windows_backend().remove_schedule(
         api=windows_api, runner=windows_runner, state_dir=windows_state_dir,
-        task_name_override=windows_task_name,
+        task_name_override=windows_task_name, executable=command, env_file=env_file,
     )

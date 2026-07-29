@@ -973,6 +973,9 @@ for attribute in ("O_DIRECTORY", "O_NOFOLLOW"):
 
 from teammem.cli import main
 from teammem.schedule import ScheduleStatus
+import teammem.schedule as schedule_module
+
+schedule_module._executable = lambda value: r"C:\\Program Files\\TeamMem\\teammem.exe"
 
 windows = types.ModuleType("teammem.schedule_windows")
 windows.schedule_status = lambda **kwargs: ScheduleStatus(

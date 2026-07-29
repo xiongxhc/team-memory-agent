@@ -195,6 +195,38 @@ def test_unknown_platform_does_not_fall_through_to_systemd():
         schedule_module._backend("freebsd")
 
 
+def test_windows_facade_passes_expected_executable_and_env_without_reading_env(monkeypatch):
+    seen = []
+    env_file = Path(r"C:\\Users\\Alex\\AppData\\Roaming\\TeamMemory\\hub.env")
+
+    class Backend:
+        @staticmethod
+        def schedule_status(**kwargs):
+            seen.append(("status", kwargs))
+            return schedule_module.ScheduleStatus(
+                False, None, "windows", Path(r"\\TeamMem-Daily-test")
+            )
+
+        @staticmethod
+        def remove_schedule(**kwargs):
+            seen.append(("remove", kwargs))
+            return False
+
+    monkeypatch.setattr(schedule_module, "_windows_backend", lambda: Backend)
+    monkeypatch.setattr(
+        schedule_module, "_executable", lambda value: value or r"C:\\bin\\teammem.exe"
+    )
+
+    assert schedule_status(
+        platform="win32", windows_env_file=env_file
+    ).installed is False
+    assert remove_schedule(platform="win32", windows_env_file=env_file) is False
+    assert [entry[1]["env_file"] for entry in seen] == [env_file, env_file]
+    assert [entry[1]["executable"] for entry in seen] == [
+        r"C:\\bin\\teammem.exe", r"C:\\bin\\teammem.exe"
+    ]
+
+
 def test_launchd_schedule_runs_only_run_daily_with_env_file(tmp_path):
     agents_dir = tmp_path / "LaunchAgents"
     runner = RecordingRunner({tuple(_launchctl_print()): 1})
