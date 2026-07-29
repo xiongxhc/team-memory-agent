@@ -101,7 +101,7 @@ MEMBERKIT_TIMEZONE=Asia/Dubai PYTHONPATH=packages/memberkit \
   .venv/bin/python -c '
 from pathlib import Path
 from memberkit.bundle import draft
-d = draft(Path("/Users/cx/.claude-mem/claude-mem.db"), "cx", "2026-07-28")
+d = draft(Path.home() / ".claude-mem" / "claude-mem.db", "cx", "2026-07-28")
 print(len(d["events"]))
 print(sum(e["project"] == "team-memory-agent" for e in d["events"]))
 '
