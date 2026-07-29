@@ -46,6 +46,48 @@ if [ -n "$obsolete_schedule_claims" ]; then
   exit 1
 fi
 
+# The Windows scheduler is deliberately current-user and interactive-only.  Keep
+# the public operator contract explicit, rather than allowing a later doc edit
+# to quietly imply a background-service or credentialed mode.
+windows_contract_file=docs/deployment.md
+if [ -f "$windows_contract_file" ] && [ -f pyproject.toml ]; then
+  for required_windows_claim in \
+    'logged-in-only' \
+    'screen lock' \
+    'logout prevents runs' \
+    'StartWhenAvailable' \
+    'machine must remain powered' \
+    'no password' \
+    'no S4U' \
+    'no shell wrapper'; do
+    if ! grep -Fq "$required_windows_claim" "$windows_contract_file"; then
+      echo "missing Windows scheduling contract: $required_windows_claim"
+      exit 1
+    fi
+  done
+
+  windows_claim_text=$(for windows_doc in \
+    README.md docs/deployment.md docs/architecture.md docs/privacy.md; do
+    if [ -f "$windows_doc" ]; then
+      grep -nH . "$windows_doc" || test $? -eq 1
+    fi
+  done)
+  windows_positive_claims=$(printf '%s\n' "$windows_claim_text" | grep -viE \
+    'does not (run after logout|use S4U|store a password|use a shell wrapper|invoke a shell wrapper|have a shell wrapper)|no (password|S4U|shell wrapper)|without (a )?(password|S4U|shell wrapper)' \
+    || test $? -eq 1)
+  unsupported_windows_claims=$(printf '%s\n' "$windows_positive_claims" | grep -niE \
+    -e '(Windows[^.]*runs after logout|runs after logout[^.]*Windows)' \
+    -e '(Windows[^.]*uses S4U|uses S4U[^.]*Windows)' \
+    -e '(Windows[^.]*stores? (a )?password|stores? (a )?password[^.]*Windows)' \
+    -e '(Windows[^.]*(uses?|invokes?|has) (a )?shell wrapper|(uses?|invokes?|has) (a )?shell wrapper[^.]*Windows)' \
+    || test $? -eq 1)
+  if [ -n "$unsupported_windows_claims" ]; then
+    printf '%s\n' "$unsupported_windows_claims"
+    echo "unsupported Windows scheduling claim found"
+    exit 1
+  fi
+fi
+
 if [ -n "${TEAMMEM_PUBLIC_DENY_REGEX:-}" ]; then
   private_matches=$(git grep -nI -E \
     -e "$TEAMMEM_PUBLIC_DENY_REGEX" -- || test $? -eq 1)

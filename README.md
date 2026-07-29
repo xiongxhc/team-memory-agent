@@ -118,7 +118,8 @@ for upgrades, troubleshooting, files created locally, and safe removal.
 
 ## Hub quick start
 
-The hub runs on an always-on, operator-controlled Mac mini, Linux server, or VPS.
+The hub runs on an always-on, operator-controlled Mac mini, Linux server, VPS, or
+Windows machine that remains powered and logged in.
 It collects central sources, imports reviewed MemberKit bundles, owns the SQLite
 ledger, and renders the shared Markdown views. Members do not install it.
 
@@ -226,10 +227,11 @@ teammem schedule status
 ```
 
 The built-in schedule invokes only `teammem run-daily`; it does not pull or
-export a private MemberKit inbox. See the
+export a private MemberKit inbox. On Windows it is a current-user, logged-in-only
+Task Scheduler task: a screen lock is fine, but logout prevents runs. See the
 [deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md)
-for macOS/Linux paths, logs, missed-run behavior, safe inbox staging, upgrades,
-and removal.
+for macOS/Linux/Windows paths, logs, missed-run behavior, safe inbox staging,
+upgrades, and removal.
 
 ### What the built-in connectors can see
 

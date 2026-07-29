@@ -11,7 +11,9 @@ keywords = ["agents", "knowledge-management", "local-first", "team-memory"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
-    "Operating System :: OS Independent",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

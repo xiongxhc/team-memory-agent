@@ -7,8 +7,10 @@ creates no schedule. Every GitHub, GitLab, Slack, Feishu, and Discord enable fla
 defaults to `false`. `teammem connectors list` and `teammem connectors check`
 inspect local configuration only.
 
-The hub belongs on an always-on, operator-controlled Mac mini, Linux server, or
-VPS. Provider payloads and the SQLite ledger remain on that machine.
+The hub belongs on an always-on, operator-controlled Mac mini, Linux server,
+VPS, or Windows machine. Windows scheduling is current-user and logged-in-only:
+a screen lock is supported, while logout prevents future runs. Provider payloads
+and the SQLite ledger remain on that machine.
 Rendered views expose normalized summaries and references; operators are
 responsible for access control to the ledger, inbox, archive, quarantine,
 snapshots, and rendered views.
@@ -49,10 +51,12 @@ optional and collects only human top-level messages in its allowlisted channels.
 ## Credentials and configuration
 
 Non-secret enable flags and allowlisted resources live in operator-owned YAML.
-Tokens and app secrets live in the process environment or
-`~/.config/teammem/hub.env`, which must have mode `0600`. Process values override
-the file. The environment-file parser treats values literally, so operators use
-absolute paths and do not rely on shell expansion.
+On macOS and Linux, tokens and app secrets live in the process environment or
+`~/.config/teammem/hub.env`, which must have mode `0600`. On Windows, the default
+is `%APPDATA%\\TeamMemory\\hub.env`; it must be a current-user-owned regular,
+non-reparse-point file with no shared-principal read allow rule. Process values
+override the file. The environment-file parser treats values literally, so
+operators use absolute paths and do not rely on shell expansion.
 
 Validation reports missing environment-variable names, never values. Connector
 and daily-run errors redact configured credentials. Credentials, runtime
@@ -101,15 +105,20 @@ time, or decline.
 The hub's `teammem run-daily` command also runs once and never installs a
 schedule. Package installation creates no background job. Only the explicit
 `teammem schedule install --time HH:MM` command installs or replaces the
-operator's 18:20-local-time-by-default launchd or systemd user job;
-`teammem schedule status` inspects it and `teammem schedule remove` removes it.
+operator's 18:20-local-time-by-default launchd, systemd user, or Windows Task
+Scheduler job; `teammem schedule status` inspects it and `teammem schedule
+remove` removes it.
 
 The schedule definition contains no credential values. Its process invocation
 contains only the resolved executable, `--env-file`, the private environment
 file's path, and `run-daily`; secrets stay inside the separately protected
-`0600` file. The built-in job does not pull or export the private MemberKit Git
-inbox. Operators either refresh a disposable staging export separately before a
-scheduled import or omit inbox paths from the scheduled configuration.
+environment file. On Windows, the XML additionally contains the current-user
+SID and paths only: it contains no provider, Git, or Windows credential, no
+password, and no secret values. The task directly launches `teammem.exe`; there
+is no PowerShell, `cmd.exe`, or shell wrapper. The built-in job does not pull or
+export the private MemberKit Git inbox. Operators either refresh a disposable
+staging export separately before a scheduled import or omit inbox paths from the
+scheduled configuration.
 
 Scheduling does not turn the hub into an inbound service. Provider polling and
 operator-owned Git transport need outbound access, but the hub opens no inbound

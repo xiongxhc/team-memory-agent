@@ -27,6 +27,17 @@ LEGITIMATE_SCHEDULE_BOUNDARIES = (
         "teammem --env-file /absolute/path/to/hub.env run-daily."
     ),
 )
+WINDOWS_CONTRACT = """\
+### Windows: Task Scheduler
+logged-in-only
+screen lock
+logout prevents runs
+StartWhenAvailable
+machine must remain powered
+no password
+no S4U
+no shell wrapper
+"""
 
 
 def _tracked_repo(tmp_path, name, content):
@@ -34,6 +45,29 @@ def _tracked_repo(tmp_path, name, content):
         ["git", "init", "-q", str(tmp_path)],
         check=True,
     )
+    path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", name],
+        check=True,
+    )
+
+
+def _windows_operator_repo(tmp_path, extra):
+    _tracked_repo(
+        tmp_path,
+        "docs/deployment.md",
+        WINDOWS_CONTRACT + extra + "\n",
+    )
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='test'\n")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "pyproject.toml"],
+        check=True,
+    )
+
+
+def _add_tracked_file(tmp_path, name, content):
     path = tmp_path / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -217,3 +251,65 @@ def test_public_scan_rejects_provider_token_shapes_in_prose(tmp_path, credential
     )
 
     assert result.returncode == 1
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "The task on Windows runs after logout.",
+        "Windows scheduling uses S4U.",
+        "The Windows backend stores a password.",
+        "Windows scheduling invokes a shell wrapper.",
+    ],
+)
+def test_public_scan_rejects_positive_windows_scheduler_claims(tmp_path, claim):
+    _windows_operator_repo(tmp_path, claim)
+
+    result = subprocess.run(
+        [str(SCANNER)], cwd=tmp_path, capture_output=True, text=True
+    )
+
+    assert result.returncode == 1
+    assert "unsupported Windows scheduling claim found" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "The task on Windows does not run after logout.",
+        "Windows scheduling does not use S4U.",
+        "The Windows backend does not store a password.",
+        "Windows scheduling has no shell wrapper.",
+    ],
+)
+def test_public_scan_allows_negative_windows_scheduler_claims(tmp_path, claim):
+    _windows_operator_repo(tmp_path, claim)
+
+    result = subprocess.run(
+        [str(SCANNER)], cwd=tmp_path, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_public_scan_rejects_positive_windows_claim_outside_deployment(tmp_path):
+    _windows_operator_repo(tmp_path, "")
+    _add_tracked_file(tmp_path, "README.md", "Windows scheduling uses S4U.\n")
+
+    result = subprocess.run(
+        [str(SCANNER)], cwd=tmp_path, capture_output=True, text=True
+    )
+
+    assert result.returncode == 1
+    assert "unsupported Windows scheduling claim found" in result.stdout
+
+
+def test_public_scan_allows_negative_windows_claim_outside_deployment(tmp_path):
+    _windows_operator_repo(tmp_path, "")
+    _add_tracked_file(tmp_path, "docs/privacy.md", "Windows scheduling does not use S4U.\n")
+
+    result = subprocess.run(
+        [str(SCANNER)], cwd=tmp_path, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
