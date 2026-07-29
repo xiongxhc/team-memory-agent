@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from teammem.config import Config, read_env_file
+from teammem.config import Config, default_env_file, read_env_file
 
 
 @pytest.fixture
@@ -102,3 +102,44 @@ def test_connector_and_daily_paths_load_from_hub_environment(tmp_path):
     assert cfg.archive == Path("/runtime/archive")
     assert cfg.quarantine == Path("/runtime/quarantine")
     assert cfg.snapshots == Path("/runtime/snapshots")
+
+
+def test_windows_default_env_file_is_resolved_at_call_time():
+    assert default_env_file(
+        platform="win32", env={"APPDATA": r"C:\\Users\\Alex\\AppData\\Roaming"}
+    ) == Path(r"C:\\Users\\Alex\\AppData\\Roaming") / "TeamMemory" / "hub.env"
+    with pytest.raises(RuntimeError, match="APPDATA is required"):
+        default_env_file(platform="win32", env={})
+
+
+def test_windows_config_reads_env_through_injected_same_handle_api():
+    env_file = Path(r"C:\Users\Alex\AppData\Roaming\TeamMemory\hub.env")
+
+    class Api:
+        def current_process_sid(self):
+            return "S-1-5-21-test"
+
+        def open_file(self, path, *, directory=False):
+            return {"path": path}
+
+        def file_info(self, handle):
+            return {"regular": True, "reparse_point": False, "file_type": "disk"}
+
+        def owner_sid(self, handle):
+            return "S-1-5-21-test"
+
+        def allow_aces(self, handle):
+            return []
+
+        def read_lines(self, handle):
+            return ["TEAMMEM_SINCE_DAYS=13\n"]
+
+        def close_handle(self, handle):
+            pass
+
+    api = Api()
+    cfg = Config.load(
+        env={}, env_file=env_file, platform="win32", windows_api=api
+    )
+    assert cfg.since_days == 13
+    assert cfg.env_file == env_file

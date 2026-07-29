@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from .config import DEFAULT_ENV_FILE, Config
+from .config import Config, default_env_file
 from .connectors.config import load_connector_settings
 from .connectors.registry import connector_names, get_connector
 from .daily import run_daily
@@ -39,7 +39,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--env-file",
         type=Path,
-        default=DEFAULT_ENV_FILE,
+        default=default_env_file(),
         metavar="PATH",
         help="private hub environment file (default: ~/.config/teammem/hub.env)",
     )
