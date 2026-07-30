@@ -1,6 +1,7 @@
 import json
 import plistlib
 import sqlite3
+import subprocess
 import sys
 import types
 from datetime import datetime
@@ -192,6 +193,69 @@ def test_facade_win32_does_not_import_the_macos_backend(tmp_path, monkeypatch):
     }
 
 
+def test_windows_facade_forwards_lifecycle_injection_seams(
+    tmp_path,
+    monkeypatch,
+):
+    """Catches install/remove dropping a Windows lifecycle dependency."""
+    observed = {}
+    windows = types.ModuleType("memberkit.schedule_windows")
+
+    def windows_install(hour, minute, executable, **kwargs):
+        observed["install"] = (hour, minute, executable, kwargs)
+        return tmp_path / "task"
+
+    def windows_remove(**kwargs):
+        observed["remove"] = kwargs
+        return True
+
+    windows.install_schedule = windows_install
+    windows.remove_schedule = windows_remove
+    monkeypatch.setitem(sys.modules, "memberkit.schedule_windows", windows)
+    monkeypatch.setitem(sys.modules, "memberkit.schedule_macos", None)
+    common = {
+        "platform": "win32",
+        "windows_api": "api",
+        "windows_runner": "runner",
+        "windows_state_dir": tmp_path / "state",
+        "windows_task_name": "task-name",
+    }
+
+    installed = schedule.install_schedule(
+        _cfg(tmp_path),
+        time="07:05",
+        executable="C:/memberkit.exe",
+        **common,
+    )
+    removed = schedule.remove_schedule(
+        windows_executable="C:/memberkit.exe",
+        **common,
+    )
+
+    assert installed == tmp_path / "task"
+    assert removed is True
+    assert observed == {
+        "install": (
+            7,
+            5,
+            "C:/memberkit.exe",
+            {
+                "api": "api",
+                "runner": "runner",
+                "state_dir": tmp_path / "state",
+                "task_name_override": "task-name",
+            },
+        ),
+        "remove": {
+            "api": "api",
+            "runner": "runner",
+            "state_dir": tmp_path / "state",
+            "task_name_override": "task-name",
+            "executable": "C:/memberkit.exe",
+        },
+    }
+
+
 def test_facade_darwin_does_not_import_the_windows_backend(tmp_path, monkeypatch):
     """Catches macOS dispatch importing its unselected Windows backend."""
     agents = tmp_path / "LaunchAgents"
@@ -207,6 +271,28 @@ def test_facade_darwin_does_not_import_the_windows_backend(tmp_path, monkeypatch
     assert schedule.schedule_status(agents, platform="darwin") == (
         schedule.ScheduleStatus(True, path, "17:30")
     )
+
+
+def test_windows_schedule_imports_no_hub_or_macos_modules():
+    """Catches MemberKit Windows scheduling gaining a hub or macOS dependency."""
+    source = """
+import sys
+import memberkit.schedule
+import memberkit.schedule_windows
+for name in sys.modules:
+    assert name != "teammem" and not name.startswith("teammem.")
+assert "memberkit.schedule_macos" not in sys.modules
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=Path(__file__).parents[3],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_install_defaults_to_1730_and_calls_only_scheduled_run(tmp_path):

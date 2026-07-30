@@ -1,4 +1,6 @@
 import hashlib
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -804,3 +806,675 @@ def test_xml_task_name_must_be_derived_from_the_same_sid():
 
     with pytest.raises(ValueError, match="current SID"):
         windows.build_task_xml(schedule)
+
+
+class FakeTaskRunner:
+    """Byte-only model of the schtasks.exe surface MemberKit owns."""
+
+    def __init__(self, tasks=None):
+        self.tasks = dict(tasks or {})
+        self.calls = []
+        self.failures = {}
+        self.hook = None
+        self.list_bytes = None
+
+    def __call__(self, command, **kwargs):
+        assert kwargs == {"capture_output": True, "text": False}
+        command = list(command)
+        self.calls.append(command)
+        operation = command[1]
+        if operation in self.failures:
+            return subprocess.CompletedProcess(
+                command,
+                self.failures[operation],
+                b"secret stdout",
+                b"secret stderr",
+            )
+        if operation == "/Query" and "/XML" in command:
+            name = command[command.index("/TN") + 1]
+            xml = self.tasks.get(name)
+            result = subprocess.CompletedProcess(
+                command,
+                0 if xml is not None else 1,
+                xml or b"",
+                b"" if xml is not None else "不存在".encode(),
+            )
+        elif operation == "/Query":
+            output = self.list_bytes
+            if output is None:
+                output = b"".join(
+                    f'"{name}","Ready"\r\n'.encode() for name in self.tasks
+                )
+            result = subprocess.CompletedProcess(command, 0, output, b"")
+        elif operation == "/Create":
+            name = command[command.index("/TN") + 1]
+            path = Path(command[command.index("/XML") + 1])
+            self.tasks[name] = path.read_bytes()
+            result = subprocess.CompletedProcess(command, 0, b"", b"")
+        elif operation == "/Delete":
+            name = command[command.index("/TN") + 1]
+            self.tasks.pop(name, None)
+            result = subprocess.CompletedProcess(command, 0, b"", b"")
+        else:
+            raise AssertionError(command)
+        return self.hook(command, result) if self.hook else result
+
+
+class FakeIdentityApi:
+    def current_process_sid(self):
+        return SID
+
+
+class RecordingLock:
+    def __init__(self, events):
+        self.events = events
+
+    def __enter__(self):
+        self.events.append("lock-enter")
+
+    def __exit__(self, *_args):
+        self.events.append("lock-exit")
+
+
+def _lifecycle_args(tmp_path, monkeypatch, runner=None):
+    events = []
+    runner = runner or FakeTaskRunner()
+    monkeypatch.setattr(
+        windows,
+        "provision_windows_private_dir",
+        lambda path, sid, api: events.append(("state", Path(path))) or tmp_path,
+    )
+    return runner, events, FakeIdentityApi()
+
+
+def test_status_absent_is_read_only_and_uses_exact_byte_queries(tmp_path):
+    runner = FakeTaskRunner()
+    state = tmp_path / "missing-state"
+
+    status = windows.schedule_status(
+        api=FakeIdentityApi(),
+        runner=runner,
+        state_dir=state,
+        executable=r"C:\Program Files\TeamMem\memberkit.exe",
+    )
+
+    assert status == windows.ScheduleStatus(False, Path(task_name(SID)), None)
+    assert not state.exists()
+    assert runner.calls == [
+        ["schtasks.exe", "/Query", "/TN", task_name(SID), "/XML"],
+        ["schtasks.exe", "/Query", "/FO", "CSV", "/NH"],
+    ]
+
+
+def test_status_accepts_only_the_exact_managed_definition():
+    schedule = _schedule()
+    runner = FakeTaskRunner({schedule.task_name: windows.build_task_xml(schedule)})
+
+    status = windows.schedule_status(
+        api=FakeIdentityApi(),
+        runner=runner,
+        executable=schedule.executable,
+    )
+
+    assert status == windows.ScheduleStatus(
+        True,
+        Path(schedule.task_name),
+        "17:30",
+    )
+
+
+@pytest.mark.parametrize(
+    "xml",
+    [
+        b"malformed secret",
+        _xml_bytes(_xml_text().replace("TeamMem-MemberKit", "Foreign", 1)),
+        _xml_bytes(
+            _xml_text().replace(
+                "<Arguments>scheduled-run</Arguments>",
+                "<Arguments>other-task</Arguments>",
+                1,
+            )
+        ),
+    ],
+)
+def test_status_reports_foreign_malformed_or_unexpected_action_as_conflict(xml):
+    runner = FakeTaskRunner({task_name(SID): xml})
+
+    with pytest.raises(RuntimeError, match="conflicts") as error:
+        windows.schedule_status(
+            api=FakeIdentityApi(),
+            runner=runner,
+            executable=r"C:\Program Files\TeamMem\memberkit.exe",
+        )
+
+    assert "secret" not in str(error.value)
+
+
+def test_install_never_overwrites_a_conflicting_task(tmp_path, monkeypatch):
+    expected = _schedule()
+    foreign = _xml_bytes(
+        _xml_text().replace(
+            "<Arguments>scheduled-run</Arguments>",
+            "<Arguments>foreign-action</Arguments>",
+            1,
+        )
+    )
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner({expected.task_name: foreign}),
+    )
+
+    with pytest.raises(RuntimeError, match="conflicts"):
+        windows.install_schedule(
+            17,
+            30,
+            expected.executable,
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert not any(call[1] in {"/Create", "/Delete"} for call in runner.calls)
+
+
+def test_status_localized_query_failure_for_present_task_is_unavailable():
+    schedule = _schedule()
+    runner = FakeTaskRunner({schedule.task_name: windows.build_task_xml(schedule)})
+
+    def localized_exact_query_failure(command, result):
+        if command[1] == "/Query" and "/XML" in command:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                b"",
+                "访问被拒绝".encode(),
+            )
+        return result
+
+    runner.hook = localized_exact_query_failure
+
+    with pytest.raises(RuntimeError, match="status is unavailable") as error:
+        windows.schedule_status(
+            api=FakeIdentityApi(),
+            runner=runner,
+            executable=schedule.executable,
+        )
+
+    assert "secret" not in str(error.value)
+
+
+def test_status_treats_malformed_csv_fallback_as_unavailable():
+    runner = FakeTaskRunner()
+    runner.list_bytes = b'"unterminated secret'
+
+    with pytest.raises(RuntimeError, match="status is unavailable") as error:
+        windows.schedule_status(
+            api=FakeIdentityApi(),
+            runner=runner,
+            executable=r"C:\Program Files\TeamMem\memberkit.exe",
+        )
+
+    assert "secret" not in str(error.value)
+
+
+def test_status_exception_chain_never_retains_runner_details():
+    def failing_runner(_command, **_kwargs):
+        raise OSError("secret scheduler failure")
+
+    with pytest.raises(RuntimeError, match="status is unavailable") as error:
+        windows.schedule_status(
+            api=FakeIdentityApi(),
+            runner=failing_runner,
+            executable=r"C:\Program Files\TeamMem\memberkit.exe",
+        )
+
+    seen = set()
+    pending = [error.value]
+    messages = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        messages.append(str(current))
+        pending.extend(
+            related
+            for related in (current.__cause__, current.__context__)
+            if related is not None
+        )
+    assert "secret" not in " ".join(messages)
+
+
+@pytest.mark.parametrize("stream", ("xml", "csv", "stderr"))
+def test_status_rejects_oversized_command_output_before_parsing(stream):
+    schedule = _schedule()
+    runner = FakeTaskRunner()
+    oversized = b"secret-" + b"x" * (1024 * 1024)
+    if stream == "xml":
+        runner.tasks[schedule.task_name] = oversized
+    elif stream == "csv":
+        runner.list_bytes = oversized
+    else:
+        def oversized_stderr(command, result):
+            return subprocess.CompletedProcess(
+                command,
+                result.returncode,
+                result.stdout,
+                oversized,
+            )
+
+        runner.hook = oversized_stderr
+
+    with pytest.raises(RuntimeError, match="unavailable|conflicts") as error:
+        windows.schedule_status(
+            api=FakeIdentityApi(),
+            runner=runner,
+            executable=schedule.executable,
+        )
+
+    assert "secret" not in str(error.value)
+
+
+def test_install_replaces_under_lock_and_removes_private_temp(
+    tmp_path,
+    monkeypatch,
+):
+    previous = _schedule()
+    replacement = _schedule(time="07:05")
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner({previous.task_name: windows.build_task_xml(previous)}),
+    )
+
+    path = windows.install_schedule(
+        7,
+        5,
+        replacement.executable,
+        api=api,
+        runner=runner,
+        state_dir=tmp_path,
+        lock_factory=lambda _path: RecordingLock(events),
+    )
+
+    assert path == Path(replacement.task_name)
+    assert events[0][0] == "state"
+    assert events[1:] == ["lock-enter", "lock-exit"]
+    assert windows.parse_task_xml(
+        runner.tasks[replacement.task_name],
+        replacement,
+    ) == "07:05"
+    create = next(call for call in runner.calls if call[1] == "/Create")
+    assert create[:5] == [
+        "schtasks.exe", "/Create", "/TN", replacement.task_name, "/XML",
+    ]
+    assert create[-1] == "/F"
+    assert Path(create[5]).parent == tmp_path
+    assert list(tmp_path.glob("*.xml")) == []
+
+
+def test_private_state_validation_precedes_lock_or_temp_writes(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+
+    def reject_state(path, sid, api):
+        calls.append(("state", Path(path)))
+        raise ValueError("unsafe state")
+
+    monkeypatch.setattr(windows, "provision_windows_private_dir", reject_state)
+
+    with pytest.raises(ValueError, match="unsafe state"):
+        windows.install_schedule(
+            17,
+            30,
+            r"C:\Program Files\TeamMem\memberkit.exe",
+            api=FakeIdentityApi(),
+            runner=FakeTaskRunner(),
+            state_dir=tmp_path,
+            lock_factory=lambda _path: pytest.fail("lock must not be created"),
+        )
+
+    assert calls == [("state", tmp_path)]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_default_state_provisions_private_parent_before_memberkit_directory(
+    monkeypatch,
+):
+    calls = []
+    local = Path(r"C:\Users\Alex\AppData\Local")
+    parent = local / "TeamMemory"
+    memberkit = parent / "MemberKit"
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setattr(
+        windows,
+        "provision_windows_private_dir",
+        lambda path, sid, api: calls.append(Path(path)) or Path(path),
+    )
+
+    with pytest.raises(RuntimeError, match="previous state restored"):
+        windows.install_schedule(
+            17,
+            30,
+            r"C:\Program Files\TeamMem\memberkit.exe",
+            api=FakeIdentityApi(),
+            runner=FakeTaskRunner(),
+            lock_factory=lambda _path: RecordingLock([]),
+        )
+
+    assert calls == [parent, memberkit]
+
+
+def test_install_rolls_back_exact_prior_xml_after_verification_failure(
+    tmp_path,
+    monkeypatch,
+):
+    previous = _schedule()
+    replacement = _schedule(time="07:05")
+    prior_xml = windows.build_task_xml(previous)
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner({previous.task_name: prior_xml}),
+    )
+    creates = 0
+
+    def corrupt_first_verification(command, result):
+        nonlocal creates
+        if command[1] == "/Create":
+            creates += 1
+        if command[1] == "/Query" and "/XML" in command and creates == 1:
+            return subprocess.CompletedProcess(command, 0, b"secret bad xml", b"")
+        return result
+
+    runner.hook = corrupt_first_verification
+    with pytest.raises(RuntimeError, match="previous state restored") as error:
+        windows.install_schedule(
+            7,
+            5,
+            replacement.executable,
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert runner.tasks[previous.task_name] == prior_xml
+    assert "secret" not in str(error.value)
+
+
+def test_first_install_failure_rolls_back_to_confirmed_absence(
+    tmp_path,
+    monkeypatch,
+):
+    runner, events, api = _lifecycle_args(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        windows,
+        "_write_xml",
+        lambda *_args: (_ for _ in ()).throw(OSError("secret disk failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="previous state restored") as error:
+        windows.install_schedule(
+            17,
+            30,
+            r"C:\Program Files\TeamMem\memberkit.exe",
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert runner.tasks == {}
+    messages = []
+    current = error.value
+    while current is not None:
+        messages.append(str(current))
+        current = current.__cause__ or current.__context__
+    assert "secret" not in " ".join(messages)
+
+
+def test_partial_temp_write_failure_removes_candidate_before_reporting(
+    tmp_path,
+    monkeypatch,
+):
+    runner, events, api = _lifecycle_args(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        windows.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("secret flush")),
+    )
+
+    with pytest.raises(RuntimeError, match="previous state restored") as error:
+        windows.install_schedule(
+            17,
+            30,
+            r"C:\Program Files\TeamMem\memberkit.exe",
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert list(tmp_path.glob("*.xml")) == []
+    assert "secret" not in str(error.value)
+
+
+def test_remove_partial_write_with_persistent_cleanup_reports_rollback_failed(
+    tmp_path,
+    monkeypatch,
+):
+    schedule = _schedule()
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner(
+            {schedule.task_name: windows.build_task_xml(schedule)}
+        ),
+    )
+    monkeypatch.setattr(
+        windows.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("secret flush")),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_remove_temp",
+        lambda _path: (_ for _ in ()).throw(OSError("secret cleanup")),
+    )
+
+    with pytest.raises(RuntimeError, match="rollback failed") as error:
+        windows.remove_schedule(
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            executable=schedule.executable,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert runner.tasks[schedule.task_name] == windows.build_task_xml(schedule)
+    assert "secret" not in str(error.value)
+
+
+def test_remove_is_idempotent_and_restores_after_failed_absence_verification(
+    tmp_path,
+    monkeypatch,
+):
+    schedule = _schedule()
+    prior_xml = windows.build_task_xml(schedule)
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner({schedule.task_name: prior_xml}),
+    )
+    deleted = False
+
+    def fail_absence_verification(command, result):
+        nonlocal deleted
+        if command[1] == "/Delete":
+            deleted = True
+        if (
+            deleted
+            and command[1] == "/Query"
+            and "/XML" in command
+            and schedule.task_name not in runner.tasks
+        ):
+            return subprocess.CompletedProcess(command, 0, prior_xml, b"")
+        return result
+
+    runner.hook = fail_absence_verification
+    with pytest.raises(RuntimeError, match="previous state restored"):
+        windows.remove_schedule(
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            executable=schedule.executable,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+    assert runner.tasks[schedule.task_name] == prior_xml
+
+    empty = FakeTaskRunner()
+    assert windows.remove_schedule(
+        api=api,
+        runner=empty,
+        state_dir=tmp_path,
+        executable=schedule.executable,
+        lock_factory=lambda _path: RecordingLock([]),
+    ) is False
+
+
+def test_remove_deletes_exact_managed_task_and_cleans_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    schedule = _schedule()
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner(
+            {schedule.task_name: windows.build_task_xml(schedule)}
+        ),
+    )
+
+    removed = windows.remove_schedule(
+        api=api,
+        runner=runner,
+        state_dir=tmp_path,
+        executable=schedule.executable,
+        lock_factory=lambda _path: RecordingLock(events),
+    )
+
+    assert removed is True
+    assert runner.tasks == {}
+    assert [
+        "schtasks.exe",
+        "/Delete",
+        "/TN",
+        schedule.task_name,
+        "/F",
+    ] in runner.calls
+    assert list(tmp_path.glob("*.xml")) == []
+
+
+def test_cleanup_retry_keeps_successful_install(
+    tmp_path,
+    monkeypatch,
+):
+    previous = _schedule()
+    replacement = _schedule(time="07:05")
+    prior_xml = windows.build_task_xml(previous)
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner({previous.task_name: prior_xml}),
+    )
+    calls = 0
+
+    def fail_once(path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("secret cleanup failure")
+        path.unlink()
+
+    monkeypatch.setattr(windows, "_remove_temp", fail_once, raising=False)
+    path = windows.install_schedule(
+        7,
+        5,
+        replacement.executable,
+        api=api,
+        runner=runner,
+        state_dir=tmp_path,
+        lock_factory=lambda _path: RecordingLock(events),
+    )
+
+    assert path == Path(replacement.task_name)
+    assert calls == 2
+    assert windows.parse_task_xml(
+        runner.tasks[replacement.task_name],
+        replacement,
+    ) == "07:05"
+    assert runner.tasks[previous.task_name] != prior_xml
+
+
+@pytest.mark.parametrize("operation", ("install", "remove"))
+def test_persistent_cleanup_failure_reports_rollback_failed(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    schedule = _schedule()
+    prior_xml = windows.build_task_xml(schedule)
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner({schedule.task_name: prior_xml}),
+    )
+    monkeypatch.setattr(
+        windows,
+        "_remove_temp",
+        lambda _path: (_ for _ in ()).throw(OSError("secret cleanup")),
+        raising=False,
+    )
+
+    if operation == "install":
+        call = lambda: windows.install_schedule(
+            17,
+            30,
+            schedule.executable,
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+    else:
+        call = lambda: windows.remove_schedule(
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            executable=schedule.executable,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    with pytest.raises(RuntimeError, match="rollback failed") as error:
+        call()
+    assert "secret" not in str(error.value)
+
+
+def test_one_byte_lock_retries_only_lock_contention():
+    calls = []
+    sleeps = []
+
+    def locking(descriptor, mode, length):
+        calls.append((descriptor, mode, length))
+        if len(calls) < 3:
+            raise OSError(13, "contended")
+
+    windows._lock_byte(locking, 42, sleeps.append)
+
+    assert calls == [(42, 2, 1), (42, 2, 1), (42, 2, 1)]
+    assert sleeps == [0.05, 0.05]

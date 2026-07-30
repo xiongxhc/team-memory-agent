@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import csv
+import errno
 import hashlib
 import ntpath
+import os
 import re
+import subprocess
+import tempfile
+import time as clock
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from .schedule import ScheduleStatus
 from .windows_security import (
     _is_absolute_windows_filesystem_path,
     current_user_sid,
+    provision_windows_private_dir,
 )
 
 
@@ -700,3 +708,464 @@ def task_xml_mismatch_categories(
     except _TaskXmlMismatch as mismatch:
         return (mismatch.category,)
     return ()
+
+
+WindowsRunner = Callable[..., subprocess.CompletedProcess[bytes]]
+_CONFLICT = "Windows schedule definition conflicts with an existing task"
+_UNAVAILABLE = "Windows scheduler status is unavailable"
+
+
+def _default_runner(
+    command: list[str],
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(command, **kwargs)
+
+
+def _run(
+    runner: WindowsRunner | None,
+    command: list[str],
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one scheduler command without decoding or exposing its output."""
+    result: subprocess.CompletedProcess[bytes] | None = None
+    try:
+        result = (runner or _default_runner)(
+            command,
+            capture_output=True,
+            text=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if (
+        result is None
+        or not isinstance(result, subprocess.CompletedProcess)
+        or not isinstance(result.stdout, bytes)
+        or not isinstance(result.stderr, bytes)
+        or len(result.stdout) > _MAX_TASK_XML_BYTES
+        or len(result.stderr) > _MAX_TASK_XML_BYTES
+    ):
+        raise RuntimeError(_UNAVAILABLE)
+    return result
+
+
+def _task_name_for(sid: str, override: str | None) -> str:
+    return _valid_task_name(
+        task_name(sid) if override is None else override,
+        sid,
+    )
+
+
+def _csv_contains_task(output: bytes, name: str) -> bool:
+    """Match only the stable CSV task-name column."""
+    found: bool | None = None
+    try:
+        if output.startswith(b"\xef\xbb\xbf"):
+            source = output.decode("utf-8-sig")
+        elif output.startswith((b"\xff\xfe", b"\xfe\xff")):
+            source = output.decode("utf-16")
+        else:
+            source = output.decode("latin-1")
+        found = any(
+            row and row[0] == name
+            for row in csv.reader(source.splitlines(), strict=True)
+        )
+    except (UnicodeError, csv.Error):
+        pass
+    if found is None:
+        raise RuntimeError(_UNAVAILABLE)
+    return found
+
+
+def _query_xml(
+    name: str,
+    runner: WindowsRunner | None,
+) -> bytes | None:
+    result = _run(
+        runner,
+        ["schtasks.exe", "/Query", "/TN", name, "/XML"],
+    )
+    if result.returncode == 0:
+        return result.stdout
+
+    listing = _run(
+        runner,
+        ["schtasks.exe", "/Query", "/FO", "CSV", "/NH"],
+    )
+    if listing.returncode != 0:
+        raise RuntimeError(_UNAVAILABLE)
+    if not _csv_contains_task(listing.stdout, name):
+        return None
+    raise RuntimeError(_UNAVAILABLE)
+
+
+def _xml_time(xml: bytes) -> str:
+    """Extract the expected time before validating the complete definition."""
+    time: str | None = None
+    try:
+        source = _decode_xml(xml)
+        lowered = source.lower()
+        if "<!doctype" in lowered or "<!entity" in lowered:
+            raise ValueError
+        root = ET.fromstring(source)
+        trigger = _only(_only(root, "Triggers"), "CalendarTrigger")
+        boundary = _text(trigger, "StartBoundary")
+        matched = re.fullmatch(
+            r"2000-01-01T((?:[01][0-9]|2[0-3]):[0-5][0-9]):00",
+            boundary,
+        )
+        if matched is None:
+            raise ValueError
+        time = matched.group(1)
+    except (ET.ParseError, UnicodeError, ValueError, TypeError):
+        pass
+    if time is None:
+        raise RuntimeError(_CONFLICT)
+    return time
+
+
+def _valid_snapshot(
+    name: str,
+    sid: str,
+    executable: str,
+    runner: WindowsRunner | None,
+) -> tuple[bytes | None, WindowsSchedule | None]:
+    xml = _query_xml(name, runner)
+    if xml is None:
+        return None, None
+    expected = WindowsSchedule(
+        sid=sid,
+        task_name=name,
+        time=_xml_time(xml),
+        executable=executable,
+    )
+    try:
+        parse_task_xml(xml, expected)
+    except RuntimeError:
+        valid = False
+    else:
+        valid = True
+    if not valid:
+        raise RuntimeError(_CONFLICT)
+    return xml, expected
+
+
+def _state_directory(path: Path | None) -> Path:
+    if path is not None:
+        return Path(path)
+    root = os.environ.get("LOCALAPPDATA")
+    if not root:
+        raise RuntimeError("LOCALAPPDATA is required for Windows scheduling")
+    return Path(root) / "TeamMemory" / "MemberKit"
+
+
+def _provision_state_directory(
+    path: Path | None,
+    sid: str,
+    api: Any,
+) -> Path:
+    directory = _state_directory(path)
+    if path is None:
+        provision_windows_private_dir(directory.parent, sid, api)
+    return provision_windows_private_dir(directory, sid, api)
+
+
+def _lock_byte(
+    locking: Callable[[int, int, int], Any],
+    descriptor: int,
+    sleep: Callable[[float], None],
+) -> None:
+    while True:
+        try:
+            locking(descriptor, 2, 1)  # msvcrt.LK_NBLCK
+            return
+        except OSError as failure:
+            winerror = getattr(failure, "winerror", None)
+            contended = (
+                winerror == 33
+                if winerror is not None
+                else failure.errno in {errno.EACCES, errno.EDEADLK}
+            )
+            if not contended:
+                raise
+            sleep(0.05)
+
+
+@contextmanager
+def _native_lock(path: Path) -> Iterator[None]:
+    if os.name != "nt":
+        raise RuntimeError("Windows scheduling is unavailable on this platform")
+    import msvcrt
+
+    with path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        _lock_byte(msvcrt.locking, handle.fileno(), clock.sleep)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def _with_lock(
+    state_dir: Path,
+    lock_factory: Callable[[Path], Any] | None,
+) -> Any:
+    return (lock_factory or _native_lock)(state_dir / "schedule.lock")
+
+
+def _write_xml(state_dir: Path, xml: bytes) -> Path:
+    path: Path | None = None
+    cleanup_ok: bool | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=".xml",
+            prefix="memberkit-",
+            dir=state_dir,
+            delete=False,
+        ) as handle:
+            path = Path(handle.name)
+            handle.write(xml)
+            handle.flush()
+            os.fsync(handle.fileno())
+            return path
+    except OSError:
+        cleanup_ok = path is None or _cleanup_temp(path)
+    assert cleanup_ok is not None
+    raise _TempWriteFailure(cleanup_ok)
+
+
+def _remove_temp(path: Path) -> None:
+    path.unlink()
+
+
+def _temp_is_gone(path: Path) -> bool:
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _cleanup_temp(path: Path | None) -> bool:
+    if path is None:
+        return True
+    try:
+        _remove_temp(path)
+    except OSError:
+        if _temp_is_gone(path):
+            return True
+        try:
+            _remove_temp(path)
+        except OSError:
+            return False
+    return _temp_is_gone(path)
+
+
+class _TempWriteFailure(OSError):
+    def __init__(self, cleanup_ok: bool) -> None:
+        super().__init__("private scheduler XML write failed")
+        self.cleanup_ok = cleanup_ok
+
+
+def _create(
+    name: str,
+    xml_path: Path,
+    runner: WindowsRunner | None,
+) -> None:
+    result = _run(
+        runner,
+        [
+            "schtasks.exe",
+            "/Create",
+            "/TN",
+            name,
+            "/XML",
+            str(xml_path),
+            "/F",
+        ],
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Windows schedule installation failed")
+
+
+def _delete(name: str, runner: WindowsRunner | None) -> None:
+    result = _run(
+        runner,
+        ["schtasks.exe", "/Delete", "/TN", name, "/F"],
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Windows schedule removal failed")
+
+
+def _verify_installed(
+    name: str,
+    expected: WindowsSchedule,
+    runner: WindowsRunner | None,
+) -> str:
+    xml = _query_xml(name, runner)
+    if xml is None:
+        raise RuntimeError(_CONFLICT)
+    try:
+        return parse_task_xml(xml, expected)
+    except RuntimeError:
+        raise RuntimeError(_CONFLICT) from None
+
+
+def _verify_absent(name: str, runner: WindowsRunner | None) -> None:
+    if _query_xml(name, runner) is not None:
+        raise RuntimeError(_CONFLICT)
+
+
+def _restore(
+    name: str,
+    snapshot: bytes | None,
+    previous: WindowsSchedule | None,
+    xml_path: Path | None,
+    runner: WindowsRunner | None,
+) -> bool:
+    try:
+        if snapshot is None:
+            if _query_xml(name, runner) is not None:
+                _delete(name, runner)
+            _verify_absent(name, runner)
+        else:
+            assert previous is not None
+            if xml_path is None:
+                _verify_installed(name, previous, runner)
+                return True
+            xml_path.write_bytes(snapshot)
+            _create(name, xml_path, runner)
+            _verify_installed(name, previous, runner)
+    except (OSError, RuntimeError):
+        return False
+    return True
+
+
+def _transaction_error(operation: str, restored: bool) -> RuntimeError:
+    if restored:
+        return RuntimeError(
+            f"Windows schedule {operation} failed; previous state restored"
+        )
+    return RuntimeError(
+        f"Windows schedule {operation} failed and rollback failed"
+    )
+
+
+def schedule_status(
+    *,
+    api: Any = None,
+    runner: WindowsRunner | None = None,
+    state_dir: Path | None = None,
+    task_name_override: str | None = None,
+    executable: str,
+) -> ScheduleStatus:
+    """Return status without provisioning scheduler state."""
+    del state_dir
+    sid = current_user_sid(api)
+    name = _task_name_for(sid, task_name_override)
+    xml, installed = _valid_snapshot(name, sid, executable, runner)
+    if xml is None:
+        return ScheduleStatus(False, Path(name), None)
+    assert installed is not None
+    return ScheduleStatus(True, Path(name), installed.time)
+
+
+def install_schedule(
+    hour: int,
+    minute: int,
+    executable: str,
+    *,
+    api: Any = None,
+    runner: WindowsRunner | None = None,
+    state_dir: Path | None = None,
+    task_name_override: str | None = None,
+    lock_factory: Callable[[Path], Any] | None = None,
+) -> Path:
+    """Install a task transactionally and restore exact prior scheduler state."""
+    sid = current_user_sid(api)
+    name = _task_name_for(sid, task_name_override)
+    schedule = WindowsSchedule(
+        sid=sid,
+        task_name=name,
+        time=f"{hour:02d}:{minute:02d}",
+        executable=executable,
+    )
+    definition = build_task_xml(schedule)
+    directory = _provision_state_directory(state_dir, sid, api)
+    with _with_lock(directory, lock_factory):
+        snapshot, previous = _valid_snapshot(name, sid, executable, runner)
+        xml_path: Path | None = None
+        transaction_error: RuntimeError | None = None
+        try:
+            xml_path = _write_xml(directory, definition)
+            _create(name, xml_path, runner)
+            if _verify_installed(name, schedule, runner) != schedule.time:
+                raise RuntimeError(_CONFLICT)
+        except (OSError, RuntimeError) as failure:
+            restored = _restore(name, snapshot, previous, xml_path, runner)
+            cleanup_ok = (
+                failure.cleanup_ok
+                if isinstance(failure, _TempWriteFailure)
+                else _cleanup_temp(xml_path)
+            )
+            restored = cleanup_ok and restored
+            transaction_error = _transaction_error("installation", restored)
+        if transaction_error is not None:
+            raise transaction_error
+
+        assert xml_path is not None
+        if not _cleanup_temp(xml_path):
+            restored = _restore(name, snapshot, previous, xml_path, runner)
+            restored = _cleanup_temp(xml_path) and restored
+            raise _transaction_error("installation", restored) from None
+    return Path(name)
+
+
+def remove_schedule(
+    *,
+    api: Any = None,
+    runner: WindowsRunner | None = None,
+    state_dir: Path | None = None,
+    task_name_override: str | None = None,
+    executable: str,
+    lock_factory: Callable[[Path], Any] | None = None,
+) -> bool:
+    """Remove only a validated task and restore it if verification fails."""
+    sid = current_user_sid(api)
+    name = _task_name_for(sid, task_name_override)
+    directory = _provision_state_directory(state_dir, sid, api)
+    with _with_lock(directory, lock_factory):
+        snapshot, previous = _valid_snapshot(name, sid, executable, runner)
+        if snapshot is None:
+            return False
+        xml_path: Path | None = None
+        transaction_error: RuntimeError | None = None
+        try:
+            xml_path = _write_xml(directory, snapshot)
+            _delete(name, runner)
+            _verify_absent(name, runner)
+        except (OSError, RuntimeError) as failure:
+            restored = _restore(name, snapshot, previous, xml_path, runner)
+            cleanup_ok = (
+                failure.cleanup_ok
+                if isinstance(failure, _TempWriteFailure)
+                else _cleanup_temp(xml_path)
+            )
+            restored = cleanup_ok and restored
+            transaction_error = _transaction_error("removal", restored)
+        if transaction_error is not None:
+            raise transaction_error
+
+        assert xml_path is not None
+        if not _cleanup_temp(xml_path):
+            restored = _restore(name, snapshot, previous, xml_path, runner)
+            restored = _cleanup_temp(xml_path) and restored
+            raise _transaction_error("removal", restored) from None
+    return True
