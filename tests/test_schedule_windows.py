@@ -366,10 +366,53 @@ def _scheduler_normalized_task_xml(schedule):
 
 def test_task_xml_accepts_exact_scheduler_default_normalization():
     schedule = _schedule()
+    xml = _scheduler_normalized_task_xml(schedule)
 
-    assert windows.parse_task_xml(
-        _scheduler_normalized_task_xml(schedule), schedule
-    ) == "18:20"
+    assert windows.parse_task_xml(xml, schedule) == "18:20"
+    assert windows.task_xml_mismatch_categories(xml, schedule) == ()
+
+
+def test_task_xml_mismatch_categories_are_exact_and_value_free():
+    schedule = _schedule()
+    text = windows.build_task_xml(schedule)[2:].decode("utf-16-le")
+    replacements = (
+        (windows.OWNERSHIP_SOURCE, "secret-source"),
+        (f"<UserId>{SID}</UserId>", "<UserId>S-1-5-21-secret</UserId>"),
+        ("2000-01-01T18:20:00", "2000-01-01T19:45:00"),
+        (
+            "<StartWhenAvailable>true</StartWhenAvailable>",
+            "<StartWhenAvailable>false</StartWhenAvailable>",
+        ),
+        (
+            r"<Command>C:\Program Files\TeamMem\teammem.exe</Command>",
+            r"<Command>C:\secret\other.exe</Command>",
+        ),
+        (
+            r'--env-file "C:\Users\Alex\App Data\hub.env" run-daily',
+            r"--env-file C:\secret\hub.env run-daily",
+        ),
+    )
+    for original, tampered in replacements:
+        text = text.replace(original, tampered, 1)
+    xml = b"\xef\xbb\xbf" + text.encode("utf-8")
+
+    categories = windows.task_xml_mismatch_categories(xml, schedule)
+
+    assert categories == ("registration.source",)
+    diagnostic = ",".join(categories)
+    for secret in ("secret-source", "S-1-5-21-secret", "19:45", r"C:\secret"):
+        assert secret not in diagnostic
+
+
+def test_task_xml_mismatch_categories_report_unmatched_structure():
+    schedule = _schedule()
+    text = windows.build_task_xml(schedule)[2:].decode("utf-16-le")
+    text = text.replace(windows.OWNERSHIP_SOURCE, "secret-source", 1)
+    text = text.replace("</Settings>", "<Priority>7</Priority></Settings>", 1)
+
+    assert windows.task_xml_mismatch_categories(
+        b"\xef\xbb\xbf" + text.encode("utf-8"), schedule
+    ) == ("xml.structure",)
 
 
 @pytest.mark.parametrize(
