@@ -138,8 +138,8 @@ def _schedule(**changes):
         "sid": SID,
         "task_name": windows.task_name(SID),
         "time": "18:20",
-        "executable": r"C:\\Program Files\\TeamMem\\teammem.exe",
-        "env_file": r"C:\\Users\\Alex\\App Data\\hub.env",
+        "executable": r"C:\Program Files\TeamMem\teammem.exe",
+        "env_file": r"C:\Users\Alex\App Data\hub.env",
     }
     values.update(changes)
     return windows.WindowsSchedule(**values)
@@ -237,7 +237,7 @@ def test_task_xml_requires_scheduler_namespace_and_exact_attributes():
     "original,tampered",
     [
         (windows.OWNERSHIP_SOURCE, " " + windows.OWNERSHIP_SOURCE + " "),
-        ("C:\\\\Program Files\\\\TeamMem\\\\teammem.exe", " C:\\\\Program Files\\\\TeamMem\\\\teammem.exe "),
+        ("C:\\Program Files\\TeamMem\\teammem.exe", " C:\\Program Files\\TeamMem\\teammem.exe "),
         ("run-daily", "run-daily "),
     ],
 )
@@ -463,8 +463,8 @@ class RecordingLock:
 
 def _lifecycle_schedule(**changes):
     values = {
-        "executable": r"C:\\Program Files\\TeamMem\\teammem.exe",
-        "env_file": r"C:\\Users\\Alex\\AppData\\Roaming\\TeamMemory\\hub.env",
+        "executable": r"C:\Program Files\TeamMem\teammem.exe",
+        "env_file": r"C:\Users\Alex\AppData\Roaming\TeamMemory\hub.env",
     }
     values.update(changes)
     return _schedule(**values)
@@ -603,8 +603,8 @@ def test_windows_remove_is_idempotent_and_restores_after_verification_failure(tm
 def test_windows_status_and_install_reject_managed_task_with_unexpected_action(tmp_path, monkeypatch):
     expected = _lifecycle_schedule()
     attacker = _lifecycle_schedule(
-        executable=r"C:\\Users\\Alex\\attacker.exe",
-        env_file=r"C:\\Users\\Alex\\evil.env",
+        executable=r"C:\Users\Alex\attacker.exe",
+        env_file=r"C:\Users\Alex\evil.env",
     )
     runner = FakeTaskRunner({expected.task_name: windows.build_task_xml(attacker)})
     _value, runner, events, api, cfg = _lifecycle_args(

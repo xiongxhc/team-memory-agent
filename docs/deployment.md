@@ -15,11 +15,11 @@ the operator machine. Only `teammem schedule install` creates a schedule.
 ## Hub installation lifecycle
 
 The connector-capable hub is version 0.2.0 and requires Python 3.11 or newer.
-PyPI currently has 0.1.0, not this connector-capable release.
 
-### Current source-checkout installation
+### Source-checkout installation
 
-The current pre-release path is a reviewed source revision:
+Use a reviewed source revision when the operator wants the configuration
+templates and code in one checkout:
 
 ```bash
 git clone https://github.com/xiongxhc/team-memory-agent.git
@@ -74,17 +74,16 @@ teammem schedule remove
 .venv/bin/pip uninstall teammem
 ```
 
-### Published-package path after release
+### Published-package installation
 
-After a connector-capable release is confirmed on PyPI, install it with an
-explicit minimum version:
+Install the connector-capable release from PyPI with an explicit minimum
+version:
 
 ```bash
 pipx install 'teammem>=0.2.0'
 ```
 
-Do not treat this after-publication command as a claim that 0.2.0 is currently
-available. For a scheduled 0.2.0-or-newer package installation, use this order:
+For a scheduled 0.2.0-or-newer package installation, use this order:
 
 ```bash
 teammem schedule remove
