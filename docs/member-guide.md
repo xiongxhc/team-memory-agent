@@ -337,8 +337,9 @@ Run one draft pass in the terminal to see errors directly:
 memberkit scheduled-run
 ```
 
-Common causes are a missing `~/.claude-mem/claude-mem.db`, invalid JSON in an
-existing draft, missing Git identity, or missing inbox permission. Check
-`schedule.err` under `MEMBERKIT_WORKDIR`; on Windows, remember that `msg.exe`
+Common local causes are a missing or unreadable claude-mem SQLite database,
+missing or invalid `MEMBERKIT_*` configuration such as the timezone, or a
+`MEMBERKIT_WORKDIR` that cannot create or update draft and state files. Check
+`schedule.err` under that work directory; on Windows, remember that `msg.exe`
 notification failure is non-fatal and `memberkit schedule status` is
 authoritative.
