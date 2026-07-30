@@ -1,0 +1,1484 @@
+"""Canonical Windows Task Scheduler definitions for MemberKit."""
+
+from __future__ import annotations
+
+import csv
+import errno
+import hashlib
+import ntpath
+import os
+import re
+import subprocess
+import tempfile
+import time as clock
+import xml.etree.ElementTree as ET
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import date as calendar_date
+from pathlib import Path
+from typing import Any, Callable, Iterator, Sequence
+
+from .schedule import ScheduleStatus
+from .windows_security import (
+    _is_absolute_windows_filesystem_path,
+    current_session_id,
+    current_user_sid,
+    provision_windows_private_dir,
+)
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_NUMERIC_ENTITY = re.compile(r"&#(?:[0-9]+|[xX][0-9a-fA-F]+);")
+_NONCANONICAL_NAMED_ENTITY = re.compile(r"&(?:apos|quot);")
+_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+_TAG = "{" + _NAMESPACE + "}"
+_TASK_NAME = re.compile(r"\\TeamMem-MemberKit-Daily-[0-9a-f]{12}\Z")
+_MAX_TASK_XML_BYTES = 1024 * 1024
+_SCHEDULER_TIMEOUT_SECONDS = 30.0
+_PROCESS_STOP_GRACE_SECONDS = 1.0
+_PROCESS_POLL_INTERVAL_SECONDS = 0.01
+_SPOOL_FACTORY = tempfile.TemporaryFile
+_MANAGED_ERROR = "Windows schedule definition is not managed by TeamMem MemberKit"
+_PRINCIPAL_ID = "Author"
+OWNERSHIP_SOURCE = "TeamMem-MemberKit"
+OWNERSHIP_DESCRIPTION = "TeamMem MemberKit daily draft reminder"
+
+
+@dataclass(frozen=True)
+class WindowsSchedule:
+    sid: str
+    task_name: str
+    time: str
+    executable: str
+
+
+def notify_pending(
+    dates: Sequence[str],
+    *,
+    api: Any = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> str | None:
+    """Notify the current process's Windows session without native output."""
+    validated_dates: list[str] = []
+    for value in dates:
+        if not isinstance(value, str) or _ISO_DATE.fullmatch(value) is None:
+            raise ValueError("pending dates must be ISO YYYY-MM-DD")
+        try:
+            parsed = calendar_date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("pending dates must be ISO YYYY-MM-DD") from exc
+        if parsed.isoformat() != value:
+            raise ValueError("pending dates must be ISO YYYY-MM-DD")
+        validated_dates.append(value)
+
+    if not validated_dates:
+        return None
+
+    try:
+        session_id = current_session_id(api)
+    except ValueError:
+        return "reminder.invalid-target"
+    except Exception:
+        return "reminder.unavailable"
+
+    execute = subprocess.run if runner is None else runner
+    try:
+        result = execute(
+            [
+                "msg.exe",
+                str(session_id),
+                "/TIME:60",
+                "MemberKit drafts ready for review: "
+                + ", ".join(validated_dates),
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return "reminder.missing-executable"
+    except PermissionError:
+        return "reminder.permission-denied"
+    except subprocess.TimeoutExpired:
+        return "reminder.timeout"
+    except OSError:
+        return "reminder.unavailable"
+    except subprocess.SubprocessError:
+        return "reminder.failed"
+
+    if result.returncode != 0:
+        return "reminder.nonzero-exit"
+    return None
+
+
+def task_name(sid: str) -> str:
+    """Create a stable task name for one SID without exposing the SID."""
+    return (
+        "\\TeamMem-MemberKit-Daily-"
+        + hashlib.sha256(sid.encode("utf-8")).hexdigest()[:12]
+    )
+
+
+def _unsafe_argument(value: str) -> bool:
+    return bool(_CONTROL.search(value))
+
+
+def encode_arguments(arguments: Sequence[str]) -> str:
+    """Encode an argument vector using the canonical Windows C runtime grammar."""
+    encoded: list[str] = []
+    for argument in arguments:
+        if not isinstance(argument, str) or _unsafe_argument(argument):
+            raise ValueError("unsafe Windows argument")
+        if argument and not any(
+            character.isspace() or character == '"' for character in argument
+        ):
+            encoded.append(argument)
+            continue
+
+        pieces = ['"']
+        backslashes = 0
+        for character in argument:
+            if character == "\\":
+                backslashes += 1
+                continue
+            if character == '"':
+                pieces.append("\\" * (backslashes * 2 + 1))
+                pieces.append('"')
+            else:
+                pieces.append("\\" * backslashes)
+                pieces.append(character)
+            backslashes = 0
+        pieces.append("\\" * (backslashes * 2))
+        pieces.append('"')
+        encoded.append("".join(pieces))
+    return " ".join(encoded)
+
+
+def decode_arguments(command_line: str) -> list[str]:
+    """Decode the Windows C runtime command-line grammar without a shell."""
+    if not isinstance(command_line, str) or _unsafe_argument(command_line):
+        raise ValueError("unsafe Windows argument")
+
+    values: list[str] = []
+    position = 0
+    length = len(command_line)
+    while position < length:
+        while position < length and command_line[position].isspace():
+            position += 1
+        if position == length:
+            break
+
+        value: list[str] = []
+        quoted = False
+        while position < length:
+            character = command_line[position]
+            if character == "\\":
+                start = position
+                while position < length and command_line[position] == "\\":
+                    position += 1
+                slashes = position - start
+                if position < length and command_line[position] == '"':
+                    value.append("\\" * (slashes // 2))
+                    if slashes % 2:
+                        value.append('"')
+                    else:
+                        quoted = not quoted
+                    position += 1
+                else:
+                    value.append("\\" * slashes)
+                continue
+            if character == '"':
+                quoted = not quoted
+                position += 1
+                continue
+            if character.isspace() and not quoted:
+                break
+            value.append(character)
+            position += 1
+        if quoted:
+            raise ValueError("unsafe Windows argument")
+        values.append("".join(value))
+        while position < length and command_line[position].isspace():
+            position += 1
+    return values
+
+
+def _absolute_windows_path(value: str | Path) -> str:
+    path = str(value)
+    if not _is_absolute_windows_filesystem_path(Path(path)):
+        raise ValueError("Windows schedule executable must be an absolute Windows path")
+    return path
+
+
+def _is_shell(path: str) -> bool:
+    return ntpath.basename(path).lower() in {
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+    }
+
+
+def _canonical_memberkit_executable(value: str | Path) -> str:
+    path = _absolute_windows_path(value)
+    if "/" in path or _CONTROL.search(path) or ntpath.normpath(path) != path:
+        raise ValueError(
+            "Windows schedule executable must use a canonical memberkit.exe path"
+        )
+
+    drive, tail = ntpath.splitdrive(path)
+    components = [component for component in tail.split("\\") if component]
+    if drive.startswith("\\\\"):
+        components = drive[2:].split("\\") + components
+    invalid_characters = set('<>"|?*:')
+    reserved = re.compile(
+        r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?\Z",
+        re.IGNORECASE,
+    )
+    if (
+        not components
+        or any(
+            component in {".", ".."}
+            or component.endswith((".", " "))
+            or any(character in invalid_characters for character in component)
+            or reserved.fullmatch(component)
+            for component in components
+        )
+        or ntpath.basename(path) != "memberkit.exe"
+    ):
+        raise ValueError(
+            "Windows schedule executable must use a canonical memberkit.exe path"
+        )
+    return path
+
+
+def _valid_task_name(value: str, sid: str) -> str:
+    if not _TASK_NAME.fullmatch(value) or value != task_name(sid):
+        raise ValueError("Windows task name must match the current SID")
+    return value
+
+
+def _normal_time(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(?:[01][0-9]|2[0-3]):[0-5][0-9]",
+        value,
+    ):
+        raise ValueError("schedule time must be HH:MM")
+    return value
+
+
+def _add(
+    parent: ET.Element,
+    name: str,
+    value: str | None = None,
+) -> ET.Element:
+    element = ET.SubElement(parent, _TAG + name)
+    if value is not None:
+        element.text = value
+    return element
+
+
+def build_task_xml(schedule: WindowsSchedule) -> bytes:
+    """Build one deterministic UTF-16LE Task Scheduler definition."""
+    executable = _absolute_windows_path(schedule.executable)
+    if _is_shell(executable):
+        raise ValueError("Windows schedule executable must not be a shell")
+    executable = _canonical_memberkit_executable(executable)
+    name = _valid_task_name(schedule.task_name, schedule.sid)
+    time = _normal_time(schedule.time)
+    arguments = encode_arguments(["scheduled-run"])
+
+    ET.register_namespace("", _NAMESPACE)
+    root = ET.Element(_TAG + "Task", {"version": "1.4"})
+    registration = _add(root, "RegistrationInfo")
+    _add(registration, "Source", OWNERSHIP_SOURCE)
+    _add(registration, "URI", name)
+    _add(registration, "Description", OWNERSHIP_DESCRIPTION)
+
+    principals = _add(root, "Principals")
+    principal = ET.SubElement(
+        principals,
+        _TAG + "Principal",
+        {"id": _PRINCIPAL_ID},
+    )
+    _add(principal, "UserId", schedule.sid)
+    _add(principal, "LogonType", "InteractiveToken")
+    _add(principal, "RunLevel", "LeastPrivilege")
+
+    triggers = _add(root, "Triggers")
+    trigger = _add(triggers, "CalendarTrigger")
+    _add(trigger, "StartBoundary", f"2000-01-01T{time}:00")
+    daily = _add(trigger, "ScheduleByDay")
+    _add(daily, "DaysInterval", "1")
+    _add(trigger, "Enabled", "true")
+
+    settings = _add(root, "Settings")
+    for key, value in (
+        ("MultipleInstancesPolicy", "IgnoreNew"),
+        ("Enabled", "true"),
+        ("StartWhenAvailable", "true"),
+        ("DisallowStartIfOnBatteries", "false"),
+        ("StopIfGoingOnBatteries", "false"),
+        ("RunOnlyIfNetworkAvailable", "false"),
+        ("WakeToRun", "false"),
+        ("ExecutionTimeLimit", "PT4H"),
+        ("UseUnifiedSchedulingEngine", "true"),
+    ):
+        _add(settings, key, value)
+
+    actions = ET.SubElement(
+        root,
+        _TAG + "Actions",
+        {"Context": _PRINCIPAL_ID},
+    )
+    action = _add(actions, "Exec")
+    _add(action, "Command", executable)
+    _add(action, "Arguments", arguments)
+
+    declaration = (
+        '<?xml version="1.0" encoding="UTF-16"?>\r\n'.encode("utf-16-le")
+    )
+    document = ET.tostring(root, encoding="unicode").encode("utf-16-le")
+    return b"\xff\xfe" + declaration + document
+
+
+def _xml_transport(xml: bytes) -> tuple[str, int]:
+    if xml.startswith(b"\x00\x00\xfe\xff") or xml.startswith(b"\xff\xfe\x00\x00"):
+        raise ValueError(_MANAGED_ERROR)
+    if xml.startswith(b"\xef\xbb\xbf"):
+        return "utf-8", 3
+    if xml.startswith(b"\xff\xfe"):
+        return "utf-16-le", 2
+    if xml.startswith(b"\xfe\xff"):
+        return "utf-16-be", 2
+
+    probe = xml[:128]
+    while probe.startswith((b" \x00", b"\t\x00", b"\r\x00", b"\n\x00")):
+        probe = probe[2:]
+    if probe.startswith(b"<\x00"):
+        return "utf-16-le", 0
+
+    probe = xml[:128]
+    while probe.startswith((b"\x00 ", b"\x00\t", b"\x00\r", b"\x00\n")):
+        probe = probe[2:]
+    if probe.startswith(b"\x00<"):
+        return "utf-16-be", 0
+
+    if xml[:128].lstrip(b" \t\r\n").startswith(b"<"):
+        return "utf-8", 0
+    raise ValueError(_MANAGED_ERROR)
+
+
+def _decode_xml(xml: bytes) -> str:
+    if (
+        not isinstance(xml, bytes)
+        or not xml
+        or len(xml) > _MAX_TASK_XML_BYTES
+    ):
+        raise ValueError(_MANAGED_ERROR)
+    encoding, offset = _xml_transport(xml)
+    return xml[offset:].decode(encoding, errors="strict")
+
+
+def _local(tag: str) -> str:
+    if not isinstance(tag, str) or not tag.startswith(_TAG):
+        raise ValueError(_MANAGED_ERROR)
+    return tag[len(_TAG):]
+
+
+def _children(parent: ET.Element, name: str) -> list[ET.Element]:
+    return [child for child in parent if _local(child.tag) == name]
+
+
+def _child_names(parent: ET.Element) -> list[str]:
+    return [_local(child.tag) for child in parent]
+
+
+def _only(parent: ET.Element, name: str) -> ET.Element:
+    values = _children(parent, name)
+    if len(values) != 1:
+        raise ValueError(_MANAGED_ERROR)
+    return values[0]
+
+
+def _exact_children(parent: ET.Element, names: Sequence[str]) -> None:
+    if _child_names(parent) != list(names):
+        raise ValueError(_MANAGED_ERROR)
+
+
+def _required_optional_children(
+    parent: ET.Element,
+    required: Sequence[str],
+    optional: Sequence[str],
+) -> None:
+    names = _child_names(parent)
+    allowed = tuple(required) + tuple(optional)
+    if (
+        any(name not in allowed for name in names)
+        or any(names.count(name) != 1 for name in required)
+        or any(names.count(name) > 1 for name in optional)
+    ):
+        raise ValueError(_MANAGED_ERROR)
+
+
+def _text(parent: ET.Element, name: str) -> str:
+    value = _only(parent, name).text
+    if value is None:
+        raise ValueError(_MANAGED_ERROR)
+    return value
+
+
+class _TaskXmlMismatch(ValueError):
+    def __init__(self, category: str) -> None:
+        super().__init__(_MANAGED_ERROR)
+        self.category = category
+
+
+def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
+    try:
+        source = _decode_xml(xml)
+        lowered = source.lower()
+        after_declaration = source.lstrip()
+        if after_declaration.startswith("<?xml "):
+            declaration_end = after_declaration.find("?>")
+            if declaration_end < 0:
+                raise ValueError(_MANAGED_ERROR)
+            after_declaration = after_declaration[declaration_end + 2:]
+        if (
+            "<!doctype" in lowered
+            or "<!entity" in lowered
+            or "<![" in source
+            or "<!--" in source
+            or "<?" in after_declaration
+            or _NUMERIC_ENTITY.search(source)
+            or _NONCANONICAL_NAMED_ENTITY.search(source)
+        ):
+            raise ValueError(_MANAGED_ERROR)
+        parser = ET.XMLParser(
+            target=ET.TreeBuilder(insert_comments=True, insert_pis=True)
+        )
+        root = ET.fromstring(source, parser=parser)
+        if root.tag != _TAG + "Task" or root.attrib != {"version": "1.4"}:
+            raise ValueError(_MANAGED_ERROR)
+        for element in root.iter():
+            _local(element.tag)
+        _valid_task_name(expected.task_name, expected.sid)
+        if _child_names(root) not in (
+            [
+                "RegistrationInfo",
+                "Principals",
+                "Triggers",
+                "Settings",
+                "Actions",
+            ],
+            [
+                "RegistrationInfo",
+                "Principals",
+                "Settings",
+                "Triggers",
+                "Actions",
+            ],
+        ):
+            raise ValueError(_MANAGED_ERROR)
+
+        registration = _only(root, "RegistrationInfo")
+        _required_optional_children(
+            registration,
+            ["Source", "URI", "Description"],
+            ["Date", "Author"],
+        )
+        registration_names = _child_names(registration)
+        metadata_end = 0
+        for metadata_name in ("Date", "Author"):
+            if (
+                metadata_end < len(registration_names)
+                and registration_names[metadata_end] == metadata_name
+            ):
+                metadata_end += 1
+        if registration_names[metadata_end:] not in (
+            ["Source", "URI", "Description"],
+            ["Source", "Description", "URI"],
+        ):
+            raise ValueError(_MANAGED_ERROR)
+        for name in ("Date", "Author"):
+            for element in _children(registration, name):
+                if (
+                    element.text is None
+                    or element.text != element.text.strip()
+                    or list(element)
+                ):
+                    raise ValueError(_MANAGED_ERROR)
+
+        principals = _only(root, "Principals")
+        _exact_children(principals, ["Principal"])
+        principal = _only(principals, "Principal")
+        _required_optional_children(
+            principal,
+            ["UserId", "LogonType"],
+            ["RunLevel"],
+        )
+        if _child_names(principal) not in (
+            ["UserId", "LogonType"],
+            ["UserId", "LogonType", "RunLevel"],
+        ):
+            raise ValueError(_MANAGED_ERROR)
+
+        triggers = _only(root, "Triggers")
+        _exact_children(triggers, ["CalendarTrigger"])
+        trigger = _only(triggers, "CalendarTrigger")
+        _required_optional_children(
+            trigger,
+            ["StartBoundary", "ScheduleByDay"],
+            ["Enabled"],
+        )
+        if _child_names(trigger) not in (
+            ["StartBoundary", "ScheduleByDay"],
+            ["StartBoundary", "ScheduleByDay", "Enabled"],
+        ):
+            raise ValueError(_MANAGED_ERROR)
+        _exact_children(_only(trigger, "ScheduleByDay"), ["DaysInterval"])
+
+        settings = _only(root, "Settings")
+        required_settings = (
+            (
+                "MultipleInstancesPolicy",
+                "IgnoreNew",
+                "settings.multiple-instances-policy",
+            ),
+            ("StartWhenAvailable", "true", "settings.start-when-available"),
+            (
+                "DisallowStartIfOnBatteries",
+                "false",
+                "settings.disallow-start-on-batteries",
+            ),
+            (
+                "StopIfGoingOnBatteries",
+                "false",
+                "settings.stop-on-batteries",
+            ),
+            (
+                "ExecutionTimeLimit",
+                "PT4H",
+                "settings.execution-time-limit",
+            ),
+            (
+                "UseUnifiedSchedulingEngine",
+                "true",
+                "settings.unified-engine",
+            ),
+        )
+        default_settings = (
+            ("Enabled", "true", "settings.enabled"),
+            (
+                "RunOnlyIfNetworkAvailable",
+                "false",
+                "settings.network-required",
+            ),
+            ("WakeToRun", "false", "settings.wake-to-run"),
+        )
+        _required_optional_children(
+            settings,
+            [key for key, _value, _category in required_settings],
+            [key for key, _value, _category in default_settings]
+            + ["IdleSettings"],
+        )
+        if _child_names(settings) not in (
+            [
+                "MultipleInstancesPolicy",
+                "Enabled",
+                "StartWhenAvailable",
+                "DisallowStartIfOnBatteries",
+                "StopIfGoingOnBatteries",
+                "RunOnlyIfNetworkAvailable",
+                "WakeToRun",
+                "ExecutionTimeLimit",
+                "UseUnifiedSchedulingEngine",
+            ],
+            [
+                "DisallowStartIfOnBatteries",
+                "StopIfGoingOnBatteries",
+                "ExecutionTimeLimit",
+                "MultipleInstancesPolicy",
+                "StartWhenAvailable",
+                "IdleSettings",
+                "UseUnifiedSchedulingEngine",
+            ],
+        ):
+            raise ValueError(_MANAGED_ERROR)
+        idle = None
+        if _children(settings, "IdleSettings"):
+            idle = _only(settings, "IdleSettings")
+            _exact_children(idle, ["StopOnIdleEnd", "RestartOnIdle"])
+
+        actions = _only(root, "Actions")
+        _exact_children(actions, ["Exec"])
+        action = _only(actions, "Exec")
+        _exact_children(action, ["Command", "Arguments"])
+
+        containers = {
+            root,
+            registration,
+            principals,
+            principal,
+            triggers,
+            trigger,
+            _only(trigger, "ScheduleByDay"),
+            settings,
+            actions,
+            action,
+        }
+        if idle is not None:
+            containers.add(idle)
+        for element in root.iter():
+            if element in containers:
+                if element.text is not None and element.text.strip():
+                    raise ValueError(_MANAGED_ERROR)
+            elif list(element):
+                raise ValueError(_MANAGED_ERROR)
+            if element.tail is not None and element.tail.strip():
+                raise ValueError(_MANAGED_ERROR)
+            if element is root:
+                continue
+            if element is principal:
+                if set(element.attrib) != {"id"}:
+                    raise ValueError(_MANAGED_ERROR)
+            elif element is actions:
+                if set(element.attrib) != {"Context"}:
+                    raise ValueError(_MANAGED_ERROR)
+            elif element.attrib:
+                raise ValueError(_MANAGED_ERROR)
+    except (ET.ParseError, UnicodeError, ValueError, TypeError):
+        raise _TaskXmlMismatch("xml.structure") from None
+
+    def check(category: str, comparison: Callable[[], bool]) -> None:
+        try:
+            matches = comparison()
+        except (UnicodeError, ValueError, TypeError):
+            matches = False
+        if not matches:
+            raise _TaskXmlMismatch(category)
+
+    def text_or_default(
+        parent: ET.Element,
+        name: str,
+        default: str,
+    ) -> str:
+        return _text(parent, name) if _children(parent, name) else default
+
+    check(
+        "registration.source",
+        lambda: _text(registration, "Source") == OWNERSHIP_SOURCE,
+    )
+    check(
+        "registration.uri",
+        lambda: _text(registration, "URI") == expected.task_name,
+    )
+    check(
+        "registration.description",
+        lambda: _text(registration, "Description") == OWNERSHIP_DESCRIPTION,
+    )
+    check("principal.sid", lambda: _text(principal, "UserId") == expected.sid)
+    check(
+        "principal.logon-type",
+        lambda: _text(principal, "LogonType") == "InteractiveToken",
+    )
+    check(
+        "principal.run-level",
+        lambda: text_or_default(
+            principal,
+            "RunLevel",
+            "LeastPrivilege",
+        )
+        == "LeastPrivilege",
+    )
+    check(
+        "principal.binding",
+        lambda: principal.attrib["id"] == _PRINCIPAL_ID,
+    )
+
+    try:
+        time = _normal_time(expected.time)
+    except (ValueError, TypeError):
+        raise _TaskXmlMismatch("trigger.start-boundary") from None
+    check(
+        "trigger.start-boundary",
+        lambda: _text(trigger, "StartBoundary")
+        == f"2000-01-01T{time}:00",
+    )
+    check(
+        "trigger.daily-interval",
+        lambda: _text(
+            _only(trigger, "ScheduleByDay"),
+            "DaysInterval",
+        )
+        == "1",
+    )
+    check(
+        "trigger.enabled",
+        lambda: text_or_default(trigger, "Enabled", "true") == "true",
+    )
+
+    for key, value, category in required_settings:
+        check(
+            category,
+            lambda key=key, value=value: _text(settings, key) == value,
+        )
+    for key, value, category in default_settings:
+        check(
+            category,
+            lambda key=key, value=value: text_or_default(
+                settings,
+                key,
+                value,
+            )
+            == value,
+        )
+    if idle is not None:
+        check(
+            "settings.idle",
+            lambda: _text(idle, "StopOnIdleEnd") == "true"
+            and _text(idle, "RestartOnIdle") == "false",
+        )
+
+    check(
+        "action.binding",
+        lambda: actions.attrib["Context"] == _PRINCIPAL_ID,
+    )
+    check(
+        "action.command",
+        lambda: _text(action, "Command")
+        == _canonical_memberkit_executable(expected.executable)
+        and not _is_shell(_text(action, "Command")),
+    )
+
+    def argv_matches() -> bool:
+        arguments = _text(action, "Arguments")
+        expected_arguments = ["scheduled-run"]
+        return (
+            decode_arguments(arguments) == expected_arguments
+            and encode_arguments(expected_arguments) == arguments
+        )
+
+    check("action.argv", argv_matches)
+    return time
+
+
+def parse_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
+    """Validate a managed definition without disclosing observed values."""
+    try:
+        return _validate_task_xml(xml, expected)
+    except _TaskXmlMismatch:
+        raise RuntimeError(_MANAGED_ERROR) from None
+
+
+def task_xml_mismatch_categories(
+    xml: bytes,
+    expected: WindowsSchedule,
+) -> tuple[str, ...]:
+    """Return one fixed mismatch category and never observed task values."""
+    try:
+        _validate_task_xml(xml, expected)
+    except _TaskXmlMismatch as mismatch:
+        return (mismatch.category,)
+    return ()
+
+
+WindowsRunner = Callable[..., subprocess.CompletedProcess[bytes]]
+_CONFLICT = "Windows schedule definition conflicts with an existing task"
+_UNAVAILABLE = "Windows scheduler status is unavailable"
+_RECOVERY_RESTORED = "restored"
+_RECOVERY_CONFLICT = "conflict"
+_RECOVERY_FAILED = "failed"
+
+
+class _SchedulerProcessError(subprocess.SubprocessError):
+    pass
+
+
+def _stop_and_reap(process: subprocess.Popen[bytes]) -> bool:
+    try:
+        returncode = process.poll()
+    except (OSError, subprocess.SubprocessError):
+        returncode = None
+    if returncode is not None:
+        return True
+
+    try:
+        process.terminate()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    else:
+        return True
+
+    try:
+        process.kill()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def _spool_size(spool: Any) -> int:
+    return os.fstat(spool.fileno()).st_size
+
+
+def _read_spool(spool: Any, deadline: float) -> bytes:
+    if clock.monotonic() > deadline or _spool_size(spool) > _MAX_TASK_XML_BYTES:
+        raise _SchedulerProcessError()
+    spool.seek(0)
+    output = spool.read(_MAX_TASK_XML_BYTES + 1)
+    if (
+        clock.monotonic() > deadline
+        or not isinstance(output, bytes)
+        or len(output) > _MAX_TASK_XML_BYTES
+    ):
+        raise _SchedulerProcessError()
+    return output
+
+
+def _default_runner(
+    command: list[str],
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[bytes]:
+    if kwargs != {"capture_output": True, "text": False}:
+        raise _SchedulerProcessError()
+
+    spools = []
+    process: subprocess.Popen[bytes] | None = None
+    result: subprocess.CompletedProcess[bytes] | None = None
+    failed = False
+    cleanup_failed = False
+    stopped = True
+    try:
+        stdout_spool = _SPOOL_FACTORY(mode="w+b")
+        spools.append(stdout_spool)
+        stderr_spool = _SPOOL_FACTORY(mode="w+b")
+        spools.append(stderr_spool)
+        deadline = clock.monotonic() + _SCHEDULER_TIMEOUT_SECONDS
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_spool,
+            stderr=stderr_spool,
+            text=False,
+        )
+        while process.poll() is None:
+            if (
+                clock.monotonic() >= deadline
+                or _spool_size(stdout_spool) > _MAX_TASK_XML_BYTES
+                or _spool_size(stderr_spool) > _MAX_TASK_XML_BYTES
+            ):
+                failed = True
+                stopped = _stop_and_reap(process)
+                break
+            remaining = deadline - clock.monotonic()
+            clock.sleep(min(_PROCESS_POLL_INTERVAL_SECONDS, remaining))
+
+        if not failed:
+            if clock.monotonic() > deadline:
+                failed = True
+            else:
+                stdout = _read_spool(stdout_spool, deadline)
+                stderr = _read_spool(stderr_spool, deadline)
+                result = subprocess.CompletedProcess(
+                    command,
+                    process.returncode,
+                    stdout,
+                    stderr,
+                )
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        failed = True
+    finally:
+        try:
+            if process is not None:
+                try:
+                    stopped = _stop_and_reap(process) and stopped
+                except Exception:
+                    stopped = False
+        finally:
+            for spool in spools:
+                try:
+                    spool.close()
+                except Exception:
+                    cleanup_failed = True
+
+    if failed or cleanup_failed or not stopped or result is None:
+        raise _SchedulerProcessError()
+    return result
+
+
+def _run(
+    runner: WindowsRunner | None,
+    command: list[str],
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one scheduler command without decoding or exposing its output."""
+    result: subprocess.CompletedProcess[bytes] | None = None
+    try:
+        result = (runner or _default_runner)(
+            command,
+            capture_output=True,
+            text=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if (
+        result is None
+        or not isinstance(result, subprocess.CompletedProcess)
+        or not isinstance(result.stdout, bytes)
+        or not isinstance(result.stderr, bytes)
+        or len(result.stdout) > _MAX_TASK_XML_BYTES
+        or len(result.stderr) > _MAX_TASK_XML_BYTES
+    ):
+        raise RuntimeError(_UNAVAILABLE)
+    return result
+
+
+def _task_name_for(sid: str, override: str | None) -> str:
+    return _valid_task_name(
+        task_name(sid) if override is None else override,
+        sid,
+    )
+
+
+def _csv_contains_task(output: bytes, name: str) -> bool:
+    """Match only the stable CSV task-name column."""
+    found: bool | None = None
+    try:
+        if output.startswith(b"\xef\xbb\xbf"):
+            source = output.decode("utf-8-sig")
+        elif output.startswith((b"\xff\xfe", b"\xfe\xff")):
+            source = output.decode("utf-16")
+        else:
+            source = output.decode("latin-1")
+        found = any(
+            row and row[0] == name
+            for row in csv.reader(source.splitlines(), strict=True)
+        )
+    except (UnicodeError, csv.Error):
+        pass
+    if found is None:
+        raise RuntimeError(_UNAVAILABLE)
+    return found
+
+
+def _query_xml(
+    name: str,
+    runner: WindowsRunner | None,
+) -> bytes | None:
+    result = _run(
+        runner,
+        ["schtasks.exe", "/Query", "/TN", name, "/XML"],
+    )
+    if result.returncode == 0:
+        return result.stdout
+
+    listing = _run(
+        runner,
+        ["schtasks.exe", "/Query", "/FO", "CSV", "/NH"],
+    )
+    if listing.returncode != 0:
+        raise RuntimeError(_UNAVAILABLE)
+    if not _csv_contains_task(listing.stdout, name):
+        return None
+    raise RuntimeError(_UNAVAILABLE)
+
+
+def _xml_time(xml: bytes) -> str:
+    """Extract the expected time before validating the complete definition."""
+    time: str | None = None
+    try:
+        source = _decode_xml(xml)
+        lowered = source.lower()
+        if "<!doctype" in lowered or "<!entity" in lowered:
+            raise ValueError
+        root = ET.fromstring(source)
+        trigger = _only(_only(root, "Triggers"), "CalendarTrigger")
+        boundary = _text(trigger, "StartBoundary")
+        matched = re.fullmatch(
+            r"2000-01-01T((?:[01][0-9]|2[0-3]):[0-5][0-9]):00",
+            boundary,
+        )
+        if matched is None:
+            raise ValueError
+        time = matched.group(1)
+    except (ET.ParseError, UnicodeError, ValueError, TypeError):
+        pass
+    if time is None:
+        raise RuntimeError(_CONFLICT)
+    return time
+
+
+def _valid_snapshot(
+    name: str,
+    sid: str,
+    executable: str,
+    runner: WindowsRunner | None,
+) -> tuple[bytes | None, WindowsSchedule | None]:
+    xml = _query_xml(name, runner)
+    if xml is None:
+        return None, None
+    expected = WindowsSchedule(
+        sid=sid,
+        task_name=name,
+        time=_xml_time(xml),
+        executable=executable,
+    )
+    try:
+        parse_task_xml(xml, expected)
+    except RuntimeError:
+        valid = False
+    else:
+        valid = True
+    if not valid:
+        raise RuntimeError(_CONFLICT)
+    return xml, expected
+
+
+def _state_directory(path: Path | None) -> Path:
+    if path is not None:
+        return Path(path)
+    root = os.environ.get("LOCALAPPDATA")
+    if not root:
+        raise RuntimeError("LOCALAPPDATA is required for Windows scheduling")
+    return Path(root) / "TeamMemory" / "MemberKit"
+
+
+def _provision_state_directory(
+    path: Path | None,
+    sid: str,
+    api: Any,
+) -> Path:
+    directory = _state_directory(path)
+    if path is None:
+        provision_windows_private_dir(directory.parent, sid, api)
+    return provision_windows_private_dir(directory, sid, api)
+
+
+def _lock_byte(
+    locking: Callable[[int, int, int], Any],
+    descriptor: int,
+    sleep: Callable[[float], None],
+) -> None:
+    while True:
+        try:
+            locking(descriptor, 2, 1)  # msvcrt.LK_NBLCK
+            return
+        except OSError as failure:
+            winerror = getattr(failure, "winerror", None)
+            contended = (
+                winerror == 33
+                if winerror is not None
+                else failure.errno in {errno.EACCES, errno.EDEADLK}
+            )
+            if not contended:
+                raise
+            sleep(0.05)
+
+
+@contextmanager
+def _native_lock(path: Path) -> Iterator[None]:
+    """Serialize cooperating MemberKit commands, not Task Scheduler clients."""
+    if os.name != "nt":
+        raise RuntimeError("Windows scheduling is unavailable on this platform")
+    import msvcrt
+
+    with path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        _lock_byte(msvcrt.locking, handle.fileno(), clock.sleep)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def _with_lock(
+    state_dir: Path,
+    lock_factory: Callable[[Path], Any] | None,
+) -> Any:
+    return (lock_factory or _native_lock)(state_dir / "schedule.lock")
+
+
+def _write_xml(state_dir: Path, xml: bytes) -> Path:
+    path: Path | None = None
+    cleanup_ok: bool | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=".xml",
+            prefix="memberkit-",
+            dir=state_dir,
+            delete=False,
+        ) as handle:
+            path = Path(handle.name)
+            handle.write(xml)
+            handle.flush()
+            os.fsync(handle.fileno())
+            return path
+    except OSError:
+        cleanup_ok = path is None or _cleanup_temp(path)
+    assert cleanup_ok is not None
+    raise _TempWriteFailure(cleanup_ok)
+
+
+def _remove_temp(path: Path) -> None:
+    path.unlink()
+
+
+def _temp_is_gone(path: Path) -> bool:
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _cleanup_temp(path: Path | None) -> bool:
+    if path is None:
+        return True
+    try:
+        _remove_temp(path)
+    except OSError:
+        if _temp_is_gone(path):
+            return True
+        try:
+            _remove_temp(path)
+        except OSError:
+            return False
+    return _temp_is_gone(path)
+
+
+class _TempWriteFailure(OSError):
+    def __init__(self, cleanup_ok: bool) -> None:
+        super().__init__("private scheduler XML write failed")
+        self.cleanup_ok = cleanup_ok
+
+
+class _CreateRejected(RuntimeError):
+    pass
+
+
+def _create(
+    name: str,
+    xml_path: Path,
+    runner: WindowsRunner | None,
+    *,
+    replace: bool,
+) -> None:
+    command = [
+        "schtasks.exe",
+        "/Create",
+        "/TN",
+        name,
+        "/XML",
+        str(xml_path),
+    ]
+    if replace:
+        command.append("/F")
+    result = _run(
+        runner,
+        command,
+    )
+    if result.returncode != 0:
+        raise _CreateRejected("Windows schedule installation failed")
+
+
+def _delete(name: str, runner: WindowsRunner | None) -> None:
+    result = _run(
+        runner,
+        ["schtasks.exe", "/Delete", "/TN", name, "/F"],
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Windows schedule removal failed")
+
+
+def _verify_installed(
+    name: str,
+    expected: WindowsSchedule,
+    runner: WindowsRunner | None,
+) -> str:
+    xml = _query_xml(name, runner)
+    if xml is None:
+        raise RuntimeError(_CONFLICT)
+    try:
+        return parse_task_xml(xml, expected)
+    except RuntimeError:
+        raise RuntimeError(_CONFLICT) from None
+
+
+def _verify_absent(name: str, runner: WindowsRunner | None) -> None:
+    if _query_xml(name, runner) is not None:
+        raise RuntimeError(_CONFLICT)
+
+
+def _require_exact_snapshot(
+    name: str,
+    snapshot: bytes,
+    runner: WindowsRunner | None,
+) -> None:
+    if _query_xml(name, runner) != snapshot:
+        raise RuntimeError(_CONFLICT)
+
+
+def _matches_schedule(xml: bytes, expected: WindowsSchedule) -> bool:
+    try:
+        parse_task_xml(xml, expected)
+    except RuntimeError:
+        return False
+    return True
+
+
+def _restore(
+    name: str,
+    snapshot: bytes | None,
+    previous: WindowsSchedule | None,
+    candidate: WindowsSchedule | None,
+    xml_path: Path | None,
+    runner: WindowsRunner | None,
+) -> str:
+    try:
+        current = _query_xml(name, runner)
+        if snapshot is None:
+            if current is None:
+                return _RECOVERY_RESTORED
+            if candidate is None:
+                return _RECOVERY_CONFLICT
+            if not _matches_schedule(current, candidate):
+                return _RECOVERY_CONFLICT
+            try:
+                _delete(name, runner)
+            except RuntimeError:
+                observed = _query_xml(name, runner)
+                if observed is None:
+                    return _RECOVERY_RESTORED
+                if _matches_schedule(observed, candidate):
+                    return _RECOVERY_FAILED
+                return _RECOVERY_CONFLICT
+            observed = _query_xml(name, runner)
+            if observed is None:
+                return _RECOVERY_RESTORED
+            if not _matches_schedule(observed, candidate):
+                return _RECOVERY_CONFLICT
+            return _RECOVERY_FAILED
+        else:
+            assert previous is not None
+            if current is not None:
+                if current == snapshot:
+                    return _RECOVERY_RESTORED
+                if candidate is None:
+                    return _RECOVERY_CONFLICT
+                if not _matches_schedule(current, candidate):
+                    return _RECOVERY_CONFLICT
+            if xml_path is None:
+                return _RECOVERY_FAILED
+            xml_path.write_bytes(snapshot)
+            try:
+                _create(
+                    name,
+                    xml_path,
+                    runner,
+                    replace=current is not None,
+                )
+            except RuntimeError:
+                observed = _query_xml(name, runner)
+                if observed is None:
+                    return _RECOVERY_FAILED
+                if observed == snapshot or _matches_schedule(observed, previous):
+                    return _RECOVERY_RESTORED
+                if candidate is not None and _matches_schedule(
+                    observed,
+                    candidate,
+                ):
+                    return _RECOVERY_FAILED
+                return _RECOVERY_CONFLICT
+            _verify_installed(name, previous, runner)
+    except (OSError, RuntimeError):
+        return _RECOVERY_FAILED
+    return _RECOVERY_RESTORED
+
+
+def _transaction_error(operation: str, recovery: str) -> RuntimeError:
+    if recovery == _RECOVERY_RESTORED:
+        return RuntimeError(
+            f"Windows schedule {operation} failed; previous state restored"
+        )
+    if recovery == _RECOVERY_CONFLICT:
+        return RuntimeError(
+            f"Windows schedule {operation} failed; conflicting state preserved"
+        )
+    return RuntimeError(
+        f"Windows schedule {operation} failed and rollback failed"
+    )
+
+
+def schedule_status(
+    *,
+    api: Any = None,
+    runner: WindowsRunner | None = None,
+    state_dir: Path | None = None,
+    task_name_override: str | None = None,
+    executable: str,
+) -> ScheduleStatus:
+    """Return status without provisioning scheduler state."""
+    del state_dir
+    sid = current_user_sid(api)
+    name = _task_name_for(sid, task_name_override)
+    xml, installed = _valid_snapshot(name, sid, executable, runner)
+    if xml is None:
+        return ScheduleStatus(False, Path(name), None)
+    assert installed is not None
+    return ScheduleStatus(True, Path(name), installed.time)
+
+
+def install_schedule(
+    hour: int,
+    minute: int,
+    executable: str,
+    *,
+    api: Any = None,
+    runner: WindowsRunner | None = None,
+    state_dir: Path | None = None,
+    task_name_override: str | None = None,
+    lock_factory: Callable[[Path], Any] | None = None,
+) -> Path:
+    """Install a task transactionally and restore exact prior scheduler state."""
+    sid = current_user_sid(api)
+    name = _task_name_for(sid, task_name_override)
+    schedule = WindowsSchedule(
+        sid=sid,
+        task_name=name,
+        time=f"{hour:02d}:{minute:02d}",
+        executable=executable,
+    )
+    definition = build_task_xml(schedule)
+    directory = _provision_state_directory(state_dir, sid, api)
+    with _with_lock(directory, lock_factory):
+        snapshot, previous = _valid_snapshot(name, sid, executable, runner)
+        xml_path: Path | None = None
+        transaction_error: RuntimeError | None = None
+        try:
+            xml_path = _write_xml(directory, definition)
+            if snapshot is not None:
+                _require_exact_snapshot(name, snapshot, runner)
+            _create(
+                name,
+                xml_path,
+                runner,
+                replace=snapshot is not None,
+            )
+            if _verify_installed(name, schedule, runner) != schedule.time:
+                raise RuntimeError(_CONFLICT)
+        except (OSError, RuntimeError) as failure:
+            recovery_candidate = (
+                None
+                if snapshot is None and isinstance(failure, _CreateRejected)
+                else schedule
+            )
+            recovery = _restore(
+                name,
+                snapshot,
+                previous,
+                recovery_candidate,
+                xml_path,
+                runner,
+            )
+            cleanup_ok = (
+                failure.cleanup_ok
+                if isinstance(failure, _TempWriteFailure)
+                else _cleanup_temp(xml_path)
+            )
+            if not cleanup_ok:
+                recovery = _RECOVERY_FAILED
+            transaction_error = _transaction_error("installation", recovery)
+        if transaction_error is not None:
+            raise transaction_error
+
+        assert xml_path is not None
+        if not _cleanup_temp(xml_path):
+            recovery = _restore(
+                name,
+                snapshot,
+                previous,
+                schedule,
+                xml_path,
+                runner,
+            )
+            if not _cleanup_temp(xml_path):
+                recovery = _RECOVERY_FAILED
+            raise _transaction_error("installation", recovery) from None
+    return Path(name)
+
+
+def remove_schedule(
+    *,
+    api: Any = None,
+    runner: WindowsRunner | None = None,
+    state_dir: Path | None = None,
+    task_name_override: str | None = None,
+    executable: str,
+    lock_factory: Callable[[Path], Any] | None = None,
+) -> bool:
+    """Remove only a validated task and restore it if verification fails."""
+    sid = current_user_sid(api)
+    name = _task_name_for(sid, task_name_override)
+    directory = _provision_state_directory(state_dir, sid, api)
+    with _with_lock(directory, lock_factory):
+        snapshot, previous = _valid_snapshot(name, sid, executable, runner)
+        if snapshot is None:
+            return False
+        xml_path: Path | None = None
+        transaction_error: RuntimeError | None = None
+        try:
+            xml_path = _write_xml(directory, snapshot)
+            _require_exact_snapshot(name, snapshot, runner)
+            _delete(name, runner)
+            _verify_absent(name, runner)
+        except (OSError, RuntimeError) as failure:
+            recovery = _restore(
+                name,
+                snapshot,
+                previous,
+                None,
+                xml_path,
+                runner,
+            )
+            cleanup_ok = (
+                failure.cleanup_ok
+                if isinstance(failure, _TempWriteFailure)
+                else _cleanup_temp(xml_path)
+            )
+            if not cleanup_ok:
+                recovery = _RECOVERY_FAILED
+            transaction_error = _transaction_error("removal", recovery)
+        if transaction_error is not None:
+            raise transaction_error
+
+        assert xml_path is not None
+        if not _cleanup_temp(xml_path):
+            recovery = _restore(
+                name,
+                snapshot,
+                previous,
+                None,
+                xml_path,
+                runner,
+            )
+            if not _cleanup_temp(xml_path):
+                recovery = _RECOVERY_FAILED
+            raise _transaction_error("removal", recovery) from None
+    return True

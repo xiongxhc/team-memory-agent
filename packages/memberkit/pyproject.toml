@@ -1,6 +1,6 @@
 [project]
 name = "teammem-memberkit"
-version = "0.2.0"
+version = "0.3.0"
 description = "Draft, review, and share local activity with a team-memory hub"
 readme = "README.md"
 license = "Apache-2.0"
@@ -12,12 +12,13 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Office/Business",
 ]
-dependencies = []
+dependencies = ["tzdata; sys_platform == 'win32'"]
 
 [project.urls]
 Homepage = "https://github.com/xiongxhc/team-memory-agent"

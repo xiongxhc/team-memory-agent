@@ -5,8 +5,14 @@ from datetime import datetime
 from pathlib import Path
 
 from . import bundle, config
-from .schedule import (DEFAULT_TIME, install_schedule, remove_schedule,
-                       schedule_status, scheduled_run)
+from .schedule import (
+    DEFAULT_TIME,
+    UnsupportedSchedulingPlatformError,
+    install_schedule,
+    remove_schedule,
+    schedule_status,
+    scheduled_run,
+)
 from .state import DraftState
 
 
@@ -30,7 +36,10 @@ def main(argv: list[str] | None = None) -> int:
     p_setup = sub.add_parser("setup", help="configure MemberKit and its local reminder")
     p_setup.add_argument("--member")
     p_setup.add_argument("--inbox-url")
-    p_setup.add_argument("--time", help="daily HH:MM in the Mac's local timezone")
+    p_setup.add_argument(
+        "--time",
+        help="daily HH:MM in the host's local timezone",
+    )
     p_setup.add_argument("--no-schedule", action="store_true")
     p_setup.add_argument("--db", default="~/.claude-mem/claude-mem.db")
     p_setup.add_argument("--workdir", default="~/.memberkit")
@@ -41,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     p_install.add_argument(
         "--time",
         default=DEFAULT_TIME,
-        help="daily HH:MM in the Mac's local timezone",
+        help="daily HH:MM in the host's local timezone",
     )
     schedule_sub.add_parser("status")
     schedule_sub.add_parser("remove")
@@ -54,21 +63,16 @@ def main(argv: list[str] | None = None) -> int:
         if not member or not inbox_url:
             raise SystemExit("member slug and inbox URL are required")
         config.resolve_timezone(args.timezone)
-        config.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        lines = [
-            f"MEMBERKIT_MEMBER={member}",
-            f"MEMBERKIT_INBOX_URL={inbox_url}",
-            f"MEMBERKIT_DB={Path(args.db).expanduser()}",
-            f"MEMBERKIT_WORKDIR={Path(args.workdir).expanduser()}",
-        ]
+        values = {
+            "MEMBERKIT_MEMBER": member,
+            "MEMBERKIT_INBOX_URL": inbox_url,
+            "MEMBERKIT_DB": str(Path(args.db).expanduser()),
+            "MEMBERKIT_WORKDIR": str(Path(args.workdir).expanduser()),
+        }
         if args.timezone:
-            lines.append(f"MEMBERKIT_TIMEZONE={args.timezone}")
-        config.CONFIG_FILE.write_text(
-            "\n".join([*lines, ""]),
-            encoding="utf-8",
-        )
-        config.CONFIG_FILE.chmod(0o600)
-        cfg = config.load({})
+            values["MEMBERKIT_TIMEZONE"] = args.timezone
+        config_path = config.write_config(values)
+        cfg = config.load(config_file=config_path)
         schedule_time = args.time
         if not args.no_schedule and schedule_time is None:
             choice = input(
@@ -79,11 +83,30 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 schedule_time = choice or DEFAULT_TIME
         if args.no_schedule:
-            print(f"configured {config.CONFIG_FILE}; schedule disabled")
+            print(f"configured {config_path}; schedule disabled")
         else:
-            path = install_schedule(cfg, time=schedule_time)
+            schedule_failed = False
+            schedule_unsupported = False
+            try:
+                path = install_schedule(cfg, time=schedule_time)
+            except UnsupportedSchedulingPlatformError:
+                schedule_unsupported = True
+            except Exception:
+                schedule_failed = True
+            if schedule_unsupported:
+                raise SystemExit(
+                    f"configuration saved at {config_path}; automatic scheduling "
+                    "is unavailable on this platform; rerun setup with "
+                    "`--no-schedule` or configure a scheduler to invoke "
+                    "`memberkit scheduled-run`"
+                )
+            if schedule_failed:
+                raise SystemExit(
+                    f"configuration saved at {config_path}; scheduling failed; "
+                    "retry with `memberkit schedule install`"
+                )
             print(
-                f"configured {config.CONFIG_FILE}; daily reminder "
+                f"configured {config_path}; daily reminder "
                 f"{schedule_time} -> {path}"
             )
         return 0

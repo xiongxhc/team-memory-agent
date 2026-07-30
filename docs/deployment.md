@@ -14,7 +14,7 @@ the operator machine. Only `teammem schedule install` creates a schedule.
 
 ## Hub installation lifecycle
 
-The connector-capable hub is version 0.2.0 and requires Python 3.11 or newer.
+The connector-capable hub is version 0.3.0 and requires Python 3.11 or newer.
 
 ### Source-checkout installation
 

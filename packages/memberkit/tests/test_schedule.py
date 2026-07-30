@@ -1,6 +1,9 @@
 import json
 import plistlib
 import sqlite3
+import subprocess
+import sys
+import types
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -8,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from memberkit import bundle
+from memberkit import schedule
 from memberkit.config import Config
 from memberkit.schedule import (
     install_schedule,
@@ -50,12 +54,257 @@ def _local_ts(iso):
     ).isoformat(timespec="milliseconds")
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("00:00", (0, 0)),
+        ("17:30", (17, 30)),
+        ("23:59", (23, 59)),
+    ),
+)
+def test_schedule_time_strictly_parses_two_digit_hour_and_minute(value, expected):
+    """Catches accepting a schedule time that is not exactly HH:MM."""
+    assert schedule._parse_time(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("7:30", "07:3", "24:00", "12:60", " 07:30", "07:30 "),
+)
+def test_schedule_time_strictly_rejects_non_hhmm_values(value):
+    """Catches shortened, out-of-range, or whitespace-padded times."""
+    with pytest.raises(ValueError, match="schedule time must be HH:MM"):
+        schedule._parse_time(value)
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    (("darwin", "macos"), ("win32", "windows")),
+)
+def test_platform_facade_selects_the_supported_scheduler(platform, expected):
+    """Catches mapping a supported platform to the wrong backend."""
+    assert schedule._backend(platform) == expected
+
+
+@pytest.mark.parametrize("platform", ("linux", "freebsd"))
+def test_platform_facade_rejects_unsupported_platform_before_mutation(
+    tmp_path, platform,
+):
+    """Catches unsupported platforms creating schedule or work directories."""
+    cfg = _cfg(tmp_path)
+    agents = tmp_path / "LaunchAgents"
+
+    with pytest.raises(
+        schedule.UnsupportedSchedulingPlatformError,
+        match=rf"unsupported scheduling platform: {platform}",
+    ):
+        schedule.install_schedule(
+            cfg,
+            agents_dir=agents,
+            executable="/opt/memberkit",
+            platform=platform,
+        )
+
+    assert not agents.exists()
+    assert not cfg.workdir.exists()
+
+
+def test_facade_rejects_explicit_empty_platform_before_backend_import(
+    tmp_path, monkeypatch,
+):
+    """Catches an explicit empty platform falling back to the host backend."""
+    cfg = _cfg(tmp_path)
+    agents = tmp_path / "LaunchAgents"
+    attempted_imports = []
+
+    def no_backend_import(name, package=None):
+        attempted_imports.append((name, package))
+        raise AssertionError("an unsupported platform must not load a backend")
+
+    monkeypatch.setattr(schedule, "import_module", no_backend_import)
+
+    with pytest.raises(
+        schedule.UnsupportedSchedulingPlatformError,
+        match=r"unsupported scheduling platform: ",
+    ):
+        schedule.install_schedule(
+            cfg,
+            agents_dir=agents,
+            executable="/opt/memberkit",
+            platform="",
+        )
+
+    assert attempted_imports == []
+    assert not agents.exists()
+    assert not cfg.workdir.exists()
+
+
+def test_facade_rejects_invalid_time_before_loading_a_backend(tmp_path, monkeypatch):
+    """Catches importing a backend for an invalid schedule time."""
+    cfg = _cfg(tmp_path)
+    attempted_imports = []
+
+    def no_backend_import(name, package=None):
+        attempted_imports.append((name, package))
+        raise AssertionError("an invalid schedule time must not load a backend")
+
+    monkeypatch.setattr(schedule, "import_module", no_backend_import, raising=False)
+
+    with pytest.raises(ValueError, match="schedule time must be HH:MM"):
+        schedule.install_schedule(
+            cfg,
+            time="7:30",
+            agents_dir=tmp_path / "LaunchAgents",
+            executable="/opt/memberkit",
+            platform="darwin",
+        )
+
+    assert attempted_imports == []
+
+
+def test_facade_win32_does_not_import_the_macos_backend(tmp_path, monkeypatch):
+    """Catches Windows dispatch importing its unselected macOS backend."""
+    observed = {}
+    windows = types.ModuleType("memberkit.schedule_windows")
+
+    def windows_status(**kwargs):
+        observed.update(kwargs)
+        return schedule.ScheduleStatus(True, tmp_path / "windows-task", "17:30")
+
+    windows.schedule_status = windows_status
+    monkeypatch.setitem(sys.modules, "memberkit.schedule_windows", windows)
+    monkeypatch.setitem(sys.modules, "memberkit.schedule_macos", None)
+
+    result = schedule.schedule_status(
+        platform="win32",
+        windows_api="api",
+        windows_runner="runner",
+        windows_state_dir=tmp_path / "state",
+        windows_task_name="task",
+        windows_executable="C:/memberkit.exe",
+    )
+
+    assert result == schedule.ScheduleStatus(
+        True, tmp_path / "windows-task", "17:30"
+    )
+    assert observed == {
+        "api": "api",
+        "runner": "runner",
+        "state_dir": tmp_path / "state",
+        "task_name_override": "task",
+        "executable": "C:/memberkit.exe",
+    }
+
+
+def test_windows_facade_forwards_lifecycle_injection_seams(
+    tmp_path,
+    monkeypatch,
+):
+    """Catches install/remove dropping a Windows lifecycle dependency."""
+    observed = {}
+    windows = types.ModuleType("memberkit.schedule_windows")
+
+    def windows_install(hour, minute, executable, **kwargs):
+        observed["install"] = (hour, minute, executable, kwargs)
+        return tmp_path / "task"
+
+    def windows_remove(**kwargs):
+        observed["remove"] = kwargs
+        return True
+
+    windows.install_schedule = windows_install
+    windows.remove_schedule = windows_remove
+    monkeypatch.setitem(sys.modules, "memberkit.schedule_windows", windows)
+    monkeypatch.setitem(sys.modules, "memberkit.schedule_macos", None)
+    common = {
+        "platform": "win32",
+        "windows_api": "api",
+        "windows_runner": "runner",
+        "windows_state_dir": tmp_path / "state",
+        "windows_task_name": "task-name",
+    }
+
+    installed = schedule.install_schedule(
+        _cfg(tmp_path),
+        time="07:05",
+        executable="C:/memberkit.exe",
+        **common,
+    )
+    removed = schedule.remove_schedule(
+        windows_executable="C:/memberkit.exe",
+        **common,
+    )
+
+    assert installed == tmp_path / "task"
+    assert removed is True
+    assert observed == {
+        "install": (
+            7,
+            5,
+            "C:/memberkit.exe",
+            {
+                "api": "api",
+                "runner": "runner",
+                "state_dir": tmp_path / "state",
+                "task_name_override": "task-name",
+            },
+        ),
+        "remove": {
+            "api": "api",
+            "runner": "runner",
+            "state_dir": tmp_path / "state",
+            "task_name_override": "task-name",
+            "executable": "C:/memberkit.exe",
+        },
+    }
+
+
+def test_facade_darwin_does_not_import_the_windows_backend(tmp_path, monkeypatch):
+    """Catches macOS dispatch importing its unselected Windows backend."""
+    agents = tmp_path / "LaunchAgents"
+    monkeypatch.setitem(sys.modules, "memberkit.schedule_windows", None)
+
+    path = schedule.install_schedule(
+        _cfg(tmp_path),
+        agents_dir=agents,
+        executable="/opt/example/memberkit",
+        platform="darwin",
+    )
+
+    assert schedule.schedule_status(agents, platform="darwin") == (
+        schedule.ScheduleStatus(True, path, "17:30")
+    )
+
+
+def test_windows_schedule_imports_no_hub_or_macos_modules():
+    """Catches MemberKit Windows scheduling gaining a hub or macOS dependency."""
+    source = """
+import sys
+import memberkit.schedule
+import memberkit.schedule_windows
+for name in sys.modules:
+    assert name != "teammem" and not name.startswith("teammem.")
+assert "memberkit.schedule_macos" not in sys.modules
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=Path(__file__).parents[3],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_install_defaults_to_1730_and_calls_only_scheduled_run(tmp_path):
     agents = tmp_path / "LaunchAgents"
     path = install_schedule(
         _cfg(tmp_path),
         agents_dir=agents,
         executable="/opt/example/memberkit",
+        platform="darwin",
     )
 
     data = plistlib.loads(path.read_bytes())
@@ -69,14 +318,20 @@ def test_install_defaults_to_1730_and_calls_only_scheduled_run(tmp_path):
 def test_status_and_remove_are_idempotent(tmp_path):
     agents = tmp_path / "LaunchAgents"
     cfg = _cfg(tmp_path)
-    assert not schedule_status(agents_dir=agents).installed
-    assert remove_schedule(agents_dir=agents) is False
+    assert not schedule_status(agents_dir=agents, platform="darwin").installed
+    assert remove_schedule(agents_dir=agents, platform="darwin") is False
 
-    install_schedule(cfg, time="08:15", agents_dir=agents, executable="memberkit")
-    status = schedule_status(agents_dir=agents)
+    install_schedule(
+        cfg,
+        time="08:15",
+        agents_dir=agents,
+        executable="memberkit",
+        platform="darwin",
+    )
+    status = schedule_status(agents_dir=agents, platform="darwin")
     assert status.installed and status.time == "08:15"
-    assert remove_schedule(agents_dir=agents) is True
-    assert remove_schedule(agents_dir=agents) is False
+    assert remove_schedule(agents_dir=agents, platform="darwin") is True
+    assert remove_schedule(agents_dir=agents, platform="darwin") is False
 
 
 def test_scheduled_run_catches_up_original_date_without_transmitting(tmp_path):
@@ -212,7 +467,10 @@ def test_scheduled_run_never_overwrites_invalid_member_edited_draft(tmp_path):
     path.write_bytes(edited)
 
     pending = scheduled_run(
-        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+        cfg,
+        datetime.fromisoformat("2026-07-28T17:30:00"),
+        notify=False,
+        platform="win32",
     )
 
     assert "2026-07-27" in pending
@@ -232,7 +490,10 @@ def test_scheduled_run_preserves_non_utf8_draft_and_processes_other_date(
     malformed.write_bytes(original)
 
     pending = scheduled_run(
-        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+        cfg,
+        datetime.fromisoformat("2026-07-28T17:30:00"),
+        notify=False,
+        platform="win32",
     )
 
     assert pending == ["2026-07-27", "2026-07-28"]
@@ -259,7 +520,10 @@ def test_scheduled_run_never_overwrites_valid_member_edited_draft(tmp_path):
     path.write_bytes(edited)
 
     pending = scheduled_run(
-        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+        cfg,
+        datetime.fromisoformat("2026-07-28T17:30:00"),
+        notify=False,
+        platform="win32",
     )
 
     assert "2026-07-27" in pending
