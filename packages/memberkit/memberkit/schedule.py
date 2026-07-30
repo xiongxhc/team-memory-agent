@@ -28,7 +28,7 @@ class ScheduleStatus:
 
 
 def _backend(platform: str | None) -> Literal["macos", "windows"]:
-    selected = platform or sys.platform
+    selected = sys.platform if platform is None else platform
     if selected == "darwin":
         return "macos"
     if selected == "win32":

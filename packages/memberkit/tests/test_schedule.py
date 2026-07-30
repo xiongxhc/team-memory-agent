@@ -108,6 +108,33 @@ def test_platform_facade_rejects_unsupported_platform_before_mutation(
     assert not cfg.workdir.exists()
 
 
+def test_facade_rejects_explicit_empty_platform_before_backend_import(
+    tmp_path, monkeypatch,
+):
+    """Catches an explicit empty platform falling back to the host backend."""
+    cfg = _cfg(tmp_path)
+    agents = tmp_path / "LaunchAgents"
+    attempted_imports = []
+
+    def no_backend_import(name, package=None):
+        attempted_imports.append((name, package))
+        raise AssertionError("an unsupported platform must not load a backend")
+
+    monkeypatch.setattr(schedule, "import_module", no_backend_import)
+
+    with pytest.raises(ValueError, match=r"unsupported scheduling platform: "):
+        schedule.install_schedule(
+            cfg,
+            agents_dir=agents,
+            executable="/opt/memberkit",
+            platform="",
+        )
+
+    assert attempted_imports == []
+    assert not agents.exists()
+    assert not cfg.workdir.exists()
+
+
 def test_facade_rejects_invalid_time_before_loading_a_backend(tmp_path, monkeypatch):
     """Catches importing a backend for an invalid schedule time."""
     cfg = _cfg(tmp_path)
