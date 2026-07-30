@@ -304,6 +304,7 @@ def test_install_defaults_to_1730_and_calls_only_scheduled_run(tmp_path):
         _cfg(tmp_path),
         agents_dir=agents,
         executable="/opt/example/memberkit",
+        platform="darwin",
     )
 
     data = plistlib.loads(path.read_bytes())
@@ -317,14 +318,20 @@ def test_install_defaults_to_1730_and_calls_only_scheduled_run(tmp_path):
 def test_status_and_remove_are_idempotent(tmp_path):
     agents = tmp_path / "LaunchAgents"
     cfg = _cfg(tmp_path)
-    assert not schedule_status(agents_dir=agents).installed
-    assert remove_schedule(agents_dir=agents) is False
+    assert not schedule_status(agents_dir=agents, platform="darwin").installed
+    assert remove_schedule(agents_dir=agents, platform="darwin") is False
 
-    install_schedule(cfg, time="08:15", agents_dir=agents, executable="memberkit")
-    status = schedule_status(agents_dir=agents)
+    install_schedule(
+        cfg,
+        time="08:15",
+        agents_dir=agents,
+        executable="memberkit",
+        platform="darwin",
+    )
+    status = schedule_status(agents_dir=agents, platform="darwin")
     assert status.installed and status.time == "08:15"
-    assert remove_schedule(agents_dir=agents) is True
-    assert remove_schedule(agents_dir=agents) is False
+    assert remove_schedule(agents_dir=agents, platform="darwin") is True
+    assert remove_schedule(agents_dir=agents, platform="darwin") is False
 
 
 def test_scheduled_run_catches_up_original_date_without_transmitting(tmp_path):

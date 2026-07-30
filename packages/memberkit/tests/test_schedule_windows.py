@@ -1089,7 +1089,8 @@ def test_default_runner_uses_two_closed_temporary_file_spools(monkeypatch):
         [sys.executable, "-c", "print('bounded')"],
     )
 
-    assert result.stdout == b"bounded\n"
+    assert result.stdout in {b"bounded\n", b"bounded\r\n"}
+    assert result.stdout.splitlines() == [b"bounded"]
     assert result.stderr == b""
     assert len(spools) == 2
     assert all(spool.closed for spool in spools)
