@@ -313,6 +313,100 @@ def test_task_xml_accepts_scheduler_added_registration_date_and_author():
     assert windows.parse_task_xml(xml, schedule) == "18:20"
 
 
+def _scheduler_normalized_task_xml(schedule):
+    text = windows.build_task_xml(schedule)[2:].decode("utf-16-le")
+    registration = (
+        "<RegistrationInfo>"
+        f"<Source>{windows.OWNERSHIP_SOURCE}</Source>"
+        f"<URI>{schedule.task_name}</URI>"
+        f"<Description>{windows.OWNERSHIP_DESCRIPTION}</Description>"
+        "</RegistrationInfo>"
+    )
+    normalized_registration = (
+        "<RegistrationInfo>"
+        f"<Source>{windows.OWNERSHIP_SOURCE}</Source>"
+        f"<Description>{windows.OWNERSHIP_DESCRIPTION}</Description>"
+        f"<URI>{schedule.task_name}</URI>"
+        "</RegistrationInfo>"
+    )
+    generated_settings = (
+        "<Settings>"
+        "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+        "<Enabled>true</Enabled>"
+        "<StartWhenAvailable>true</StartWhenAvailable>"
+        "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+        "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
+        "<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>"
+        "<WakeToRun>false</WakeToRun>"
+        "<ExecutionTimeLimit>PT4H</ExecutionTimeLimit>"
+        "</Settings>"
+    )
+    normalized_settings = (
+        "<Settings>"
+        "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+        "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
+        "<ExecutionTimeLimit>PT4H</ExecutionTimeLimit>"
+        "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+        "<StartWhenAvailable>true</StartWhenAvailable>"
+        "<IdleSettings>"
+        "<StopOnIdleEnd>true</StopOnIdleEnd>"
+        "<RestartOnIdle>false</RestartOnIdle>"
+        "</IdleSettings>"
+        "<UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine>"
+        "</Settings>"
+    )
+    assert registration in text
+    assert generated_settings in text
+    text = text.replace(registration, normalized_registration, 1)
+    text = text.replace("<RunLevel>LeastPrivilege</RunLevel>", "", 1)
+    text = text.replace("<Enabled>true</Enabled></CalendarTrigger>", "</CalendarTrigger>", 1)
+    text = text.replace(generated_settings, normalized_settings, 1)
+    return b"\xef\xbb\xbf" + text.encode("utf-8")
+
+
+def test_task_xml_accepts_exact_scheduler_default_normalization():
+    schedule = _schedule()
+
+    assert windows.parse_task_xml(
+        _scheduler_normalized_task_xml(schedule), schedule
+    ) == "18:20"
+
+
+@pytest.mark.parametrize(
+    "original,tampered",
+    [
+        ("</LogonType>", "</LogonType><RunLevel>HighestAvailable</RunLevel>"),
+        ("</ScheduleByDay>", "</ScheduleByDay><Enabled>false</Enabled>"),
+        ("</Settings>", "<Enabled>false</Enabled></Settings>"),
+        (
+            "</Settings>",
+            "<RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable></Settings>",
+        ),
+        ("</Settings>", "<WakeToRun>true</WakeToRun></Settings>"),
+        ("<StopOnIdleEnd>true</StopOnIdleEnd>", "<StopOnIdleEnd>false</StopOnIdleEnd>"),
+        ("<RestartOnIdle>false</RestartOnIdle>", "<RestartOnIdle>true</RestartOnIdle>"),
+        (
+            "<UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine>",
+            "<UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>",
+        ),
+        (
+            "</Settings>",
+            "<UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine></Settings>",
+        ),
+        ("</Settings>", "<Priority>7</Priority></Settings>"),
+    ],
+)
+def test_task_xml_rejects_nondefault_duplicate_or_unknown_scheduler_normalization(
+    original, tampered
+):
+    schedule = _schedule()
+    text = _scheduler_normalized_task_xml(schedule).decode("utf-8-sig")
+    text = text.replace(original, tampered, 1)
+
+    with pytest.raises(RuntimeError, match="^Windows schedule definition is not managed by TeamMem$"):
+        windows.parse_task_xml(b"\xef\xbb\xbf" + text.encode("utf-8"), schedule)
+
+
 @pytest.mark.parametrize(
     "addition",
     [

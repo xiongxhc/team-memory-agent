@@ -171,6 +171,20 @@ def _exact_children(parent: ET.Element, names: Sequence[str]) -> None:
         raise ValueError(_MANAGED_ERROR)
 
 
+def _required_optional_children(
+    parent: ET.Element,
+    required: Sequence[str],
+    optional: Sequence[str],
+) -> None:
+    names = [_local(child.tag) for child in parent]
+    if (
+        any(name not in tuple(required) + tuple(optional) for name in names)
+        or any(names.count(name) != 1 for name in required)
+        or any(names.count(name) > 1 for name in optional)
+    ):
+        raise ValueError(_MANAGED_ERROR)
+
+
 def _text(parent: ET.Element, name: str) -> str:
     value = _only(parent, name).text
     if value is None:
@@ -324,40 +338,77 @@ def parse_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
         principals = _only(root, "Principals")
         _exact_children(principals, ["Principal"])
         principal = _only(principals, "Principal")
-        _exact_children(principal, ["UserId", "LogonType", "RunLevel"])
+        _required_optional_children(
+            principal, ["UserId", "LogonType"], ["RunLevel"]
+        )
+        run_level = (
+            _text(principal, "RunLevel")
+            if _children(principal, "RunLevel")
+            else "LeastPrivilege"
+        )
         if (
             _text(principal, "UserId") != expected.sid
             or _text(principal, "LogonType") != "InteractiveToken"
-            or _text(principal, "RunLevel") != "LeastPrivilege"
+            or run_level != "LeastPrivilege"
         ):
             raise ValueError(_MANAGED_ERROR)
         triggers = _only(root, "Triggers")
         _exact_children(triggers, ["CalendarTrigger"])
         trigger = _only(triggers, "CalendarTrigger")
-        _exact_children(trigger, ["StartBoundary", "ScheduleByDay", "Enabled"])
+        _required_optional_children(
+            trigger, ["StartBoundary", "ScheduleByDay"], ["Enabled"]
+        )
         time = _normal_time(expected.time)
+        trigger_enabled = (
+            _text(trigger, "Enabled")
+            if _children(trigger, "Enabled")
+            else "true"
+        )
         if (
             _text(trigger, "StartBoundary") != f"2000-01-01T{time}:00"
             or _text(_only(trigger, "ScheduleByDay"), "DaysInterval") != "1"
-            or _text(trigger, "Enabled") != "true"
+            or trigger_enabled != "true"
         ):
             raise ValueError(_MANAGED_ERROR)
         _exact_children(_only(trigger, "ScheduleByDay"), ["DaysInterval"])
         settings = _only(root, "Settings")
-        setting_values = (
+        required_settings = (
             ("MultipleInstancesPolicy", "IgnoreNew"),
-            ("Enabled", "true"),
             ("StartWhenAvailable", "true"),
             ("DisallowStartIfOnBatteries", "false"),
             ("StopIfGoingOnBatteries", "false"),
-            ("RunOnlyIfNetworkAvailable", "false"),
-            ("WakeToRun", "false"),
             ("ExecutionTimeLimit", "PT4H"),
         )
-        _exact_children(settings, [key for key, _value in setting_values])
-        for key, value in setting_values:
+        default_settings = (
+            ("Enabled", "true"),
+            ("RunOnlyIfNetworkAvailable", "false"),
+            ("WakeToRun", "false"),
+        )
+        service_settings = ("IdleSettings", "UseUnifiedSchedulingEngine")
+        _required_optional_children(
+            settings,
+            [key for key, _value in required_settings],
+            [key for key, _value in default_settings] + list(service_settings),
+        )
+        for key, value in required_settings:
             if _text(settings, key) != value:
                 raise ValueError(_MANAGED_ERROR)
+        for key, value in default_settings:
+            if _children(settings, key) and _text(settings, key) != value:
+                raise ValueError(_MANAGED_ERROR)
+        if _children(settings, "IdleSettings"):
+            idle = _only(settings, "IdleSettings")
+            _exact_children(idle, ["StopOnIdleEnd", "RestartOnIdle"])
+            if (
+                _text(idle, "StopOnIdleEnd") != "true"
+                or _text(idle, "RestartOnIdle") != "false"
+            ):
+                raise ValueError(_MANAGED_ERROR)
+        if (
+            _children(settings, "UseUnifiedSchedulingEngine")
+            and _text(settings, "UseUnifiedSchedulingEngine") != "false"
+        ):
+            raise ValueError(_MANAGED_ERROR)
         actions = _only(root, "Actions")
         _exact_children(actions, ["Exec"])
         action = _only(actions, "Exec")
