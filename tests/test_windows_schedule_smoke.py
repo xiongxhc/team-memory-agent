@@ -30,6 +30,28 @@ def test_smoke_times_refuse_to_install_when_the_window_crosses_midnight():
     assert smoke._future_schedule_times(now) is None
 
 
+def test_smoke_task_shape_reports_structure_without_values():
+    smoke = _smoke_module()
+    xml = b"""\
+<Task version="1.4">
+  <RegistrationInfo>
+    <Date>2026-07-30T08:13:39</Date>
+    <Author>CI\\runneradmin</Author>
+  </RegistrationInfo>
+  <Principals><Principal id="Author"><UserId>S-1-5-21-secret</UserId></Principal></Principals>
+  <Actions Context="Author"><Exec><Command>C:\\secret\\teammem.exe</Command>
+    <Arguments>--env-file C:\\secret\\hub.env run-daily</Arguments></Exec></Actions>
+</Task>
+"""
+
+    shape = smoke._safe_task_shape(xml)
+
+    for structural_name in ("RegistrationInfo", "Date", "Author", "Principal", "id", "Actions", "Context"):
+        assert structural_name in shape
+    for secret_value in ("runneradmin", "S-1-5-21-secret", "C:\\secret", "--env-file"):
+        assert secret_value not in shape
+
+
 def test_smoke_allows_only_github_hosted_runners(monkeypatch):
     smoke = _smoke_module()
     monkeypatch.setenv("GITHUB_ACTIONS", "true")

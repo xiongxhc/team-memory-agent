@@ -13,8 +13,10 @@ import shutil
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from teammem.config import Config
 from teammem.schedule import install_schedule, remove_schedule, schedule_status
@@ -28,6 +30,72 @@ _REPLACEMENT_TRIGGER_DELAY = timedelta(minutes=20)
 _ROLLOVER_WAIT_SECONDS = 21 * 60
 _SYSTEM_SID = "S-1-5-18"
 _ADMINISTRATORS_SID = "S-1-5-32-544"
+_STRUCTURE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
+_MAX_SHAPE_ELEMENTS = 128
+_MAX_SHAPE_CHARACTERS = 4096
+
+
+def _structure_name(qualified: str) -> str:
+    local = qualified.rsplit("}", 1)[-1]
+    return local if _STRUCTURE_NAME.fullmatch(local) else "<unknown>"
+
+
+def _safe_task_shape(xml: bytes) -> str:
+    """Summarize XML structure without exposing any element or attribute values."""
+    try:
+        root = ET.fromstring(xml)
+    except (ET.ParseError, UnicodeError, ValueError):
+        return "<unparseable-task-xml>"
+    entries: list[str] = []
+    truncated = False
+
+    def visit(element: ET.Element, parents: tuple[str, ...]) -> None:
+        nonlocal truncated
+        if len(entries) >= _MAX_SHAPE_ELEMENTS:
+            truncated = True
+            return
+        path = parents + (_structure_name(element.tag),)
+        attributes = sorted(_structure_name(name) for name in element.attrib)
+        suffix = f"[attrs={','.join(attributes)}]" if attributes else ""
+        entries.append("/".join(path) + suffix)
+        for child in element:
+            visit(child, path)
+            if truncated:
+                break
+
+    visit(root, ())
+    if truncated:
+        entries.append("<truncated>")
+    return ";".join(entries)[:_MAX_SHAPE_CHARACTERS]
+
+
+class _CapturingRunner:
+    """Capture only the latest successful queried definition for safe diagnostics."""
+
+    def __init__(self) -> None:
+        self.last_query_xml: bytes | None = None
+
+    def __call__(
+        self, command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[bytes]:
+        result = subprocess.run(command, **kwargs)
+        if (
+            result.returncode == 0
+            and "/Query" in command
+            and "/XML" in command
+            and isinstance(result.stdout, bytes)
+        ):
+            self.last_query_xml = result.stdout
+        return result
+
+
+def _report_task_shape(runner: _CapturingRunner) -> None:
+    if runner.last_query_xml is not None:
+        print(
+            "Queried Task Scheduler XML shape: "
+            + _safe_task_shape(runner.last_query_xml),
+            file=sys.stderr,
+        )
 
 
 def _arguments() -> argparse.Namespace:
@@ -140,54 +208,64 @@ def run_smoke(suffix: str) -> None:
     cfg = Config.load(env_file=env_file, require_env_file=True, platform="win32")
     executable = _teammem_executable()
     install_time, replace_time = _select_future_schedule_times()
+    runner = _CapturingRunner()
+    try:
+        install_schedule(
+            cfg,
+            install_time,
+            platform="win32",
+            executable=executable,
+            windows_runner=runner,
+            windows_state_dir=state_dir,
+        )
+        installed = schedule_status(
+            platform="win32",
+            windows_runner=runner,
+            windows_state_dir=state_dir,
+            windows_executable=executable,
+            windows_env_file=env_file,
+        )
+        if not installed.installed or installed.time != install_time:
+            raise RuntimeError("Windows scheduler did not retain the installed task")
 
-    install_schedule(
-        cfg,
-        install_time,
-        platform="win32",
-        executable=executable,
-        windows_state_dir=state_dir,
-    )
-    installed = schedule_status(
-        platform="win32",
-        windows_state_dir=state_dir,
-        windows_executable=executable,
-        windows_env_file=env_file,
-    )
-    if not installed.installed or installed.time != install_time:
-        raise RuntimeError("Windows scheduler did not retain the installed task")
+        install_schedule(
+            cfg,
+            replace_time,
+            platform="win32",
+            executable=executable,
+            windows_runner=runner,
+            windows_state_dir=state_dir,
+        )
+        replaced = schedule_status(
+            platform="win32",
+            windows_runner=runner,
+            windows_state_dir=state_dir,
+            windows_executable=executable,
+            windows_env_file=env_file,
+        )
+        if not replaced.installed or replaced.time != replace_time:
+            raise RuntimeError("Windows scheduler did not retain the replacement task")
 
-    install_schedule(
-        cfg,
-        replace_time,
-        platform="win32",
-        executable=executable,
-        windows_state_dir=state_dir,
-    )
-    replaced = schedule_status(
-        platform="win32",
-        windows_state_dir=state_dir,
-        windows_executable=executable,
-        windows_env_file=env_file,
-    )
-    if not replaced.installed or replaced.time != replace_time:
-        raise RuntimeError("Windows scheduler did not retain the replacement task")
-
-    if not remove_schedule(
-        platform="win32",
-        windows_state_dir=state_dir,
-        windows_executable=executable,
-        windows_env_file=env_file,
-    ):
-        raise RuntimeError("Windows scheduler did not remove the smoke task")
-    removed = schedule_status(
-        platform="win32",
-        windows_state_dir=state_dir,
-        windows_executable=executable,
-        windows_env_file=env_file,
-    )
-    if removed.installed:
-        raise RuntimeError("Windows scheduler retained the removed smoke task")
+        if not remove_schedule(
+            platform="win32",
+            windows_runner=runner,
+            windows_state_dir=state_dir,
+            windows_executable=executable,
+            windows_env_file=env_file,
+        ):
+            raise RuntimeError("Windows scheduler did not remove the smoke task")
+        removed = schedule_status(
+            platform="win32",
+            windows_runner=runner,
+            windows_state_dir=state_dir,
+            windows_executable=executable,
+            windows_env_file=env_file,
+        )
+        if removed.installed:
+            raise RuntimeError("Windows scheduler retained the removed smoke task")
+    except RuntimeError:
+        _report_task_shape(runner)
+        raise
 
 
 def main() -> int:

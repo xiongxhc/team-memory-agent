@@ -32,6 +32,7 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _TASK_NAME = re.compile(r"\\TeamMem-Daily-[0-9a-f]{12}\Z")
 OWNERSHIP_SOURCE = "TeamMem"
 OWNERSHIP_DESCRIPTION = "TeamMem daily operator schedule"
+_PRINCIPAL_ID = "Author"
 
 
 @dataclass(frozen=True)
@@ -212,7 +213,9 @@ def build_task_xml(schedule: WindowsSchedule) -> bytes:
     _add(registration, "URI", name)
     _add(registration, "Description", OWNERSHIP_DESCRIPTION)
     principals = _add(root, "Principals")
-    principal = _add(principals, "Principal")
+    principal = ET.SubElement(
+        principals, _TAG + "Principal", {"id": _PRINCIPAL_ID}
+    )
     _add(principal, "UserId", schedule.sid)
     _add(principal, "LogonType", "InteractiveToken")
     _add(principal, "RunLevel", "LeastPrivilege")
@@ -234,7 +237,7 @@ def build_task_xml(schedule: WindowsSchedule) -> bytes:
         ("ExecutionTimeLimit", "PT4H"),
     ):
         _add(settings, key, value)
-    actions = _add(root, "Actions")
+    actions = ET.SubElement(root, _TAG + "Actions", {"Context": _PRINCIPAL_ID})
     action = _add(actions, "Exec")
     _add(action, "Command", executable)
     _add(action, "Arguments", arguments)
@@ -265,14 +268,31 @@ def parse_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
             raise ValueError(_MANAGED_ERROR)
         for element in root.iter():
             _local(element.tag)
-            if element is not root and element.attrib:
-                raise ValueError(_MANAGED_ERROR)
         _valid_task_name(expected.task_name, expected.sid)
         _exact_children(
             root, ["RegistrationInfo", "Principals", "Triggers", "Settings", "Actions"]
         )
         registration = _only(root, "RegistrationInfo")
-        _exact_children(registration, ["Source", "URI", "Description"])
+        registration_names = [_local(child.tag) for child in registration]
+        required_registration = ("Source", "URI", "Description")
+        optional_registration = ("Date", "Author")
+        if (
+            any(
+                name not in required_registration + optional_registration
+                for name in registration_names
+            )
+            or any(registration_names.count(name) != 1 for name in required_registration)
+            or any(registration_names.count(name) > 1 for name in optional_registration)
+        ):
+            raise ValueError(_MANAGED_ERROR)
+        for name in optional_registration:
+            for element in _children(registration, name):
+                if (
+                    element.text is None
+                    or element.text != element.text.strip()
+                    or list(element)
+                ):
+                    raise ValueError(_MANAGED_ERROR)
         if (
             _text(registration, "Source") != OWNERSHIP_SOURCE
             or _text(registration, "URI") != expected.task_name
@@ -320,6 +340,17 @@ def parse_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
         _exact_children(actions, ["Exec"])
         action = _only(actions, "Exec")
         _exact_children(action, ["Command", "Arguments"])
+        for element in root.iter():
+            if element is root:
+                continue
+            if element is principal:
+                if element.attrib != {"id": _PRINCIPAL_ID}:
+                    raise ValueError(_MANAGED_ERROR)
+            elif element is actions:
+                if element.attrib != {"Context": _PRINCIPAL_ID}:
+                    raise ValueError(_MANAGED_ERROR)
+            elif element.attrib:
+                raise ValueError(_MANAGED_ERROR)
         executable = _text(action, "Command")
         env_file = _absolute_windows_path(expected.env_file)
         if (
