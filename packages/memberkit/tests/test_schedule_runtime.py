@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import pytest
 
 from memberkit import bundle, schedule, schedule_windows
 from memberkit.config import Config
+from memberkit.state import DraftState
 
 
 class UsernameApi:
@@ -406,3 +408,58 @@ def test_windows_scheduled_run_logs_exception_class_then_reraises_draft_failure(
     assert "RuntimeError" in error
     assert "secret-token" not in error
     assert "private.invalid" not in error
+
+
+def test_windows_scheduled_run_filters_malformed_persisted_pending_dates(
+    tmp_path,
+):
+    cfg = runtime_config(tmp_path)
+    state_path = cfg.workdir / "state.json"
+    state_path.parent.mkdir(parents=True)
+    malformed_dates = [
+        "secret-token\nnot-a-date",
+        "2026-02-30",
+        "2026-7-20",
+    ]
+    state_path.write_text(
+        json.dumps(
+            {
+                "approved": [],
+                "excluded": [],
+                "pending": {
+                    "2026-07-20": ["valid-fingerprint"],
+                    **{
+                        date: [f"malformed-fingerprint-{index}"]
+                        for index, date in enumerate(malformed_dates)
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = ReminderRunner()
+
+    pending = schedule.scheduled_run(
+        cfg,
+        datetime(2026, 7, 28, 18, 0),
+        platform="win32",
+        windows_api=UsernameApi(),
+        windows_runner=runner,
+    )
+
+    assert pending == ["2026-07-20"]
+    assert runner.calls[0][0] == [
+        "msg.exe",
+        "Alex",
+        "/TIME:60",
+        "MemberKit drafts ready for review: 2026-07-20",
+    ]
+    log = (cfg.workdir / "schedule.log").read_text(encoding="utf-8")
+    assert "2026-07-20" in log
+    for malformed in malformed_dates:
+        assert malformed not in log
+        assert malformed not in pending
+        assert malformed not in runner.calls[0][0][-1]
+    snapshot = DraftState(state_path).snapshot()
+    for malformed in malformed_dates:
+        assert malformed in snapshot["pending"]

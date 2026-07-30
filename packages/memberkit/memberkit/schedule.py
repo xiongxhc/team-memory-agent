@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass
+from datetime import date as calendar_date
 from datetime import datetime, timedelta
 from importlib import import_module
 from pathlib import Path
@@ -172,6 +173,21 @@ def _valid_existing_draft(data: object, config: Config, date: str) -> bool:
     return True
 
 
+def _is_strict_iso_date(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or len(value) != 10
+        or value[4] != "-"
+        or value[7] != "-"
+        or not (value[:4] + value[5:7] + value[8:]).isdigit()
+    ):
+        return False
+    try:
+        return calendar_date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
 def _append_bounded_log(
     path: Path,
     line: str,
@@ -286,7 +302,11 @@ def scheduled_run(
     normalized_now, timezone = _normalize_run_time(config, now, timezone)
     invoked = normalized_now.isoformat(timespec="seconds")
     try:
-        pending_dates = _prepare_pending(config, normalized_now, timezone)
+        pending_dates = [
+            date
+            for date in _prepare_pending(config, normalized_now, timezone)
+            if _is_strict_iso_date(date)
+        ]
     except Exception as exc:
         if selected == "win32":
             _safe_append_log(

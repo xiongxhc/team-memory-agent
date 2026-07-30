@@ -79,13 +79,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_schedule:
             print(f"configured {config_path}; schedule disabled")
         else:
+            schedule_failed = False
             try:
                 path = install_schedule(cfg, time=schedule_time)
             except Exception:
+                schedule_failed = True
+            if schedule_failed:
                 raise SystemExit(
                     f"configuration saved at {config_path}; scheduling failed; "
                     "retry with `memberkit schedule install`"
-                ) from None
+                )
             print(
                 f"configured {config_path}; daily reminder "
                 f"{schedule_time} -> {path}"

@@ -529,6 +529,15 @@ def test_setup_schedule_failure_preserves_config_and_names_retry_command(
     assert "secret-token" not in message
     assert config_path.read_text(encoding="utf-8") == "saved\n"
     assert not scheduler_artifact.exists()
+    related = []
+    pending = [error.value.__cause__, error.value.__context__]
+    while pending:
+        exception = pending.pop()
+        if exception is None or exception in related:
+            continue
+        related.append(exception)
+        pending.extend([exception.__cause__, exception.__context__])
+    assert related == []
 
 
 def test_dismiss_excludes_pending_date_without_transmitting(tmp_path, monkeypatch):
