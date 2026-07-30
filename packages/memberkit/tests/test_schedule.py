@@ -457,7 +457,10 @@ def test_scheduled_run_never_overwrites_invalid_member_edited_draft(tmp_path):
     path.write_bytes(edited)
 
     pending = scheduled_run(
-        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+        cfg,
+        datetime.fromisoformat("2026-07-28T17:30:00"),
+        notify=False,
+        platform="win32",
     )
 
     assert "2026-07-27" in pending
@@ -477,7 +480,10 @@ def test_scheduled_run_preserves_non_utf8_draft_and_processes_other_date(
     malformed.write_bytes(original)
 
     pending = scheduled_run(
-        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+        cfg,
+        datetime.fromisoformat("2026-07-28T17:30:00"),
+        notify=False,
+        platform="win32",
     )
 
     assert pending == ["2026-07-27", "2026-07-28"]
@@ -504,7 +510,10 @@ def test_scheduled_run_never_overwrites_valid_member_edited_draft(tmp_path):
     path.write_bytes(edited)
 
     pending = scheduled_run(
-        cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
+        cfg,
+        datetime.fromisoformat("2026-07-28T17:30:00"),
+        notify=False,
+        platform="win32",
     )
 
     assert "2026-07-27" in pending

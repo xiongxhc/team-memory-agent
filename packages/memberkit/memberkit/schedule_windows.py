@@ -14,6 +14,7 @@ import time as clock
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import date as calendar_date
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
@@ -21,11 +22,13 @@ from .schedule import ScheduleStatus
 from .windows_security import (
     _is_absolute_windows_filesystem_path,
     current_user_sid,
+    current_username,
     provision_windows_private_dir,
 )
 
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _NUMERIC_ENTITY = re.compile(r"&#(?:[0-9]+|[xX][0-9a-fA-F]+);")
 _NONCANONICAL_NAMED_ENTITY = re.compile(r"&(?:apos|quot);")
 _NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
@@ -48,6 +51,73 @@ class WindowsSchedule:
     task_name: str
     time: str
     executable: str
+
+
+def notify_pending(
+    dates: Sequence[str],
+    *,
+    api: Any = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> str | None:
+    """Notify the current Windows user without surfacing native output."""
+    validated_dates: list[str] = []
+    for value in dates:
+        if not isinstance(value, str) or _ISO_DATE.fullmatch(value) is None:
+            raise ValueError("pending dates must be ISO YYYY-MM-DD")
+        try:
+            parsed = calendar_date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("pending dates must be ISO YYYY-MM-DD") from exc
+        if parsed.isoformat() != value:
+            raise ValueError("pending dates must be ISO YYYY-MM-DD")
+        validated_dates.append(value)
+
+    if not validated_dates:
+        return None
+
+    try:
+        username = current_username(api)
+    except OSError:
+        return "reminder.unavailable"
+    if (
+        not isinstance(username, str)
+        or not username
+        or username[0] in {"/", "-"}
+        or "*" in username
+        or _CONTROL.search(username)
+    ):
+        return "reminder.invalid-target"
+
+    execute = subprocess.run if runner is None else runner
+    try:
+        result = execute(
+            [
+                "msg.exe",
+                username,
+                "/TIME:60",
+                "MemberKit drafts ready for review: "
+                + ", ".join(validated_dates),
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return "reminder.missing-executable"
+    except PermissionError:
+        return "reminder.permission-denied"
+    except subprocess.TimeoutExpired:
+        return "reminder.timeout"
+    except OSError:
+        return "reminder.unavailable"
+    except subprocess.SubprocessError:
+        return "reminder.failed"
+
+    if result.returncode != 0:
+        return "reminder.nonzero-exit"
+    return None
 
 
 def task_name(sid: str) -> str:

@@ -352,17 +352,31 @@ def test_review_replace_failure_preserves_bundle_and_state(
     assert sorted(item.name for item in path.parent.iterdir()) == [path.name]
 
 
-def test_setup_prompts_to_accept_default_schedule(tmp_path, monkeypatch):
+def test_setup_uses_platform_config_api_then_installs_default_schedule(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
     cfg = _setup_cfg(tmp_path)
     prompts = []
-    installed = []
-    monkeypatch.setattr(cli.config, "CONFIG_FILE", tmp_path / "memberkit.env")
-    monkeypatch.setattr(cli.config, "load", lambda env: cfg)
-    monkeypatch.setattr(
-        cli,
-        "install_schedule",
-        lambda config, time: installed.append(time) or tmp_path / "agent.plist",
-    )
+    calls = []
+    config_path = tmp_path / "platform" / "memberkit.env"
+
+    def write_config(values):
+        calls.append(("write", values))
+        return config_path
+
+    def load(*, config_file):
+        calls.append(("load", config_file))
+        return cfg
+
+    def install(config, time):
+        calls.append(("install", config, time))
+        return tmp_path / "scheduler-artifact"
+
+    monkeypatch.setattr(cli.config, "write_config", write_config)
+    monkeypatch.setattr(cli.config, "load", load)
+    monkeypatch.setattr(cli, "install_schedule", install)
     monkeypatch.setattr(
         "builtins.input",
         lambda prompt: prompts.append(prompt) or "",
@@ -376,15 +390,45 @@ def test_setup_prompts_to_accept_default_schedule(tmp_path, monkeypatch):
         "--workdir", str(cfg.workdir),
     ]) == 0
 
-    assert installed == ["17:30"]
+    assert calls == [
+        (
+            "write",
+            {
+                "MEMBERKIT_MEMBER": "alex",
+                "MEMBERKIT_INBOX_URL": "git@example.test:team/inbox.git",
+                "MEMBERKIT_DB": str(cfg.db),
+                "MEMBERKIT_WORKDIR": str(cfg.workdir),
+            },
+        ),
+        ("load", config_path),
+        ("install", cfg, "17:30"),
+    ]
     assert any("17:30" in prompt for prompt in prompts)
+    assert str(config_path) in capsys.readouterr().out
 
 
-def test_setup_can_decline_schedule_interactively(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "setup_args",
+    [
+        [],
+        ["--no-schedule"],
+    ],
+)
+def test_setup_can_skip_schedule_after_saving_config(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    setup_args,
+):
     cfg = _setup_cfg(tmp_path)
     installed = []
-    monkeypatch.setattr(cli.config, "CONFIG_FILE", tmp_path / "memberkit.env")
-    monkeypatch.setattr(cli.config, "load", lambda env: cfg)
+    path = tmp_path / "platform" / "memberkit.env"
+    monkeypatch.setattr(cli.config, "write_config", lambda _values: path)
+    monkeypatch.setattr(
+        cli.config,
+        "load",
+        lambda *, config_file: cfg if config_file == path else None,
+    )
     monkeypatch.setattr(
         cli,
         "install_schedule",
@@ -398,20 +442,24 @@ def test_setup_can_decline_schedule_interactively(tmp_path, monkeypatch):
         "--inbox-url", cfg.inbox_url,
         "--db", str(cfg.db),
         "--workdir", str(cfg.workdir),
+        *setup_args,
     ]) == 0
 
     assert installed == []
+    assert str(path) in capsys.readouterr().out
 
 
-def test_setup_invalid_timezone_preserves_existing_config(tmp_path, monkeypatch):
+def test_setup_invalid_timezone_never_calls_config_writer(tmp_path, monkeypatch):
     path = tmp_path / "memberkit.env"
-    original = (
-        b"MEMBERKIT_MEMBER=alex\n"
-        b"MEMBERKIT_INBOX_URL=git@example.test:team/inbox.git\n"
-        b"MEMBERKIT_TIMEZONE=Asia/Dubai\n"
-    )
+    original = b"MEMBERKIT_TIMEZONE=Asia/Dubai\n"
     path.write_bytes(original)
-    monkeypatch.setattr(cli.config, "CONFIG_FILE", path)
+    monkeypatch.setattr(
+        cli.config,
+        "write_config",
+        lambda _values: (_ for _ in ()).throw(
+            AssertionError("invalid timezone must fail before configuration write")
+        ),
+    )
 
     with pytest.raises(SystemExit, match="invalid MEMBERKIT_TIMEZONE"):
         cli.main([
@@ -423,6 +471,64 @@ def test_setup_invalid_timezone_preserves_existing_config(tmp_path, monkeypatch)
         ])
 
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["setup", "--help"],
+        ["schedule", "install", "--help"],
+    ],
+)
+def test_setup_and_schedule_help_name_host_local_timezone(argv, capsys):
+    with pytest.raises(SystemExit) as error:
+        cli.main(argv)
+
+    assert error.value.code == 0
+    assert "host's local timezone" in capsys.readouterr().out
+
+
+def test_setup_schedule_failure_preserves_config_and_names_retry_command(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _setup_cfg(tmp_path)
+    config_path = tmp_path / "platform" / "memberkit.env"
+    scheduler_artifact = tmp_path / "scheduler-artifact"
+
+    def write_config(_values):
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("saved\n", encoding="utf-8")
+        return config_path
+
+    monkeypatch.setattr(cli.config, "write_config", write_config)
+    monkeypatch.setattr(
+        cli.config,
+        "load",
+        lambda *, config_file: cfg if config_file == config_path else None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "install_schedule",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("unsupported scheduling platform: linux secret-token")
+        ),
+    )
+
+    with pytest.raises(SystemExit) as error:
+        cli.main([
+            "setup",
+            "--member", cfg.member,
+            "--inbox-url", cfg.inbox_url,
+            "--time", "17:30",
+        ])
+
+    message = str(error.value)
+    assert str(config_path) in message
+    assert "memberkit schedule install" in message
+    assert "secret-token" not in message
+    assert config_path.read_text(encoding="utf-8") == "saved\n"
+    assert not scheduler_artifact.exists()
 
 
 def test_dismiss_excludes_pending_date_without_transmitting(tmp_path, monkeypatch):
