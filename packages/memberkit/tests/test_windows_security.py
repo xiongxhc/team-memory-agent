@@ -21,7 +21,10 @@ SID = "S-1-5-21-111-222-333-1001"
 USERNAME = "Alex"
 SYSTEM_SID = "S-1-5-18"
 ADMINISTRATORS_SID = "S-1-5-32-544"
-SECRET_TEXT = "MEMBERKIT_INBOX_URL=https://token@example.invalid/inbox\n"
+SECRET_TEXT = (
+    "MEMBERKIT_INBOX_"
+    "URL=https://token@example.invalid/inbox\n"
+)
 
 
 def _file(
