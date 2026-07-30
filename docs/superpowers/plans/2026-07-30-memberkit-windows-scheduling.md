@@ -39,6 +39,15 @@ pytest, GitHub Actions
   values.
 - Windows Task Scheduler XML and errors never contain inbox URLs, credentials,
   event summaries, journals, or bundle content.
+- The lifecycle lock serializes cooperating MemberKit commands. Every observed
+  unmanaged or conflicting task is refused and preserved.
+- Initial registration after an absent query is create-only and omits `/F`, so
+  a same-name collision fails without overwriting.
+- Another Task Scheduler client using the same Windows identity can race between
+  query, revalidation, and mutation. That non-cooperating concurrency is outside
+  the transaction guarantee; no atomic compare-and-swap or malicious same-user
+  integrity is claimed. A stronger boundary requires a separately privileged
+  principal or service.
 - Windows configuration is private before content is written and is validated
   through the same opened handle on every read.
 - Windows reminders target only the current username with `/TIME:60`; reminder
@@ -646,7 +655,7 @@ git commit -m "feat: define MemberKit Windows tasks"
 
 ---
 
-### Task 5: Transactional Windows Scheduler Lifecycle
+### Task 5: Windows Scheduler Lifecycle and Concurrency Boundary
 
 **Files:**
 
@@ -693,6 +702,10 @@ def remove_schedule(
 ```
 
 - Consumed by: Tasks 6 and 7.
+- `WindowsRunner` captures byte streams and has one bounded deadline covering
+  direct-child execution and captured-pipe drain completion. Inherited handles
+  must not cause an indefinite wait; timeout or incomplete safe drain returns a
+  sanitized failure and leaves mutation outcome determination to a fresh query.
 
 - [ ] **Step 1: Write the fake byte-only `schtasks.exe` runner**
 
@@ -701,12 +714,15 @@ Model only:
 ```text
 /Query /TN <name> /XML
 /Query /FO CSV /NH
+/Create /TN <name> /XML <path>
 /Create /TN <name> /XML <path> /F
 /Delete /TN <name> /F
 ```
 
 Assert every call uses `capture_output=True, text=False`. The fake runner stores
-task XML bytes and supports injected failures/hooks.
+task XML bytes and supports deterministic injected failures and race hooks.
+Create without `/F` must fail on a name collision and preserve the stored
+definition.
 
 - [ ] **Step 2: Write failing status/conflict tests**
 
@@ -715,7 +731,10 @@ managed task, unexpected action, foreign ownership, and the read-only rule:
 status creates no state directory, lock, or temporary file. Also cover
 successful XML output, CSV fallback output, and stderr that each exceed 1 MiB;
 all must fail with sanitized unavailable/conflict categories before parsing or
-exposing content.
+exposing content. Exercise the real process-runner contract with controlled
+children: its timeout covers captured-pipe drain completion, and a descendant
+that inherits a pipe handle cannot keep the operation waiting indefinitely.
+Failure remains sanitized and does not assume whether a mutation succeeded.
 
 - [ ] **Step 3: Run lifecycle RED**
 
@@ -743,10 +762,26 @@ Never parse or return command output.
 
 - [ ] **Step 5: Write failing install/remove/rollback tests**
 
-Cover one-byte `msvcrt` lock contention, private state validation before lock or
-temp writes, exact replacement, post-create verification, first-install rollback
-to absence, prior-XML restoration, cleanup retry, persistent cleanup failure,
+Cover one-byte `msvcrt` lock contention between cooperating MemberKit commands,
+private state validation before lock or temp writes, create-only initial
+registration without `/F`, exact managed replacement with `/F`, query and
+revalidation immediately before replacement/removal, post-create verification,
+first-install rollback to absence only when the observed definition is still the
+candidate, prior-XML restoration, cleanup retry, persistent cleanup failure,
 idempotent removal, and removal restoration.
+
+Use deterministic race hooks for at least these cases:
+
+- a foreign task appears after the absent query and before initial create:
+  create fails on collision and the foreign bytes remain unchanged;
+- a validated managed task becomes foreign before replacement or removal
+  revalidation: MemberKit refuses mutation and preserves the foreign bytes;
+- a task becomes foreign before post-mutation verification or recovery:
+  MemberKit reports conflict/uncertain recovery and preserves the observed
+  foreign bytes.
+
+Do not write tests that assume atomic compare-and-swap across the final
+revalidation-to-mutation window.
 
 - [ ] **Step 6: Run mutation RED**
 
@@ -760,21 +795,35 @@ Run:
 
 Expected: mutation tests fail.
 
-- [ ] **Step 7: Implement transactional install and removal**
+- [ ] **Step 7: Implement the cooperating-command lifecycle**
 
-Register only through:
+After an absent query, register only through the create-only command:
 
 ```python
 [
     "schtasks.exe", "/Create", "/TN", name,
-    "/XML", str(private_xml_path), "/F",
+    "/XML", str(private_xml_path),
 ]
 ```
 
-Snapshot and validate exact prior XML under the lifecycle lock. Verify every
-create/delete. On failure restore exact prior XML or verify absence, then prove
-temporary XML removal. Errors distinguish "previous state restored" from
-"rollback failed" without including XML or subprocess output.
+If this command reports a collision, query the name and preserve the observed
+definition. For replacement, snapshot an exact managed prior definition under
+the lifecycle lock, query and revalidate it immediately before using the same
+`/Create` command with `/F`. Removal likewise queries and revalidates the
+managed snapshot immediately before `/Delete /F`.
+
+Verify every successful create/delete with a fresh query. On failure, use fresh
+queries for best-effort recovery: restore the prior definition only when the
+observed state has not become foreign, and remove only a definition that still
+validates as the newly created candidate. Preserve every unmanaged or
+conflicting definition observed. Prove temporary XML removal. Errors distinguish
+"previous state restored", "conflicting state preserved", and "rollback failed"
+without including XML or subprocess output.
+
+The implementation must document that the lock covers cooperating MemberKit
+commands only. It must not represent query/revalidate/mutate as atomic
+compare-and-swap or claim integrity against another same-identity scheduler
+client.
 
 - [ ] **Step 8: Connect facade injection seams**
 
@@ -794,6 +843,14 @@ Run:
 ```
 
 Expected: all schedule tests pass without a real scheduler call.
+
+Task 5 is accepted only when the tests prove collision-safe initial create,
+cooperating-command lock serialization, managed query/revalidation before
+replacement and removal, best-effort rollback, bounded runner completion through
+pipe drain, and preservation of every foreign definition observed by the
+deterministic race hooks. The accepted guarantee excludes unobserved mutation by
+a non-cooperating same-identity Task Scheduler client between the final
+revalidation and mutation.
 
 - [ ] **Step 10: Commit Task 5**
 
@@ -1056,9 +1113,11 @@ The smoke:
 6. Asserts the workdir has no schedule logs, state, or drafts, proving the action
    never ran.
 7. Removes the exact SID-derived task and smoke config only when the validated
-   run-ID-specific ownership sentinel exists, then removes disposable files and
-   the sentinel in unconditional cleanup. `--cleanup-only` follows the same
-   ownership check; it never deletes a conflicting pre-existing config or task.
+   run-ID-specific ownership sentinel exists and the task revalidates as the
+   managed smoke definition, then removes disposable files and the sentinel in
+   unconditional cleanup. `--cleanup-only` follows the same ownership and task
+   revalidation checks; it preserves every conflicting config or task it
+   observes.
 
 - [ ] **Step 4: Add the dedicated Windows CI job**
 
@@ -1096,7 +1155,8 @@ Document the same commands dispatching to launchd/Task Scheduler, explicit
 opt-in setup, Windows config/state paths, SID-specific task, logged-in-only and
 locked-session behavior, `StartWhenAvailable`, no wake, `IgnoreNew`, best-effort
 `msg.exe`, bounded logs, removal before uninstall, Linux automatic scheduling
-deferral, and the no-auto-push rule.
+deferral, the no-auto-push rule, collision refusal, and the documented
+same-identity non-cooperating concurrency boundary.
 
 - [ ] **Step 7: Install build tooling and run the complete local verification**
 

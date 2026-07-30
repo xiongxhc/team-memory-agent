@@ -140,21 +140,43 @@ markers in `RegistrationInfo/Source`, `RegistrationInfo/Description`, and
 
 Status, replacement, and removal require the exact task name, current SID,
 ownership markers, trigger, settings, executable, and argument vector. An
-unmanaged or conflicting task is reported and never overwritten or deleted.
+unmanaged or conflicting task that MemberKit observes is reported and never
+overwritten or deleted.
+
+MemberKit's lifecycle lock serializes cooperating MemberKit commands for this
+identity. It does not lock Task Scheduler itself. A different Task Scheduler
+client running as the same Windows identity can mutate the same task between
+MemberKit's query, revalidation, and mutation. That non-cooperating concurrency
+is outside the lifecycle transaction guarantee; the Task Scheduler command
+surface provides no atomic compare-and-swap operation for this workflow.
+MemberKit refuses every unmanaged or conflicting definition it observes, but it
+cannot guarantee integrity against a malicious process with the same user's
+access. That stronger boundary requires a separately privileged principal or
+service and is not part of this design.
 
 ## Canonical Windows Task
 
 MemberKit generates deterministic UTF-16LE Task Scheduler XML with a BOM and
-matching XML encoding declaration. It registers the definition through the
-exact direct command:
+matching XML encoding declaration. Initial registration after an absent query
+uses the exact direct create-only command:
 
 ```text
-schtasks.exe /Create /TN <task-name> /XML <private-xml-path> /F
+schtasks.exe /Create /TN <task-name> /XML <private-xml-path>
 ```
 
-It does not use PowerShell or `cmd.exe`. Query output is bounded to 1 MiB and
+Omitting `/F` makes a same-name collision fail instead of overwriting the task.
+Replacement of a queried and revalidated managed definition, and best-effort
+restoration of such a definition, may use the same command with `/F`. MemberKit
+does not use PowerShell or `cmd.exe`. Query output is bounded to 1 MiB and
 decoded with strict BOM or UTF-16 signature detection rather than the active
 console code page.
+
+The direct process runner captures byte output and applies a bounded deadline to
+the whole operation, including completion of captured-pipe draining. Inherited
+stdout or stderr handles held open after the direct child exits must not make
+MemberKit wait indefinitely. A timeout or inability to complete safe pipe
+draining is a sanitized scheduler failure; MemberKit does not infer that the
+mutation succeeded and continues only through query-based recovery.
 
 The definition contains exactly one principal, one daily calendar trigger, and
 one executable action.
@@ -208,25 +230,38 @@ Windows scheduler state uses:
 ```
 
 The directory is created and validated as current-user-owned private state.
-Install, replace, and remove are serialized with one per-user lifecycle lock.
+Cooperating install, replace, and remove commands are serialized with one
+per-user lifecycle lock.
 
 Installation:
 
 1. Validate the requested time, absolute executable, SID, and private state.
-2. Query and validate any existing managed task.
-3. Preserve the exact existing XML as a rollback snapshot.
-4. Write the candidate XML to a private temporary file.
-5. Register it through `schtasks.exe`.
-6. Query and validate the registered definition.
-7. Delete the temporary file.
+2. Query the exact SID-derived name. Refuse any unmanaged or conflicting
+   definition that is observed.
+3. If absent, write the candidate XML and create without `/F`. A name collision
+   fails without overwriting; MemberKit queries the collision and preserves any
+   foreign definition it observes.
+4. If managed, preserve the exact XML as a rollback snapshot, then query and
+   revalidate it immediately before replacement with `/F`.
+5. Query and validate the resulting definition and delete the temporary file.
 
-Any failure restores the previous definition or confirms that a newly created
-task is absent. Cleanup failure is reported. A failed install never silently
-claims success.
+On a failure after mutation, MemberKit queries the task and makes a best-effort
+attempt to restore the validated previous definition or remove only a definition
+that still validates as the candidate it created. It preserves any unmanaged or
+conflicting definition observed during recovery. Cleanup failure is reported,
+and a failed install never silently claims success.
 
-Removal deletes only a validated managed MemberKit task. It is idempotent when
-no task exists and restores the prior definition if deletion or verification
-fails.
+Removal is idempotent when no task exists. Otherwise it snapshots a managed
+definition, queries and revalidates it immediately before `/Delete /F`, verifies
+absence, and makes a best-effort restoration after failure. It never deletes or
+replaces an unmanaged or conflicting definition it observes.
+
+These checks protect against stale observations at each explicit query point and
+serialize MemberKit's own commands. They are not atomic compare-and-swap:
+another same-identity Task Scheduler client can mutate the name after the final
+revalidation or during recovery. In that case MemberKit reports the uncertain
+or conflicting result and preserves every foreign definition it observes, but
+cannot promise rollback to the pre-operation state.
 
 Status is read-only. It creates no directories, locks, or temporary files.
 
@@ -291,7 +326,13 @@ Hermetic tests cover:
   normalization;
 - localized Task Scheduler query output decoding;
 - unmanaged-task conflicts;
-- transactional install replacement, rollback, cleanup, and idempotent removal;
+- cooperating-command serialization, collision-safe create-only initial
+  registration, managed replacement/removal revalidation, best-effort rollback,
+  cleanup, and idempotent removal;
+- deterministic race hooks at query/revalidation/recovery boundaries proving
+  that observed foreign tasks are preserved;
+- bounded process execution through captured-pipe drain completion, including
+  safe failure when inherited handles keep a pipe open;
 - Windows configuration path selection, atomic creation, DACL application, and
   handle-based validation on both setup and every read;
 - Windows `tzdata` installation and named IANA-zone behavior across one
@@ -347,3 +388,6 @@ The root README, MemberKit README, and member guide explain:
 - Installing the TeamMem hub for members.
 - Automatically pushing or approving MemberKit drafts.
 - Refactoring the hub scheduler in the same change.
+- Integrity against malicious or non-cooperating mutation by another Task
+  Scheduler client running as the same Windows identity.
+- A separately privileged scheduler principal or service.
