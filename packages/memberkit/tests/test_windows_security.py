@@ -23,6 +23,7 @@ USERNAME = "Alex"
 SESSION_ID = 42
 SYSTEM_SID = "S-1-5-18"
 ADMINISTRATORS_SID = "S-1-5-32-544"
+FOREIGN_SID = "S-1-5-21-999-888-777-1001"
 SECRET_TEXT = (
     "MEMBERKIT_INBOX_"
     "URL=https://token@example.invalid/inbox\n"
@@ -82,12 +83,13 @@ class FakeWindowsApi:
         self.phases = []
         self.opened = []
         self.closed = []
-        self.dacl_calls = []
+        self.security_calls = []
         self.destination = None
         self.parent = None
         self._cleanup_recorded = False
         self._failed_phases = set()
         self.open_handles = set()
+        self.created_owner_sids = []
 
     def _phase(self, phase):
         self.phases.append(phase)
@@ -157,8 +159,12 @@ class FakeWindowsApi:
         self._phase("provision private parent")
         if path in self.records:
             raise FileExistsError(path)
-        record = _directory(dacl_protected=False)
+        record = _directory(
+            owner_sid=FOREIGN_SID,
+            dacl_protected=False,
+        )
         record["path"] = path
+        self.created_owner_sids.append(record["owner_sid"])
         self.records[path] = record
         self.open_handles.add(id(record))
         return record
@@ -168,21 +174,27 @@ class FakeWindowsApi:
         path = Path(path)
         if path in self.records:
             raise FileExistsError(path)
-        record = _file(data=b"", dacl_protected=False)
+        record = _file(
+            data=b"",
+            owner_sid=FOREIGN_SID,
+            dacl_protected=False,
+        )
         record["path"] = path
+        self.created_owner_sids.append(record["owner_sid"])
         self.records[path] = record
         self.open_handles.add(id(record))
         return record
 
-    def apply_protected_dacl(self, handle, sid, principals):
+    def apply_private_security(self, handle, sid, principals):
         phase = (
-            "apply protected DACL"
+            "apply private security"
             if not handle["directory"]
             else "protect private parent"
         )
         self._phase(phase)
         principals = tuple(principals)
-        self.dacl_calls.append((handle["path"], sid, principals))
+        self.security_calls.append((handle["path"], sid, principals))
+        handle["owner_sid"] = sid
         handle["dacl_protected"] = True
         handle["allow_aces"] = [(principal, 0x10000000) for principal in principals]
 
@@ -295,6 +307,11 @@ def test_native_bindings_use_pointer_width_handles():
     assert kernel32.FlushFileBuffers.argtypes == [ctypes.c_void_p]
     assert advapi32.OpenProcessToken.argtypes[0] is ctypes.c_void_p
     assert advapi32.GetSecurityInfo.argtypes[0] is ctypes.c_void_p
+    assert advapi32.GetSecurityDescriptorOwner.argtypes == [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_int),
+    ]
     assert advapi32.SetSecurityInfo.argtypes[0] is ctypes.c_void_p
 
 
@@ -325,7 +342,7 @@ def test_native_current_session_uses_the_current_process_id(monkeypatch):
     assert calls == [("process",), ("session", 987)]
 
 
-def test_native_created_handles_request_write_dac_before_protection(
+def test_native_created_handles_request_write_dac_and_owner_before_protection(
     monkeypatch,
 ):
     calls = []
@@ -355,9 +372,169 @@ def test_native_created_handles_request_write_dac_before_protection(
     api.create_empty_file(Path(r"C:\TeamMemory\.memberkit.env.tmp"))
 
     assert len(calls) == 2
+    assert calls[0][1] == 0x000E0080
+    assert calls[1][1] == 0xC00E0000
     for _path, access, _share, _creation, flags in calls:
         assert access & 0x00040000  # WRITE_DAC
+        assert access & 0x00080000  # WRITE_OWNER
         assert flags & 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
+
+
+def test_native_open_file_requests_write_owner_independently(monkeypatch):
+    calls = []
+
+    class Kernel32:
+        @staticmethod
+        def CreateFileW(path, access, share, security, creation, flags, template):
+            calls.append(access)
+            return 42
+
+    monkeypatch.setattr(
+        NativeWindowsApi,
+        "_libraries",
+        staticmethod(lambda: (ctypes, Kernel32(), object())),
+    )
+    api = object.__new__(NativeWindowsApi)
+
+    api.open_file(Path(r"C:\TeamMemory"), directory=True, write_owner=True)
+
+    assert calls[0] & 0x00080000  # WRITE_OWNER
+    assert not calls[0] & 0x00040000  # WRITE_DAC
+
+
+def test_native_private_security_sets_owner_and_dacl_together(monkeypatch):
+    calls = []
+
+    class Kernel32:
+        @staticmethod
+        def LocalFree(descriptor):
+            calls.append(("free", descriptor.value))
+
+    class Advapi32:
+        @staticmethod
+        def ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, revision, descriptor, size
+        ):
+            calls.append(("convert", sddl, revision))
+            descriptor._obj.value = 0x1000
+            return 1
+
+        @staticmethod
+        def GetSecurityDescriptorOwner(descriptor, owner, defaulted):
+            calls.append(("owner", descriptor.value))
+            owner._obj.value = 0x2000
+            return 1
+
+        @staticmethod
+        def GetSecurityDescriptorDacl(descriptor, present, dacl, defaulted):
+            calls.append(("dacl", descriptor.value))
+            present._obj.value = 1
+            dacl._obj.value = 0x3000
+            return 1
+
+        @staticmethod
+        def SetSecurityInfo(handle, kind, flags, owner, group, dacl, sacl):
+            calls.append(
+                (
+                    "set",
+                    handle,
+                    kind,
+                    flags,
+                    owner.value,
+                    group,
+                    dacl.value,
+                    sacl,
+                )
+            )
+            return 0
+
+    monkeypatch.setattr(
+        NativeWindowsApi,
+        "_libraries",
+        staticmethod(lambda: (ctypes, Kernel32(), Advapi32())),
+    )
+    api = object.__new__(NativeWindowsApi)
+
+    api.apply_private_security(
+        42,
+        SID,
+        (SID, SYSTEM_SID, ADMINISTRATORS_SID),
+    )
+
+    assert calls == [
+        (
+            "convert",
+            (
+                f"O:{SID}D:P"
+                f"(A;;FA;;;{SID})"
+                f"(A;;FA;;;{SYSTEM_SID})"
+                f"(A;;FA;;;{ADMINISTRATORS_SID})"
+            ),
+            1,
+        ),
+        ("owner", 0x1000),
+        ("dacl", 0x1000),
+        ("set", 42, 1, 0x80000005, 0x2000, None, 0x3000, None),
+        ("free", 0x1000),
+    ]
+
+
+@pytest.mark.parametrize("failure_step", ["owner", "dacl", "set"])
+def test_native_private_security_frees_descriptor_on_failure(
+    monkeypatch,
+    failure_step,
+):
+    calls = []
+
+    class Kernel32:
+        @staticmethod
+        def LocalFree(descriptor):
+            calls.append(("free", descriptor.value))
+
+    class Advapi32:
+        @staticmethod
+        def ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, revision, descriptor, size
+        ):
+            descriptor._obj.value = 0x1000
+            return 1
+
+        @staticmethod
+        def GetSecurityDescriptorOwner(descriptor, owner, defaulted):
+            if failure_step == "owner":
+                return 0
+            owner._obj.value = 0x2000
+            return 1
+
+        @staticmethod
+        def GetSecurityDescriptorDacl(descriptor, present, dacl, defaulted):
+            if failure_step == "dacl":
+                return 0
+            present._obj.value = 1
+            dacl._obj.value = 0x3000
+            return 1
+
+        @staticmethod
+        def SetSecurityInfo(handle, kind, flags, owner, group, dacl, sacl):
+            return 5 if failure_step == "set" else 0
+
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+    monkeypatch.setattr(
+        NativeWindowsApi,
+        "_libraries",
+        staticmethod(lambda: (ctypes, Kernel32(), Advapi32())),
+    )
+    api = object.__new__(NativeWindowsApi)
+
+    with pytest.raises(OSError) as error:
+        api.apply_private_security(
+            42,
+            SID,
+            (SID, SYSTEM_SID, ADMINISTRATORS_SID),
+        )
+
+    assert calls == [("free", 0x1000)]
+    assert SID not in str(error.value)
 
 
 @pytest.mark.parametrize(
@@ -513,21 +690,24 @@ def test_provision_windows_private_directory_creates_protects_and_validates():
     api = FakeWindowsApi()
 
     assert provision_windows_private_dir(path, SID, api) == path
-    assert api.dacl_calls == [
+    assert api.security_calls == [
         (path, SID, (SID, SYSTEM_SID, ADMINISTRATORS_SID))
     ]
+    assert api.created_owner_sids == [FOREIGN_SID]
+    assert api.records[path]["owner_sid"] == SID
     assert validate_windows_private_dir(path, SID, api) == path
 
 
 def test_provision_windows_private_directory_rejects_existing_unsafe_directory():
     path = Path(r"C:\Users\Alex\AppData\Roaming\TeamMemory")
-    unsafe = _directory(dacl_protected=False)
+    unsafe = _directory(owner_sid=FOREIGN_SID, dacl_protected=False)
     api = FakeWindowsApi({path: unsafe})
 
     with pytest.raises(ValueError):
         provision_windows_private_dir(path, SID, api)
 
-    assert api.dacl_calls == []
+    assert api.security_calls == []
+    assert unsafe["owner_sid"] == FOREIGN_SID
 
 
 def test_atomic_private_write_preserves_exact_security_order_and_cleans_artifacts():
@@ -542,8 +722,9 @@ def test_atomic_private_write_preserves_exact_security_order_and_cleans_artifact
     assert api.records[path]["data"] == SECRET_TEXT.encode("utf-8")
     assert api.phases == [
         "provision private parent",
+        "open and validate destination",
         "create empty candidate",
-        "apply protected DACL",
+        "apply private security",
         "validate candidate handle",
         "write UTF-8 through candidate handle",
         "flush candidate handle",
@@ -552,7 +733,13 @@ def test_atomic_private_write_preserves_exact_security_order_and_cleans_artifact
         "open and validate destination",
         "remove backup and candidate",
     ]
-    assert api.dacl_calls[-1][2] == (SID, SYSTEM_SID, ADMINISTRATORS_SID)
+    assert api.security_calls[-1][2] == (
+        SID,
+        SYSTEM_SID,
+        ADMINISTRATORS_SID,
+    )
+    assert api.created_owner_sids == [FOREIGN_SID]
+    assert api.records[path]["owner_sid"] == SID
     assert set(api.records) == {parent, path}
 
 
@@ -569,12 +756,31 @@ def test_atomic_private_first_write_uses_move_and_leaves_no_artifacts():
     assert set(api.records) == {parent, path}
 
 
+def test_atomic_private_write_rejects_existing_foreign_owner_without_mutation():
+    path = Path(r"C:\Users\Alex\AppData\Roaming\TeamMemory\memberkit.env")
+    parent, records = _private_records(path)
+    records[path]["owner_sid"] = FOREIGN_SID
+    original = records[path]
+    api = FakeWindowsApi(records)
+    api.parent = parent
+    api.destination = path
+
+    with pytest.raises(RuntimeError, match="validate existing destination"):
+        atomic_write_windows_private_text(path, SECRET_TEXT, SID, api)
+
+    assert api.records[path] is original
+    assert api.records[path]["owner_sid"] == FOREIGN_SID
+    assert api.records[path]["data"] == b"old private bytes\n"
+    assert api.created_owner_sids == []
+    assert api.security_calls == []
+
+
 @pytest.mark.parametrize(
     "phase",
     [
         "provision private parent",
         "create empty candidate",
-        "apply protected DACL",
+        "apply private security",
         "validate candidate handle",
         "write UTF-8 through candidate handle",
         "flush candidate handle",
@@ -616,10 +822,14 @@ def test_atomic_private_write_reports_rollback_failure_separately():
     api.destination = path
 
     original_open = api.open_file
+    destination_opens = 0
 
     def fail_destination_validation(candidate, *, directory=False):
+        nonlocal destination_opens
         if Path(candidate) == path and not directory:
-            raise OSError(f"validation failed: {SECRET_TEXT}")
+            destination_opens += 1
+            if destination_opens == 2:
+                raise OSError(f"validation failed: {SECRET_TEXT}")
         return original_open(candidate, directory=directory)
 
     api.open_file = fail_destination_validation
@@ -634,6 +844,42 @@ def test_atomic_private_write_reports_rollback_failure_separately():
     ]
     assert backups == [b"old private bytes\n"]
     assert SECRET_TEXT.strip() not in str(error.value)
+
+
+def test_atomic_private_write_rolls_back_after_second_destination_open_fails():
+    path = Path(r"C:\Users\Alex\AppData\Roaming\TeamMemory\memberkit.env")
+    parent, records = _private_records(path)
+    api = FakeWindowsApi(records)
+    api.parent = parent
+    api.destination = path
+    destination_opens = 0
+    restore_calls = []
+    original_open = api.open_file
+    original_restore = api.restore_backup
+
+    def fail_post_replace_validation(candidate, *, directory=False):
+        nonlocal destination_opens
+        if Path(candidate) == path and not directory:
+            destination_opens += 1
+            if destination_opens == 2:
+                raise OSError(f"post-replace validation failed: {SECRET_TEXT}")
+        return original_open(candidate, directory=directory)
+
+    def record_restore(destination, backup):
+        restore_calls.append((Path(destination), Path(backup)))
+        return original_restore(destination, backup)
+
+    api.open_file = fail_post_replace_validation
+    api.restore_backup = record_restore
+
+    with pytest.raises(RuntimeError, match="open and validate destination"):
+        atomic_write_windows_private_text(path, SECRET_TEXT, SID, api)
+
+    assert destination_opens == 2
+    assert len(restore_calls) == 1
+    assert restore_calls[0][0] == path
+    assert api.records[path]["data"] == b"old private bytes\n"
+    assert set(api.records) == {parent, path}
 
 
 def test_atomic_private_write_removes_secret_from_entire_exception_chain():

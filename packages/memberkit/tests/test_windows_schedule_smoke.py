@@ -35,8 +35,17 @@ class _ParentProvisioningApi:
     def current_process_sid(self):
         return self.sid
 
-    def open_file(self, path, *, directory=False, write_dac=False):
-        self.calls.append(("open_file", Path(path), directory, write_dac))
+    def open_file(
+        self,
+        path,
+        *,
+        directory=False,
+        write_dac=False,
+        write_owner=False,
+    ):
+        self.calls.append(
+            ("open_file", Path(path), directory, write_dac, write_owner)
+        )
         if Path(path) == self.parent and directory and not write_dac:
             failure = FileNotFoundError(errno.ENOENT, "PLANTED_EXCEPTION")
             failure.winerror = 3
@@ -45,10 +54,15 @@ class _ParentProvisioningApi:
 
     def create_directory(self, path):
         self.calls.append(("create_directory", Path(path)))
-        return self.open_file(path, directory=True, write_dac=True)
+        return self.open_file(
+            path,
+            directory=True,
+            write_dac=True,
+            write_owner=True,
+        )
 
-    def apply_protected_dacl(self, handle, sid, principals):
-        self.calls.append(("apply_protected_dacl", handle, sid, tuple(principals)))
+    def apply_private_security(self, handle, sid, principals):
+        self.calls.append(("apply_private_security", handle, sid, tuple(principals)))
 
     def describe_handle(self, handle):
         self.calls.append(("describe_handle", handle))
@@ -79,7 +93,14 @@ class _AtomicWriteApi(_ParentProvisioningApi):
         self.records = {}
         self.fail_candidate = fail_candidate
 
-    def open_file(self, path, *, directory=False, write_dac=False):
+    def open_file(
+        self,
+        path,
+        *,
+        directory=False,
+        write_dac=False,
+        write_owner=False,
+    ):
         path = Path(path)
         if (
             path == self.parent
@@ -94,7 +115,7 @@ class _AtomicWriteApi(_ParentProvisioningApi):
 
     def create_directory(self, path):
         record = {
-            "owner_sid": self.sid,
+            "owner_sid": "S-1-5-21-FOREIGN-PLANTED",
             "dacl_protected": False,
             "file_type": "disk",
             "directory": True,
@@ -103,13 +124,18 @@ class _AtomicWriteApi(_ParentProvisioningApi):
             "allow_aces": [],
         }
         self.records[Path(path)] = record
-        return self.open_file(path, directory=True, write_dac=True)
+        return self.open_file(
+            path,
+            directory=True,
+            write_dac=True,
+            write_owner=True,
+        )
 
     def create_empty_file(self, path):
         if self.fail_candidate:
             raise PermissionError(errno.EACCES, "PLANTED_CANDIDATE_SECRET")
         record = {
-            "owner_sid": self.sid,
+            "owner_sid": "S-1-5-21-FOREIGN-PLANTED",
             "dacl_protected": False,
             "file_type": "disk",
             "directory": False,
@@ -121,7 +147,8 @@ class _AtomicWriteApi(_ParentProvisioningApi):
         self.records[Path(path)] = record
         return record
 
-    def apply_protected_dacl(self, handle, sid, principals):
+    def apply_private_security(self, handle, sid, principals):
+        handle["owner_sid"] = sid
         handle["dacl_protected"] = True
         handle["allow_aces"] = [
             (principal, 0x10000000) for principal in principals
@@ -181,8 +208,8 @@ def test_real_write_config_emits_exact_safe_sequence_only_on_failure(
             "status=missing category=file-not-found winerror=3"
         ),
         "memberkit.private-config stage=parent.create-directory status=ok",
-        "memberkit.private-config stage=parent.open-write-dac status=ok",
-        "memberkit.private-config stage=parent.apply-dacl status=ok",
+        "memberkit.private-config stage=parent.open-write-security status=ok",
+        "memberkit.private-config stage=parent.apply-security status=ok",
         (
             "memberkit.private-config stage=parent.describe-handle status=ok "
             "owner_matches_current_sid=true dacl_protected=true disk=true "

@@ -211,7 +211,7 @@ def provision_windows_private_dir(
             handle = native.create_directory(path)
         except FileExistsError:
             return _open_and_validate(path, sid, native, directory=True)
-        native.apply_protected_dacl(
+        native.apply_private_security(
             handle,
             sid,
             (sid, *PRIVATE_DACL_SIDS),
@@ -278,11 +278,15 @@ def atomic_write_windows_private_text(
         provision_windows_private_dir(parent, sid, native)
 
         had_destination = native.path_exists(path)
+        if had_destination:
+            phase = "validate existing destination"
+            validate_windows_private_file(path, sid, native)
+
         phase = "create empty candidate"
         handle = native.create_empty_file(candidate)
 
-        phase = "apply protected DACL"
-        native.apply_protected_dacl(
+        phase = "apply private security"
+        native.apply_private_security(
             handle,
             sid,
             (sid, *PRIVATE_DACL_SIDS),
@@ -486,6 +490,12 @@ class NativeWindowsApi:
             pointer(dword),
         ]
         advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = boolean
+        advapi32.GetSecurityDescriptorOwner.argtypes = [
+            handle,
+            pointer(handle),
+            pointer(boolean),
+        ]
+        advapi32.GetSecurityDescriptorOwner.restype = boolean
         advapi32.GetSecurityDescriptorDacl.argtypes = [
             handle,
             pointer(boolean),
@@ -578,11 +588,14 @@ class NativeWindowsApi:
         *,
         directory: bool = False,
         write_dac: bool = False,
+        write_owner: bool = False,
     ):
         ctypes, kernel32, _advapi32 = self._libraries()
         desired_access = 0x00020000 | (0x00000080 if directory else 0x80000000)
         if write_dac:
             desired_access |= 0x00040000
+        if write_owner:
+            desired_access |= 0x00080000
         flags = 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
         if directory:
             flags |= 0x02000000  # FILE_FLAG_BACKUP_SEMANTICS
@@ -610,7 +623,12 @@ class NativeWindowsApi:
                 raise FileExistsError(error, "Windows directory exists", str(path))
             raise OSError(error, "CreateDirectoryW failed")
         try:
-            return self.open_file(path, directory=True, write_dac=True)
+            return self.open_file(
+                path,
+                directory=True,
+                write_dac=True,
+                write_owner=True,
+            )
         except BaseException:
             kernel32.RemoveDirectoryW(str(path))
             raise
@@ -619,7 +637,11 @@ class NativeWindowsApi:
         ctypes, kernel32, _advapi32 = self._libraries()
         handle = kernel32.CreateFileW(
             str(path),
-            0x80000000 | 0x40000000 | 0x00020000 | 0x00040000,
+            0x80000000
+            | 0x40000000
+            | 0x00020000
+            | 0x00040000
+            | 0x00080000,
             0,
             None,
             1,
@@ -791,18 +813,21 @@ class NativeWindowsApi:
             return None
         return offset if ace_size >= offset + 8 else None
 
-    def apply_protected_dacl(
+    def apply_private_security(
         self,
         handle,
         sid: str,
         principals: Iterable[str],
     ) -> None:
+        """Set the current-user owner and protected private DACL together."""
         ctypes, kernel32, advapi32 = self._libraries()
         principals = tuple(principals)
         expected = (sid, *PRIVATE_DACL_SIDS)
         if principals != expected:
             raise ValueError("private DACL principals do not match the security contract")
-        sddl = "D:P" + "".join(f"(A;;FA;;;{principal})" for principal in principals)
+        sddl = f"O:{sid}D:P" + "".join(
+            f"(A;;FA;;;{principal})" for principal in principals
+        )
         descriptor = ctypes.c_void_p()
         if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl,
@@ -815,6 +840,17 @@ class NativeWindowsApi:
                 "ConvertStringSecurityDescriptorToSecurityDescriptorW failed",
             )
         try:
+            owner = ctypes.c_void_p()
+            owner_defaulted = ctypes.c_int()
+            if not advapi32.GetSecurityDescriptorOwner(
+                descriptor,
+                ctypes.byref(owner),
+                ctypes.byref(owner_defaulted),
+            ) or not owner.value:
+                raise OSError(
+                    ctypes.get_last_error(),
+                    "GetSecurityDescriptorOwner failed",
+                )
             present = ctypes.c_int()
             defaulted = ctypes.c_int()
             dacl = ctypes.c_void_p()
@@ -823,7 +859,7 @@ class NativeWindowsApi:
                 ctypes.byref(present),
                 ctypes.byref(dacl),
                 ctypes.byref(defaulted),
-            ) or not present.value:
+            ) or not present.value or not dacl.value:
                 raise OSError(
                     ctypes.get_last_error(),
                     "GetSecurityDescriptorDacl failed",
@@ -831,8 +867,8 @@ class NativeWindowsApi:
             result = advapi32.SetSecurityInfo(
                 handle,
                 1,
-                0x00000004 | 0x80000000,
-                None,
+                0x00000001 | 0x00000004 | 0x80000000,
+                owner,
                 None,
                 dacl,
                 None,

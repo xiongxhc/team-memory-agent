@@ -134,10 +134,13 @@ class _PrivateConfigDiagnosticApi:
         path: Path,
         directory: bool,
         write_dac: bool,
+        write_owner: bool,
     ) -> Any:
         kwargs = {"directory": directory}
         if write_dac:
             kwargs["write_dac"] = True
+        if write_owner:
+            kwargs["write_owner"] = True
         return opener(path, **kwargs)
 
     def _open_parent(
@@ -147,10 +150,17 @@ class _PrivateConfigDiagnosticApi:
         *,
         directory: bool,
         write_dac: bool,
+        write_owner: bool,
     ) -> Any:
         handle = self._call(
-            "parent.open-write-dac" if write_dac else "parent.open-existing",
-            lambda: self._delegate_open(opener, path, directory, write_dac),
+            "parent.open-write-security" if write_dac else "parent.open-existing",
+            lambda: self._delegate_open(
+                opener,
+                path,
+                directory,
+                write_dac,
+                write_owner,
+            ),
             missing=not write_dac,
         )
         self._parent_handles.add(id(handle))
@@ -162,6 +172,7 @@ class _PrivateConfigDiagnosticApi:
         *,
         directory: bool = False,
         write_dac: bool = False,
+        write_owner: bool = False,
     ) -> Any:
         if directory and Path(path) == self._parent:
             return self._open_parent(
@@ -169,9 +180,14 @@ class _PrivateConfigDiagnosticApi:
                 Path(path),
                 directory=directory,
                 write_dac=write_dac,
+                write_owner=write_owner,
             )
         return self._delegate_open(
-            self._delegate.open_file, Path(path), directory, write_dac
+            self._delegate.open_file,
+            Path(path),
+            directory,
+            write_dac,
+            write_owner,
         )
 
     def create_directory(self, path: Path) -> Any:
@@ -187,6 +203,7 @@ class _PrivateConfigDiagnosticApi:
             *,
             directory: bool = False,
             write_dac: bool = False,
+            write_owner: bool = False,
         ) -> Any:
             if directory and Path(opened_path) == self._parent:
                 return self._open_parent(
@@ -194,9 +211,14 @@ class _PrivateConfigDiagnosticApi:
                     Path(opened_path),
                     directory=directory,
                     write_dac=write_dac,
+                    write_owner=write_owner,
                 )
             return self._delegate_open(
-                original_opener, Path(opened_path), directory, write_dac
+                original_opener,
+                Path(opened_path),
+                directory,
+                write_dac,
+                write_owner,
             )
 
         setattr(self._delegate, "open_file", observed_opener)
@@ -218,17 +240,17 @@ class _PrivateConfigDiagnosticApi:
             else:
                 delattr(self._delegate, "open_file")
 
-    def apply_protected_dacl(
+    def apply_private_security(
         self,
         handle: Any,
         sid: str,
         principals: Any,
     ) -> None:
         if id(handle) not in self._parent_handles:
-            return self._delegate.apply_protected_dacl(handle, sid, principals)
+            return self._delegate.apply_private_security(handle, sid, principals)
         self._call(
-            "parent.apply-dacl",
-            lambda: self._delegate.apply_protected_dacl(handle, sid, principals),
+            "parent.apply-security",
+            lambda: self._delegate.apply_private_security(handle, sid, principals),
         )
 
     def describe_handle(self, handle: Any) -> dict[str, Any]:
