@@ -465,8 +465,7 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
         for element in root.iter():
             _local(element.tag)
         _valid_task_name(expected.task_name, expected.sid)
-        _exact_children(
-            root,
+        if _child_names(root) not in (
             [
                 "RegistrationInfo",
                 "Principals",
@@ -474,7 +473,15 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
                 "Settings",
                 "Actions",
             ],
-        )
+            [
+                "RegistrationInfo",
+                "Principals",
+                "Settings",
+                "Triggers",
+                "Actions",
+            ],
+        ):
+            raise ValueError(_MANAGED_ERROR)
 
         registration = _only(root, "RegistrationInfo")
         _required_optional_children(

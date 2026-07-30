@@ -564,6 +564,12 @@ def _swap_xml_blocks(text, first_open, first_close, second_open, second_close):
             "<Principals>",
             "</Principals>",
         ),
+        (
+            "<Settings>",
+            "</Settings>",
+            '<Actions Context="Author">',
+            "</Actions>",
+        ),
         ("<Source>", "</Source>", "<URI>", "</URI>"),
         ("<UserId>", "</UserId>", "<LogonType>", "</LogonType>"),
         (
@@ -702,6 +708,28 @@ def _scheduler_normalized_xml(schedule):
     )
     assert generated in text
     return text.replace(generated, normalized, 1)
+
+
+def _native_scheduler_normalized_xml(schedule):
+    return _swap_xml_blocks(
+        _scheduler_normalized_xml(schedule),
+        "<Triggers>",
+        "</Triggers>",
+        "<Settings>",
+        "</Settings>",
+    )
+
+
+def test_xml_accepts_full_native_scheduler_normalization():
+    schedule = _schedule()
+    xml = _xml_bytes(
+        _native_scheduler_normalized_xml(schedule),
+        encoding="utf-8",
+        bom=b"",
+    )
+
+    assert windows.parse_task_xml(xml, schedule) == "17:30"
+    assert windows.task_xml_mismatch_categories(xml, schedule) == ()
 
 
 def test_xml_accepts_only_the_proven_scheduler_added_defaults():
@@ -932,6 +960,41 @@ def test_status_accepts_only_the_exact_managed_definition():
         Path(schedule.task_name),
         "17:30",
     )
+
+
+def test_status_and_remove_authenticate_native_normalized_task(
+    tmp_path,
+    monkeypatch,
+):
+    schedule = _schedule()
+    normalized = _xml_bytes(
+        _native_scheduler_normalized_xml(schedule),
+        encoding="utf-8",
+        bom=b"",
+    )
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner({schedule.task_name: normalized}),
+    )
+
+    assert windows.schedule_status(
+        api=api,
+        runner=runner,
+        executable=schedule.executable,
+    ) == windows.ScheduleStatus(
+        True,
+        Path(schedule.task_name),
+        "17:30",
+    )
+    assert windows.remove_schedule(
+        api=api,
+        runner=runner,
+        state_dir=tmp_path,
+        executable=schedule.executable,
+        lock_factory=lambda _path: RecordingLock(events),
+    ) is True
+    assert runner.tasks == {}
 
 
 @pytest.mark.parametrize(
@@ -1717,6 +1780,57 @@ def test_first_install_rollback_never_deletes_concurrently_appearing_foreign_tas
 
     assert runner.tasks[schedule.task_name] == foreign
     assert not any(call[1] == "/Delete" for call in runner.calls)
+
+
+def test_first_install_recovery_deletes_native_normalized_task(
+    tmp_path,
+    monkeypatch,
+):
+    schedule = _schedule()
+    normalized = _xml_bytes(
+        _native_scheduler_normalized_xml(schedule),
+        encoding="utf-8",
+        bom=b"",
+    )
+    runner, events, api = _lifecycle_args(tmp_path, monkeypatch)
+    created = False
+    post_create_queries = 0
+
+    def fail_first_post_create_verification(command, result):
+        nonlocal created, post_create_queries
+        if command[1] == "/Create":
+            created = True
+            runner.tasks[schedule.task_name] = normalized
+        elif command[1] == "/Query" and "/XML" in command and created:
+            post_create_queries += 1
+            if post_create_queries == 1:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    b"controlled invalid verification",
+                    b"",
+                )
+        return result
+
+    runner.hook = fail_first_post_create_verification
+    with pytest.raises(RuntimeError) as error:
+        windows.install_schedule(
+            17,
+            30,
+            schedule.executable,
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert str(error.value) == (
+        "Windows schedule installation failed; previous state restored"
+    )
+    assert post_create_queries == 3
+    assert runner.tasks == {}
+    assert sum(call[1] == "/Delete" for call in runner.calls) == 1
+    assert "controlled" not in str(error.value)
 
 
 def test_prior_snapshot_rollback_never_overwrites_concurrent_foreign_task(
