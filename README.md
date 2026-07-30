@@ -28,7 +28,7 @@ Ask the hub operator for:
 - your roster slug, such as `alex`;
 - the Git URL of the team-memory inbox, plus permission to push to it.
 
-MemberKit v0.1 reads local observations from
+MemberKit v0.2 reads local observations from
 [`claude-mem`](https://github.com/thedotmack/claude-mem). Its default database is
 `~/.claude-mem/claude-mem.db`. You also need Python 3.11 or newer, `pipx`, and Git.
 
@@ -156,11 +156,10 @@ The public quick start uses GitHub and Slack. GitLab, Feishu, and Discord are
 equally supported built-in options. Every network connector is disabled by
 default; package installation makes no provider request and creates no schedule.
 
-### 1. Install the connector-capable source checkout
+### 1. Install the connector-capable hub
 
-The five-connector hub is version 0.2.0. That connector-capable release is not
-yet published on PyPI, so the current pre-release path is a reviewed source
-checkout:
+The five-connector hub is version 0.2.0. The following source-checkout path keeps
+the example configuration files beside the installation:
 
 ```bash
 git clone https://github.com/xiongxhc/team-memory-agent.git
@@ -293,18 +292,16 @@ accepted and quarantined files are consumed from the configured import directory
 See the [deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md)
 for the safe export and `run-daily` workflow.
 
-### Published-package path after release
+### Published-package installation
 
-After a connector-capable release is confirmed on PyPI, the package path will
-be:
+Install the connector-capable release from PyPI with:
 
 ```bash
 pipx install 'teammem>=0.2.0'
 ```
 
-Do not use that command as evidence that 0.2.0 is already published. For a
-scheduled package installation, remove the schedule before upgrading, test one
-manual run, and explicitly reinstall it:
+For a scheduled package installation, remove the schedule before upgrading,
+test one manual run, and explicitly reinstall it:
 
 ```bash
 teammem schedule remove

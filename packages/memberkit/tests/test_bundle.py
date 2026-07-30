@@ -263,10 +263,11 @@ def test_default_and_all_preserve_every_eligible_observation(tmp_path):
 
 
 def test_draft_uses_only_frozen_v1_fields_from_rich_observation_rows(tmp_path):
+    iso = "2026-07-24T09:00:00+04:00"
     row = (
         "sdk", "SESSION_SENTINEL", "Visible title", "SUBTITLE_SENTINEL",
         "NARRATIVE_SENTINEL", "FACTS_SENTINEL", "TYPE_SENTINEL",
-        "2026-07-24T09:00:00", epoch("2026-07-24T09:00:00"),
+        iso, epoch(iso),
     )
 
     out = bundle.draft(

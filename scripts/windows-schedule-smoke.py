@@ -26,6 +26,8 @@ _SAFE_SUFFIX = re.compile(r"[A-Za-z0-9_-]+\Z")
 _FIRST_TRIGGER_DELAY = timedelta(minutes=10)
 _REPLACEMENT_TRIGGER_DELAY = timedelta(minutes=20)
 _ROLLOVER_WAIT_SECONDS = 21 * 60
+_SYSTEM_SID = "S-1-5-18"
+_ADMINISTRATORS_SID = "S-1-5-32-544"
 
 
 def _arguments() -> argparse.Namespace:
@@ -68,6 +70,27 @@ def _teammem_executable() -> str:
     return str(Path(command).resolve())
 
 
+def _secure_ci_path(path: Path, sid: str, *, directory: bool) -> None:
+    """Give a disposable CI path the same owner/DACL contract as production."""
+    rights = "(OI)(CI)F" if directory else "F"
+    commands = (
+        ["icacls.exe", str(path), "/inheritancelevel:r"],
+        [
+            "icacls.exe",
+            str(path),
+            "/grant:r",
+            f"*{sid}:{rights}",
+            f"*{_SYSTEM_SID}:{rights}",
+            f"*{_ADMINISTRATORS_SID}:{rights}",
+        ],
+        ["icacls.exe", str(path), "/setowner", f"*{sid}"],
+    )
+    for command in commands:
+        result = subprocess.run(command, capture_output=True, check=False)
+        if result.returncode != 0:
+            raise RuntimeError("could not secure Windows smoke-test path")
+
+
 def _paths(suffix: str) -> tuple[Path, Path]:
     if not _SAFE_SUFFIX.fullmatch(suffix):
         raise ValueError("smoke suffix must contain only letters, digits, _ and -")
@@ -106,9 +129,14 @@ def _select_future_schedule_times() -> tuple[str, str]:
 
 def run_smoke(suffix: str) -> None:
     env_dir, state_dir = _paths(suffix)
+    sid = current_user_sid()
     env_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    _secure_ci_path(env_dir, sid, directory=True)
+    _secure_ci_path(state_dir, sid, directory=True)
     env_file = env_dir / "hub.env"
     env_file.write_text("TEAMMEM_SINCE_DAYS=1\n", encoding="utf-8")
+    _secure_ci_path(env_file, sid, directory=False)
     cfg = Config.load(env_file=env_file, require_env_file=True, platform="win32")
     executable = _teammem_executable()
     install_time, replace_time = _select_future_schedule_times()
