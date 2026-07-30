@@ -229,6 +229,42 @@ def test_xml_rejects_shell_executables(executable):
 
 
 @pytest.mark.parametrize(
+    "executable",
+    [
+        r"C:\TeamMem\other.exe",
+        r"C:\Windows\System32\cmd.exe.",
+        "C:\\Windows\\System32\\cmd.exe ",
+        r"C:\Windows\System32\powershell.exe.",
+        "C:\\Program Files\\PowerShell\\7\\pwsh.exe ",
+        r"C:\TeamMem\MEMBERKIT.EXE",
+        r"C:\TeamMem\memberkit.exe.",
+        "C:\\TeamMem\\memberkit.exe ",
+        r"C:\TeamMem.\memberkit.exe",
+        "C:\\TeamMem \\memberkit.exe",
+        r"C:\TeamMem\.\memberkit.exe",
+        r"C:\TeamMem\\memberkit.exe",
+        "C:/TeamMem/memberkit.exe",
+        "C:\\TeamMem\\memberkit.exe\n",
+    ],
+)
+def test_xml_builder_rejects_noncanonical_memberkit_executable(executable):
+    with pytest.raises(ValueError, match="canonical memberkit.exe"):
+        windows.build_task_xml(_schedule(executable=executable))
+
+
+def test_xml_parser_rejects_matching_non_memberkit_executable():
+    expected = _schedule(executable=r"C:\TeamMem\other.exe")
+    text = _xml_text().replace(
+        r"C:\Program Files\TeamMem\memberkit.exe",
+        expected.executable,
+        1,
+    )
+
+    with pytest.raises(RuntimeError, match="not managed"):
+        windows.parse_task_xml(_xml_bytes(text), expected)
+
+
+@pytest.mark.parametrize(
     "time",
     [
         "7:30",
@@ -456,8 +492,143 @@ def test_xml_rejects_entity_bearing_documents(payload):
         windows.parse_task_xml(payload, _schedule())
 
 
+@pytest.mark.parametrize(
+    "addition",
+    [
+        "<!-- lexical tampering -->",
+        "<?memberkit lexical-tampering?>",
+    ],
+)
+def test_xml_rejects_comments_and_processing_instructions(addition):
+    schedule = _schedule()
+    text = _xml_text(schedule)
+    mutations = [
+        text.replace(
+            "</RegistrationInfo>",
+            "</RegistrationInfo>" + addition,
+            1,
+        ),
+        text.replace("\r\n<Task", "\r\n" + addition + "<Task", 1),
+        text + addition,
+    ]
+
+    for mutation in mutations:
+        with pytest.raises(RuntimeError, match="not managed"):
+            windows.parse_task_xml(_xml_bytes(mutation), schedule)
+
+
+@pytest.mark.parametrize(
+    ("original", "tampered"),
+    [
+        ("<RegistrationInfo>", "<RegistrationInfo>lexical-tampering"),
+        ("<Settings>", "<Settings>lexical-tampering"),
+        ("</Source><URI>", "</Source>lexical-tampering<URI>"),
+    ],
+)
+def test_xml_rejects_non_whitespace_container_text_and_tails(
+    original,
+    tampered,
+):
+    schedule = _schedule()
+    text = _xml_text(schedule).replace(original, tampered, 1)
+
+    with pytest.raises(RuntimeError, match="not managed"):
+        windows.parse_task_xml(_xml_bytes(text), schedule)
+
+
+def _swap_xml_blocks(text, first_open, first_close, second_open, second_close):
+    first_start = text.index(first_open)
+    first_end = text.index(first_close, first_start) + len(first_close)
+    second_start = text.index(second_open, first_end)
+    second_end = text.index(second_close, second_start) + len(second_close)
+    return (
+        text[:first_start]
+        + text[second_start:second_end]
+        + text[first_end:second_start]
+        + text[first_start:first_end]
+        + text[second_end:]
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_open", "first_close", "second_open", "second_close"),
+    [
+        (
+            "<RegistrationInfo>",
+            "</RegistrationInfo>",
+            "<Principals>",
+            "</Principals>",
+        ),
+        ("<Source>", "</Source>", "<URI>", "</URI>"),
+        ("<UserId>", "</UserId>", "<LogonType>", "</LogonType>"),
+        (
+            "<StartBoundary>",
+            "</StartBoundary>",
+            "<ScheduleByDay>",
+            "</ScheduleByDay>",
+        ),
+        (
+            "<MultipleInstancesPolicy>",
+            "</MultipleInstancesPolicy>",
+            "<Enabled>",
+            "</Enabled>",
+        ),
+        ("<Command>", "</Command>", "<Arguments>", "</Arguments>"),
+    ],
+)
+def test_xml_rejects_unproven_child_order(
+    first_open,
+    first_close,
+    second_open,
+    second_close,
+):
+    schedule = _schedule()
+    text = _swap_xml_blocks(
+        _xml_text(schedule),
+        first_open,
+        first_close,
+        second_open,
+        second_close,
+    )
+
+    with pytest.raises(RuntimeError, match="not managed"):
+        windows.parse_task_xml(_xml_bytes(text), schedule)
+
+
+@pytest.mark.parametrize(
+    "tampered",
+    [
+        "<Source>TeamMem&#45;MemberKit</Source>",
+        "<Source><![CDATA[TeamMem-MemberKit]]></Source>",
+    ],
+)
+def test_xml_rejects_noncanonical_lexical_spelling_of_managed_text(tampered):
+    schedule = _schedule()
+    text = _xml_text(schedule).replace(
+        "<Source>TeamMem-MemberKit</Source>",
+        tampered,
+        1,
+    )
+
+    with pytest.raises(RuntimeError, match="not managed"):
+        windows.parse_task_xml(_xml_bytes(text), schedule)
+
+
 def _scheduler_normalized_xml(schedule):
     text = _xml_text(schedule)
+    text = text.replace(
+        (
+            "<Source>TeamMem-MemberKit</Source>"
+            f"<URI>{schedule.task_name}</URI>"
+            "<Description>TeamMem MemberKit daily draft reminder</Description>"
+        ),
+        (
+            "<Source>TeamMem-MemberKit</Source>"
+            "<Description>TeamMem MemberKit daily draft reminder</Description>"
+            f"<URI>{schedule.task_name}</URI>"
+        ),
+        1,
+    )
     text = text.replace("<RunLevel>LeastPrivilege</RunLevel>", "", 1)
     text = text.replace(
         "<Enabled>true</Enabled></CalendarTrigger>",

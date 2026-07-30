@@ -18,6 +18,7 @@ from .windows_security import (
 
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_NUMERIC_ENTITY = re.compile(r"&#(?:[0-9]+|[xX][0-9a-fA-F]+);")
 _NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 _TAG = "{" + _NAMESPACE + "}"
 _TASK_NAME = re.compile(r"\\TeamMem-MemberKit-Daily-[0-9a-f]{12}\Z")
@@ -143,6 +144,39 @@ def _is_shell(path: str) -> bool:
     }
 
 
+def _canonical_memberkit_executable(value: str | Path) -> str:
+    path = _absolute_windows_path(value)
+    if "/" in path or _CONTROL.search(path) or ntpath.normpath(path) != path:
+        raise ValueError(
+            "Windows schedule executable must use a canonical memberkit.exe path"
+        )
+
+    drive, tail = ntpath.splitdrive(path)
+    components = [component for component in tail.split("\\") if component]
+    if drive.startswith("\\\\"):
+        components = drive[2:].split("\\") + components
+    invalid_characters = set('<>"|?*:')
+    reserved = re.compile(
+        r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?\Z",
+        re.IGNORECASE,
+    )
+    if (
+        not components
+        or any(
+            component in {".", ".."}
+            or component.endswith((".", " "))
+            or any(character in invalid_characters for character in component)
+            or reserved.fullmatch(component)
+            for component in components
+        )
+        or ntpath.basename(path) != "memberkit.exe"
+    ):
+        raise ValueError(
+            "Windows schedule executable must use a canonical memberkit.exe path"
+        )
+    return path
+
+
 def _valid_task_name(value: str, sid: str) -> str:
     if not _TASK_NAME.fullmatch(value) or value != task_name(sid):
         raise ValueError("Windows task name must match the current SID")
@@ -174,6 +208,7 @@ def build_task_xml(schedule: WindowsSchedule) -> bytes:
     executable = _absolute_windows_path(schedule.executable)
     if _is_shell(executable):
         raise ValueError("Windows schedule executable must not be a shell")
+    executable = _canonical_memberkit_executable(executable)
     name = _valid_task_name(schedule.task_name, schedule.sid)
     time = _normal_time(schedule.time)
     arguments = encode_arguments(["scheduled-run"])
@@ -280,6 +315,10 @@ def _children(parent: ET.Element, name: str) -> list[ET.Element]:
     return [child for child in parent if _local(child.tag) == name]
 
 
+def _child_names(parent: ET.Element) -> list[str]:
+    return [_local(child.tag) for child in parent]
+
+
 def _only(parent: ET.Element, name: str) -> ET.Element:
     values = _children(parent, name)
     if len(values) != 1:
@@ -288,7 +327,7 @@ def _only(parent: ET.Element, name: str) -> ET.Element:
 
 
 def _exact_children(parent: ET.Element, names: Sequence[str]) -> None:
-    if sorted(_local(child.tag) for child in parent) != sorted(names):
+    if _child_names(parent) != list(names):
         raise ValueError(_MANAGED_ERROR)
 
 
@@ -297,7 +336,7 @@ def _required_optional_children(
     required: Sequence[str],
     optional: Sequence[str],
 ) -> None:
-    names = [_local(child.tag) for child in parent]
+    names = _child_names(parent)
     allowed = tuple(required) + tuple(optional)
     if (
         any(name not in allowed for name in names)
@@ -324,9 +363,25 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
     try:
         source = _decode_xml(xml)
         lowered = source.lower()
-        if "<!doctype" in lowered or "<!entity" in lowered:
+        after_declaration = source.lstrip()
+        if after_declaration.startswith("<?xml "):
+            declaration_end = after_declaration.find("?>")
+            if declaration_end < 0:
+                raise ValueError(_MANAGED_ERROR)
+            after_declaration = after_declaration[declaration_end + 2:]
+        if (
+            "<!doctype" in lowered
+            or "<!entity" in lowered
+            or "<![" in source
+            or "<!--" in source
+            or "<?" in after_declaration
+            or _NUMERIC_ENTITY.search(source)
+        ):
             raise ValueError(_MANAGED_ERROR)
-        root = ET.fromstring(source)
+        parser = ET.XMLParser(
+            target=ET.TreeBuilder(insert_comments=True, insert_pis=True)
+        )
+        root = ET.fromstring(source, parser=parser)
         if root.tag != _TAG + "Task" or root.attrib != {"version": "1.4"}:
             raise ValueError(_MANAGED_ERROR)
         for element in root.iter():
@@ -349,6 +404,19 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
             ["Source", "URI", "Description"],
             ["Date", "Author"],
         )
+        registration_names = _child_names(registration)
+        metadata_end = 0
+        for metadata_name in ("Date", "Author"):
+            if (
+                metadata_end < len(registration_names)
+                and registration_names[metadata_end] == metadata_name
+            ):
+                metadata_end += 1
+        if registration_names[metadata_end:] not in (
+            ["Source", "URI", "Description"],
+            ["Source", "Description", "URI"],
+        ):
+            raise ValueError(_MANAGED_ERROR)
         for name in ("Date", "Author"):
             for element in _children(registration, name):
                 if (
@@ -366,6 +434,11 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
             ["UserId", "LogonType"],
             ["RunLevel"],
         )
+        if _child_names(principal) not in (
+            ["UserId", "LogonType"],
+            ["UserId", "LogonType", "RunLevel"],
+        ):
+            raise ValueError(_MANAGED_ERROR)
 
         triggers = _only(root, "Triggers")
         _exact_children(triggers, ["CalendarTrigger"])
@@ -375,6 +448,11 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
             ["StartBoundary", "ScheduleByDay"],
             ["Enabled"],
         )
+        if _child_names(trigger) not in (
+            ["StartBoundary", "ScheduleByDay"],
+            ["StartBoundary", "ScheduleByDay", "Enabled"],
+        ):
+            raise ValueError(_MANAGED_ERROR)
         _exact_children(_only(trigger, "ScheduleByDay"), ["DaysInterval"])
 
         settings = _only(root, "Settings")
@@ -421,6 +499,29 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
             [key for key, _value, _category in default_settings]
             + ["IdleSettings"],
         )
+        if _child_names(settings) not in (
+            [
+                "MultipleInstancesPolicy",
+                "Enabled",
+                "StartWhenAvailable",
+                "DisallowStartIfOnBatteries",
+                "StopIfGoingOnBatteries",
+                "RunOnlyIfNetworkAvailable",
+                "WakeToRun",
+                "ExecutionTimeLimit",
+                "UseUnifiedSchedulingEngine",
+            ],
+            [
+                "DisallowStartIfOnBatteries",
+                "StopIfGoingOnBatteries",
+                "ExecutionTimeLimit",
+                "MultipleInstancesPolicy",
+                "StartWhenAvailable",
+                "IdleSettings",
+                "UseUnifiedSchedulingEngine",
+            ],
+        ):
+            raise ValueError(_MANAGED_ERROR)
         idle = None
         if _children(settings, "IdleSettings"):
             idle = _only(settings, "IdleSettings")
@@ -431,7 +532,28 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
         action = _only(actions, "Exec")
         _exact_children(action, ["Command", "Arguments"])
 
+        containers = {
+            root,
+            registration,
+            principals,
+            principal,
+            triggers,
+            trigger,
+            _only(trigger, "ScheduleByDay"),
+            settings,
+            actions,
+            action,
+        }
+        if idle is not None:
+            containers.add(idle)
         for element in root.iter():
+            if element in containers:
+                if element.text is not None and element.text.strip():
+                    raise ValueError(_MANAGED_ERROR)
+            elif list(element):
+                raise ValueError(_MANAGED_ERROR)
+            if element.tail is not None and element.tail.strip():
+                raise ValueError(_MANAGED_ERROR)
             if element is root:
                 continue
             if element is principal:
@@ -542,7 +664,7 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
     check(
         "action.command",
         lambda: _text(action, "Command")
-        == _absolute_windows_path(expected.executable)
+        == _canonical_memberkit_executable(expected.executable)
         and not _is_shell(_text(action, "Command")),
     )
 
