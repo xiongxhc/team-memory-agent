@@ -236,9 +236,10 @@ prevents execution. `StartWhenAvailable` requests a catch-up run after a missed
 trigger once the interactive token is available. `IgnoreNew` prevents overlapping
 runs, and `WakeToRun=false` means MemberKit does not wake a sleeping computer.
 
-Windows reminders use `msg.exe` for the current username with a 60-second expiry.
-Delivery is best effort: an unavailable or denied reminder does not fail draft
-preparation. On Windows, `schedule.log` and `schedule.err` under
+Windows reminders use `msg.exe` for the current process's Windows session ID
+with a 60-second expiry. Delivery is best effort: an unavailable or denied
+reminder does not fail draft preparation. On Windows, `schedule.log` and
+`schedule.err` under
 `MEMBERKIT_WORKDIR` record bounded diagnostics; each is capped at 1 MiB and keeps
 one `.1` rollover. On macOS, launchd redirects output to those filenames
 directly, without MemberKit's bounded rotation.
