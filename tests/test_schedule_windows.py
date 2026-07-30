@@ -164,12 +164,14 @@ def test_task_xml_is_deterministic_complete_and_secret_free():
         "<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
         "<WakeToRun>false</WakeToRun>",
         "<ExecutionTimeLimit>PT4H</ExecutionTimeLimit>",
+        '<Principal id="Author">',
+        '<Actions Context="Author">',
         windows.OWNERSHIP_SOURCE,
         schedule.task_name,
     ):
         assert value in decoded
     assert decoded.count("<CalendarTrigger>") == 1
-    assert decoded.count("<Principal>") == 1
+    assert decoded.count('<Principal id="Author">') == 1
     assert decoded.count("<Exec>") == 1
     assert "private-token" not in decoded
     assert windows.parse_task_xml(xml, schedule) == "18:20"
@@ -231,6 +233,78 @@ def test_task_xml_requires_scheduler_namespace_and_exact_attributes():
     for mutation in mutations:
         with pytest.raises(RuntimeError, match="^Windows schedule definition is not managed by TeamMem$"):
             windows.parse_task_xml(b"\xff\xfe" + mutation.encode("utf-16-le"), schedule)
+
+
+def _task_xml_with_standard_principal_action_binding(schedule):
+    text = windows.build_task_xml(schedule)[2:].decode("utf-16-le")
+    text = text.replace("<Principal>", '<Principal id="Author">', 1)
+    text = text.replace("<Actions>", '<Actions Context="Author">', 1)
+    return text
+
+
+def test_task_xml_accepts_standard_principal_action_binding():
+    schedule = _schedule()
+    text = _task_xml_with_standard_principal_action_binding(schedule)
+
+    assert windows.parse_task_xml(
+        b"\xff\xfe" + text.encode("utf-16-le"), schedule
+    ) == "18:20"
+
+
+@pytest.mark.parametrize(
+    "original,tampered",
+    [
+        ('<Principal id="Author">', "<Principal>"),
+        ('<Actions Context="Author">', "<Actions>"),
+        ('<Principal id="Author">', '<Principal id="Other">'),
+        ('<Actions Context="Author">', '<Actions Context="Other">'),
+        ('<Principal id="Author">', '<Principal id="Author" extra="value">'),
+        ('<Actions Context="Author">', '<Actions Context="Author" extra="value">'),
+    ],
+)
+def test_task_xml_rejects_missing_mismatched_or_extra_binding_attributes(
+    original, tampered
+):
+    schedule = _schedule()
+    text = _task_xml_with_standard_principal_action_binding(schedule)
+    text = text.replace(original, tampered, 1)
+
+    with pytest.raises(RuntimeError, match="^Windows schedule definition is not managed by TeamMem$"):
+        windows.parse_task_xml(b"\xff\xfe" + text.encode("utf-16-le"), schedule)
+
+
+def test_task_xml_accepts_scheduler_added_registration_date_and_author():
+    schedule = _schedule()
+    text = windows.build_task_xml(schedule)[2:].decode("utf-16-le")
+    text = text.replace(
+        "<RegistrationInfo>",
+        (
+            "<RegistrationInfo>"
+            "<Date>2026-07-30T08:13:39.1234567</Date>"
+            "<Author>CI\\runneradmin</Author>"
+        ),
+        1,
+    )
+    xml = b"\xff\xfe" + text.encode("utf-16-le")
+
+    assert windows.parse_task_xml(xml, schedule) == "18:20"
+
+
+@pytest.mark.parametrize(
+    "addition",
+    [
+        "<Date>2026-07-30T08:13:39.1234567</Date><Date>2026-07-30T08:13:40</Date>",
+        "<Author>CI\\runneradmin</Author><Author>CI\\runneradmin</Author>",
+        "<SecurityDescriptor>D:(A;;FA;;;WD)</SecurityDescriptor>",
+    ],
+)
+def test_task_xml_rejects_duplicate_or_unknown_registration_metadata(addition):
+    schedule = _schedule()
+    text = windows.build_task_xml(schedule)[2:].decode("utf-16-le")
+    text = text.replace("<RegistrationInfo>", "<RegistrationInfo>" + addition, 1)
+
+    with pytest.raises(RuntimeError, match="^Windows schedule definition is not managed by TeamMem$"):
+        windows.parse_task_xml(b"\xff\xfe" + text.encode("utf-16-le"), schedule)
 
 
 @pytest.mark.parametrize(
