@@ -164,6 +164,7 @@ def test_task_xml_is_deterministic_complete_and_secret_free():
         "<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>",
         "<WakeToRun>false</WakeToRun>",
         "<ExecutionTimeLimit>PT4H</ExecutionTimeLimit>",
+        "<UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>",
         '<Principal id="Author">',
         '<Actions Context="Author">',
         windows.OWNERSHIP_SOURCE,
@@ -339,6 +340,7 @@ def _scheduler_normalized_task_xml(schedule):
         "<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>"
         "<WakeToRun>false</WakeToRun>"
         "<ExecutionTimeLimit>PT4H</ExecutionTimeLimit>"
+        "<UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>"
         "</Settings>"
     )
     normalized_settings = (
@@ -352,7 +354,7 @@ def _scheduler_normalized_task_xml(schedule):
         "<StopOnIdleEnd>true</StopOnIdleEnd>"
         "<RestartOnIdle>false</RestartOnIdle>"
         "</IdleSettings>"
-        "<UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine>"
+        "<UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>"
         "</Settings>"
     )
     assert registration in text
@@ -429,12 +431,16 @@ def test_task_xml_mismatch_categories_report_unmatched_structure():
         ("<StopOnIdleEnd>true</StopOnIdleEnd>", "<StopOnIdleEnd>false</StopOnIdleEnd>"),
         ("<RestartOnIdle>false</RestartOnIdle>", "<RestartOnIdle>true</RestartOnIdle>"),
         (
-            "<UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine>",
             "<UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>",
+            "<UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine>",
+        ),
+        (
+            "<UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>",
+            "",
         ),
         (
             "</Settings>",
-            "<UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine></Settings>",
+            "<UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine></Settings>",
         ),
         ("</Settings>", "<Priority>7</Priority></Settings>"),
     ],

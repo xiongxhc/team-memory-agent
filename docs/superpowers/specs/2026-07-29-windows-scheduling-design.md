@@ -172,9 +172,13 @@ Query validation treats only documented Task Scheduler defaults as
 semantically equivalent to the explicit generated form. It accepts omitted
 default values for `RunLevel`, task or trigger `Enabled`,
 `RunOnlyIfNetworkAvailable`, and `WakeToRun`, plus scheduler-added
-default-valued `IdleSettings` and `UseUnifiedSchedulingEngine`. Non-default
-values, duplicates, and any other additions remain conflicts. Ownership, the
-current SID, action, trigger time, executable, and argument vector remain exact.
+default-valued `IdleSettings`. `UseUnifiedSchedulingEngine=true` is explicit
+and required in both generated and queried forms because Task Scheduler
+registers this version 1.4 definition with the unified engine enabled. This
+keeps the source definition compatible with the registered representation
+instead of treating an engine change as a harmless default. Non-default values,
+duplicates, and any other additions remain conflicts. Ownership, the current
+SID, action, trigger time, executable, and argument vector remain exact.
 
 ### Principal
 
@@ -203,6 +207,7 @@ daily trigger, subject to the current-user interactive-token requirement.
 - `StopIfGoingOnBatteries`: `false`.
 - `RunOnlyIfNetworkAvailable`: `false`.
 - `WakeToRun`: `false`.
+- `UseUnifiedSchedulingEngine`: `true`.
 - A finite execution limit large enough for a normal daily collection run.
 
 Network availability is not made a Task Scheduler precondition because local
