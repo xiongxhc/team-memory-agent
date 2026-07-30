@@ -37,6 +37,12 @@ _MAX_SHAPE_CHARACTERS = 4096
 _SENTINEL_VERSION = 1
 _SMOKE_MEMBER = "memberkit-ci-smoke"
 _SMOKE_INBOX = "file:///memberkit-windows-schedule-smoke-disabled"
+_CLEANUP_ERRORS = (
+    OSError,
+    RuntimeError,
+    subprocess.SubprocessError,
+    ValueError,
+)
 
 
 def _structure_name(qualified: str) -> str:
@@ -328,17 +334,6 @@ def _database_path(state_dir: Path) -> Path:
     return state_dir.with_name(state_dir.name + "-claude-mem.db")
 
 
-def _delete_task(name: str) -> None:
-    """Delete an already revalidated smoke task without exposing native output."""
-    subprocess.run(
-        ["schtasks.exe", "/Delete", "/TN", name, "/F"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-
-
 def _schedule_status(
     executable: str,
     runner: _CapturingRunner,
@@ -370,6 +365,7 @@ def _default_config_is_absent() -> bool:
 
 
 def run_smoke(suffix: str) -> None:
+    _require_ci()
     executable = _memberkit_executable()
     workdir, state_dir = _paths(suffix)
     sentinel = _sentinel_path(suffix)
@@ -454,87 +450,123 @@ def run_smoke(suffix: str) -> None:
         raise
 
 
+def _path_absent(path: Path) -> bool:
+    try:
+        return not os.path.lexists(path)
+    except OSError:
+        return False
+
+
+def _remove_file(path: Path) -> bool:
+    if _path_absent(path):
+        return True
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return _path_absent(path)
+
+
+def _remove_tree(path: Path) -> bool:
+    if _path_absent(path):
+        return True
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+    return _path_absent(path)
+
+
 def _cleanup(suffix: str) -> None:
+    _require_ci()
     executable = _memberkit_executable()
     workdir, state_dir = _paths(suffix)
     sentinel = _sentinel_path(suffix)
+    config_file = default_config_file(platform="win32")
+    db = _database_path(state_dir)
     schedule_times = _read_sentinel(sentinel, suffix, executable)
     if schedule_times is None:
         runner = _CapturingRunner()
-        config_present = os.path.lexists(default_config_file(platform="win32"))
+        config_present = not _path_absent(config_file)
         try:
             task_present = _schedule_status(
                 executable,
                 runner,
                 state_dir,
             ).installed
-        except RuntimeError:
+        except _CLEANUP_ERRORS:
             _report_task_shape(runner, None)
             task_present = True
-        if config_present or task_present:
+        artifacts_present = any(
+            not _path_absent(path)
+            for path in (workdir, state_dir, db, sentinel)
+        )
+        if config_present or task_present or artifacts_present:
             raise RuntimeError("cleanup.ownership-sentinel")
         return
 
-    config_file = default_config_file(platform="win32")
-    db = _database_path(state_dir)
-    sid = current_user_sid()
     runner = _CapturingRunner()
-    conflicts: list[str] = []
+    failures: set[str] = set()
+
     try:
-        try:
-            status = _schedule_status(executable, runner, state_dir)
-        except RuntimeError:
+        status = _schedule_status(executable, runner, state_dir)
+    except _CLEANUP_ERRORS:
+        _report_task_shape(runner, None)
+        failures.add("task")
+    else:
+        if status.installed and status.time not in schedule_times:
             _report_task_shape(runner, None)
-            conflicts.append("task")
-        else:
-            if status.installed and status.time not in schedule_times:
-                _report_task_shape(runner, None)
-                conflicts.append("task")
-            elif status.installed:
-                try:
-                    remove_schedule(
-                        platform="win32",
-                        windows_runner=runner,
-                        windows_state_dir=state_dir,
-                        windows_executable=executable,
-                    )
-                except RuntimeError:
-                    _report_task_shape(runner, None)
-                    conflicts.append("task")
-
-        if os.path.lexists(config_file):
+            failures.add("task")
+        elif status.installed:
             try:
-                exact_config = (
-                    read_windows_private_text(config_file, sid)
-                    == _config_text(db, workdir)
+                remove_schedule(
+                    platform="win32",
+                    windows_runner=runner,
+                    windows_state_dir=state_dir,
+                    windows_executable=executable,
                 )
-            except (OSError, RuntimeError, ValueError):
-                exact_config = False
-            if exact_config:
-                try:
-                    config_file.unlink()
-                except OSError:
-                    conflicts.append("config")
+            except _CLEANUP_ERRORS:
+                _report_task_shape(runner, None)
+                failures.add("task")
             else:
-                conflicts.append("config")
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-        shutil.rmtree(state_dir, ignore_errors=True)
-        try:
-            db.unlink()
-        except OSError:
-            pass
-        try:
-            sentinel.unlink()
-        except OSError:
-            pass
-        try:
-            config_file.parent.rmdir()
-        except OSError:
-            pass
+                try:
+                    removed = _schedule_status(executable, runner, state_dir)
+                except _CLEANUP_ERRORS:
+                    _report_task_shape(runner, None)
+                    failures.add("task")
+                else:
+                    if removed.installed:
+                        _report_task_shape(runner, None)
+                        failures.add("task")
 
-    if conflicts:
-        raise RuntimeError("cleanup.conflict:" + ",".join(sorted(set(conflicts))))
+    if not _path_absent(config_file):
+        try:
+            sid = current_user_sid()
+            exact_config = (
+                read_windows_private_text(config_file, sid)
+                == _config_text(db, workdir)
+            )
+        except _CLEANUP_ERRORS:
+            exact_config = False
+        if exact_config:
+            if not _remove_file(config_file):
+                failures.add("config")
+        else:
+            failures.add("config")
+
+    for category, path, remover in (
+        ("workdir", workdir, _remove_tree),
+        ("state", state_dir, _remove_tree),
+        ("db", db, _remove_file),
+    ):
+        if not remover(path):
+            failures.add(category)
+
+    if failures:
+        raise RuntimeError("cleanup.failure:" + ",".join(sorted(failures)))
+
+    if not _remove_file(sentinel):
+        raise RuntimeError("cleanup.failure:sentinel")
 
 
 def main() -> int:

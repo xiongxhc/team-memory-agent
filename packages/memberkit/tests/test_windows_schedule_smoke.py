@@ -1,5 +1,6 @@
 """Pure safety tests for the MemberKit Windows scheduler CI smoke."""
 
+import shutil
 from datetime import datetime
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -200,6 +201,7 @@ def test_cleanup_only_is_idempotent_when_no_smoke_artifacts_exist(
     state_dir = tmp_path / "state"
     config_file = tmp_path / "memberkit.env"
     executable = str((tmp_path / "memberkit.exe").resolve())
+    monkeypatch.setattr(smoke, "_require_ci", lambda: None)
     monkeypatch.setattr(smoke, "_memberkit_executable", lambda: executable)
     monkeypatch.setattr(smoke, "_paths", lambda _suffix: (workdir, state_dir))
     monkeypatch.setattr(smoke, "_sentinel_path", lambda _suffix: tmp_path / "owner")
@@ -219,3 +221,258 @@ def test_cleanup_only_is_idempotent_when_no_smoke_artifacts_exist(
     assert not workdir.exists()
     assert not state_dir.exists()
     assert not config_file.exists()
+
+
+@pytest.mark.parametrize("entrypoint", ["run_smoke", "_cleanup"])
+def test_imported_smoke_mutation_entrypoints_require_github_hosted_windows(
+    monkeypatch,
+    entrypoint,
+):
+    smoke = _smoke_module()
+    monkeypatch.setattr(smoke.sys, "platform", "linux")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
+    monkeypatch.setenv("RUNNER_OS", "Windows")
+    monkeypatch.setattr(
+        smoke,
+        "_memberkit_executable",
+        lambda: pytest.fail("guard must run before executable resolution"),
+    )
+
+    with pytest.raises(RuntimeError, match="GitHub-hosted Windows"):
+        getattr(smoke, entrypoint)("123")
+
+
+def _owned_cleanup(monkeypatch, tmp_path):
+    smoke = _smoke_module()
+    workdir = tmp_path / "work"
+    state_dir = tmp_path / "state"
+    config_file = tmp_path / "memberkit.env"
+    sentinel = tmp_path / "owner.json"
+    executable = str((tmp_path / "memberkit.exe").resolve())
+    schedule_times = ("12:10", "12:20")
+    monkeypatch.setattr(smoke, "_require_ci", lambda: None)
+    monkeypatch.setattr(smoke, "_memberkit_executable", lambda: executable)
+    monkeypatch.setattr(smoke, "_paths", lambda _suffix: (workdir, state_dir))
+    monkeypatch.setattr(smoke, "_sentinel_path", lambda _suffix: sentinel)
+    monkeypatch.setattr(
+        smoke,
+        "default_config_file",
+        lambda **_kwargs: config_file,
+    )
+    monkeypatch.setattr(smoke, "current_user_sid", lambda: "S-1-5-21-smoke")
+    smoke._write_sentinel(sentinel, "123", executable, schedule_times)
+    return SimpleNamespace(
+        smoke=smoke,
+        workdir=workdir,
+        state_dir=state_dir,
+        db=smoke._database_path(state_dir),
+        config_file=config_file,
+        sentinel=sentinel,
+        executable=executable,
+        schedule_times=schedule_times,
+    )
+
+
+@pytest.mark.parametrize("failure_kind", ["query", "conflict", "remove"])
+def test_task_cleanup_failure_retains_retry_authority(
+    monkeypatch,
+    tmp_path,
+    failure_kind,
+):
+    owned = _owned_cleanup(monkeypatch, tmp_path)
+    smoke = owned.smoke
+    task_state = {"failure": True}
+
+    def status(*_args):
+        if not task_state["failure"]:
+            return SimpleNamespace(installed=False, time=None)
+        if failure_kind == "query":
+            raise OSError("secret observed task")
+        if failure_kind == "conflict":
+            return SimpleNamespace(installed=True, time="13:00")
+        return SimpleNamespace(installed=True, time=owned.schedule_times[0])
+
+    def remove(**_kwargs):
+        if task_state["failure"]:
+            raise OSError("secret removal failure")
+        return True
+
+    monkeypatch.setattr(smoke, "_schedule_status", status)
+    monkeypatch.setattr(smoke, "remove_schedule", remove)
+
+    with pytest.raises(RuntimeError) as error:
+        smoke._cleanup("123")
+
+    assert "task" in str(error.value)
+    assert "secret" not in str(error.value)
+    assert owned.sentinel.exists()
+
+    task_state["failure"] = False
+    smoke._cleanup("123")
+    assert not owned.sentinel.exists()
+
+
+def test_foreign_task_and_config_are_preserved_with_retry_authority(
+    monkeypatch,
+    tmp_path,
+):
+    owned = _owned_cleanup(monkeypatch, tmp_path)
+    owned.config_file.write_text("foreign-config-value", encoding="utf-8")
+    monkeypatch.setattr(
+        owned.smoke,
+        "_schedule_status",
+        lambda *_args: SimpleNamespace(installed=True, time="13:00"),
+    )
+    monkeypatch.setattr(
+        owned.smoke,
+        "read_windows_private_text",
+        lambda *_args: "foreign-config-value",
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        owned.smoke._cleanup("123")
+
+    assert "config" in str(error.value)
+    assert "task" in str(error.value)
+    assert "foreign-config-value" not in str(error.value)
+    assert owned.config_file.read_text(encoding="utf-8") == "foreign-config-value"
+    assert owned.sentinel.exists()
+
+
+def test_config_delete_failure_retains_sentinel_and_can_retry(
+    monkeypatch,
+    tmp_path,
+):
+    owned = _owned_cleanup(monkeypatch, tmp_path)
+    owned.config_file.write_text("owned", encoding="utf-8")
+    monkeypatch.setattr(
+        owned.smoke,
+        "_schedule_status",
+        lambda *_args: SimpleNamespace(installed=False, time=None),
+    )
+    monkeypatch.setattr(
+        owned.smoke,
+        "read_windows_private_text",
+        lambda *_args: owned.smoke._config_text(owned.db, owned.workdir),
+    )
+    original_unlink = Path.unlink
+    failure = {"active": True}
+
+    def unlink(path, *args, **kwargs):
+        if path == owned.config_file and failure["active"]:
+            raise OSError("secret config delete failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+    with pytest.raises(RuntimeError) as error:
+        owned.smoke._cleanup("123")
+
+    assert "config" in str(error.value)
+    assert "secret" not in str(error.value)
+    assert owned.config_file.exists()
+    assert owned.sentinel.exists()
+
+    failure["active"] = False
+    owned.smoke._cleanup("123")
+    assert not owned.config_file.exists()
+    assert not owned.sentinel.exists()
+
+
+@pytest.mark.parametrize("artifact", ["workdir", "state_dir", "db"])
+def test_artifact_delete_failure_is_reported_and_cleanup_can_retry(
+    monkeypatch,
+    tmp_path,
+    artifact,
+):
+    owned = _owned_cleanup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        owned.smoke,
+        "_schedule_status",
+        lambda *_args: SimpleNamespace(installed=False, time=None),
+    )
+    target = getattr(owned, artifact)
+    if artifact == "db":
+        target.write_text("owned database", encoding="utf-8")
+    else:
+        target.mkdir()
+        (target / "owned").write_text("owned artifact", encoding="utf-8")
+    failure = {"active": True}
+    original_rmtree = shutil.rmtree
+    original_unlink = Path.unlink
+
+    def rmtree(path, *args, **kwargs):
+        if Path(path) == target and failure["active"]:
+            raise OSError("secret tree delete failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    def unlink(path, *args, **kwargs):
+        if path == target and failure["active"]:
+            raise OSError("secret file delete failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(owned.smoke.shutil, "rmtree", rmtree)
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+    with pytest.raises(RuntimeError) as error:
+        owned.smoke._cleanup("123")
+
+    expected_category = "state" if artifact == "state_dir" else artifact
+    assert expected_category in str(error.value)
+    assert "secret" not in str(error.value)
+    assert target.exists()
+    assert owned.sentinel.exists()
+
+    failure["active"] = False
+    owned.smoke._cleanup("123")
+    assert not target.exists()
+    assert not owned.sentinel.exists()
+
+
+def test_sentinel_delete_failure_is_reported_and_can_retry(
+    monkeypatch,
+    tmp_path,
+):
+    owned = _owned_cleanup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        owned.smoke,
+        "_schedule_status",
+        lambda *_args: SimpleNamespace(installed=False, time=None),
+    )
+    failure = {"active": True}
+    original_unlink = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path == owned.sentinel and failure["active"]:
+            raise OSError("secret sentinel delete failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+    with pytest.raises(RuntimeError) as error:
+        owned.smoke._cleanup("123")
+
+    assert "sentinel" in str(error.value)
+    assert "secret" not in str(error.value)
+    assert owned.sentinel.exists()
+
+    failure["active"] = False
+    owned.smoke._cleanup("123")
+    assert not owned.sentinel.exists()
+
+
+def test_cleanup_can_remove_a_valid_last_remaining_sentinel(
+    monkeypatch,
+    tmp_path,
+):
+    owned = _owned_cleanup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        owned.smoke,
+        "_schedule_status",
+        lambda *_args: SimpleNamespace(installed=False, time=None),
+    )
+
+    owned.smoke._cleanup("123")
+
+    assert not owned.sentinel.exists()
