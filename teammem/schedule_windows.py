@@ -250,6 +250,7 @@ def build_task_xml(schedule: WindowsSchedule) -> bytes:
         ("RunOnlyIfNetworkAvailable", "false"),
         ("WakeToRun", "false"),
         ("ExecutionTimeLimit", "PT4H"),
+        ("UseUnifiedSchedulingEngine", "true"),
     ):
         _add(settings, key, value)
     actions = ET.SubElement(root, _TAG + "Actions", {"Context": _PRINCIPAL_ID})
@@ -360,6 +361,11 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
                 "settings.stop-on-batteries",
             ),
             ("ExecutionTimeLimit", "PT4H", "settings.execution-time-limit"),
+            (
+                "UseUnifiedSchedulingEngine",
+                "true",
+                "settings.unified-engine",
+            ),
         )
         default_settings = (
             ("Enabled", "true", "settings.enabled"),
@@ -370,12 +376,11 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
             ),
             ("WakeToRun", "false", "settings.wake-to-run"),
         )
-        service_settings = ("IdleSettings", "UseUnifiedSchedulingEngine")
         _required_optional_children(
             settings,
             [key for key, _value, _category in required_settings],
             [key for key, _value, _category in default_settings]
-            + list(service_settings),
+            + ["IdleSettings"],
         )
         idle: ET.Element | None = None
         if _children(settings, "IdleSettings"):
@@ -470,11 +475,6 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
             "settings.idle",
             lambda: _text(idle, "StopOnIdleEnd") == "true"
             and _text(idle, "RestartOnIdle") == "false",
-        )
-    if _children(settings, "UseUnifiedSchedulingEngine"):
-        check(
-            "settings.unified-engine",
-            lambda: _text(settings, "UseUnifiedSchedulingEngine") == "false",
         )
     check(
         "action.binding",
