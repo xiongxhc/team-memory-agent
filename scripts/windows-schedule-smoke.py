@@ -20,7 +20,7 @@ from typing import Any
 
 from teammem.config import Config
 from teammem.schedule import install_schedule, remove_schedule, schedule_status
-from teammem.schedule_windows import task_name
+from teammem.schedule_windows import _decode_xml, _xml_transport, task_name
 from teammem.windows_security import current_user_sid
 
 
@@ -42,10 +42,17 @@ def _structure_name(qualified: str) -> str:
 
 def _safe_task_shape(xml: bytes) -> str:
     """Summarize XML structure without exposing any element or attribute values."""
+    sample = xml[:128]
+    _encoding, _offset, signature = _xml_transport(xml)
+    profile = (
+        f"signature={signature};length={len(xml)};"
+        f"zero-even={sample[0::2].count(0)};"
+        f"zero-odd={sample[1::2].count(0)}"
+    )
     try:
-        root = ET.fromstring(xml)
-    except (ET.ParseError, UnicodeError, ValueError):
-        return "<unparseable-task-xml>"
+        root = ET.fromstring(_decode_xml(xml))
+    except (ET.ParseError, UnicodeError, ValueError, TypeError):
+        return profile + ";tags=<unparseable-task-xml>"
     entries: list[str] = []
     truncated = False
 
@@ -66,7 +73,7 @@ def _safe_task_shape(xml: bytes) -> str:
     visit(root, ())
     if truncated:
         entries.append("<truncated>")
-    return ";".join(entries)[:_MAX_SHAPE_CHARACTERS]
+    return (profile + ";tags=" + ";".join(entries))[:_MAX_SHAPE_CHARACTERS]
 
 
 class _CapturingRunner:

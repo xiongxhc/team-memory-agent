@@ -32,7 +32,8 @@ def test_smoke_times_refuse_to_install_when_the_window_crosses_midnight():
 
 def test_smoke_task_shape_reports_structure_without_values():
     smoke = _smoke_module()
-    xml = b"""\
+    text = """\
+<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4">
   <RegistrationInfo>
     <Date>2026-07-30T08:13:39</Date>
@@ -43,13 +44,35 @@ def test_smoke_task_shape_reports_structure_without_values():
     <Arguments>--env-file C:\\secret\\hub.env run-daily</Arguments></Exec></Actions>
 </Task>
 """
+    xml = b"\xef\xbb\xbf" + text.encode("utf-8")
 
     shape = smoke._safe_task_shape(xml)
 
-    for structural_name in ("RegistrationInfo", "Date", "Author", "Principal", "id", "Actions", "Context"):
+    for structural_name in (
+        "signature=utf8-bom",
+        "RegistrationInfo",
+        "Date",
+        "Author",
+        "Principal",
+        "id",
+        "Actions",
+        "Context",
+    ):
         assert structural_name in shape
     for secret_value in ("runneradmin", "S-1-5-21-secret", "C:\\secret", "--env-file"):
         assert secret_value not in shape
+
+
+def test_smoke_unparseable_shape_reports_only_bounded_byte_profile():
+    smoke = _smoke_module()
+
+    shape = smoke._safe_task_shape(b"\x00\xffsecret-value")
+
+    assert "signature=other" in shape
+    assert "length=14" in shape
+    assert "zero-even=" in shape
+    assert "zero-odd=" in shape
+    assert "secret-value" not in shape
 
 
 def test_smoke_allows_only_github_hosted_runners(monkeypatch):

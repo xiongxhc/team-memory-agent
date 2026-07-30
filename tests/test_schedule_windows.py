@@ -179,6 +179,29 @@ def test_task_xml_is_deterministic_complete_and_secret_free():
 
 
 @pytest.mark.parametrize(
+    "encoding,bom",
+    [
+        ("utf-8", b""),
+        ("utf-8", b"\xef\xbb\xbf"),
+        ("utf-16-le", b""),
+        ("utf-16-be", b""),
+    ],
+)
+def test_task_xml_accepts_realistic_query_byte_encodings(encoding, bom):
+    schedule = _schedule()
+    text = windows.build_task_xml(schedule)[2:].decode("utf-16-le")
+
+    assert windows.parse_task_xml(bom + text.encode(encoding), schedule) == "18:20"
+
+
+def test_task_xml_rejects_oversized_input_before_parsing():
+    payload = b"<" + b"x" * windows._MAX_TASK_XML_BYTES
+
+    with pytest.raises(RuntimeError, match="^Windows schedule definition is not managed by TeamMem$"):
+        windows.parse_task_xml(payload, _schedule())
+
+
+@pytest.mark.parametrize(
     "field,value",
     [
         ("executable", r"C:teammem.exe"),

@@ -30,6 +30,7 @@ _TAG = "{" + _NAMESPACE + "}"
 _MANAGED_ERROR = "Windows schedule definition is not managed by TeamMem"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _TASK_NAME = re.compile(r"\\TeamMem-Daily-[0-9a-f]{12}\Z")
+_MAX_TASK_XML_BYTES = 1024 * 1024
 OWNERSHIP_SOURCE = "TeamMem"
 OWNERSHIP_DESCRIPTION = "TeamMem daily operator schedule"
 _PRINCIPAL_ID = "Author"
@@ -245,12 +246,33 @@ def build_task_xml(schedule: WindowsSchedule) -> bytes:
     return b"\xff\xfe" + declaration + ET.tostring(root, encoding="unicode").encode("utf-16-le")
 
 
-def _decode_xml(xml: bytes) -> str:
+def _xml_transport(xml: bytes) -> tuple[str, int, str]:
+    if xml.startswith(b"\xef\xbb\xbf"):
+        return "utf-8", 3, "utf8-bom"
     if xml.startswith(b"\xff\xfe"):
-        return xml[2:].decode("utf-16-le")
+        return "utf-16-le", 2, "utf16le-bom"
     if xml.startswith(b"\xfe\xff"):
-        return xml[2:].decode("utf-16-be")
-    return xml.decode("utf-8")
+        return "utf-16-be", 2, "utf16be-bom"
+    probe = xml[:64]
+    while probe.startswith((b" \x00", b"\t\x00", b"\r\x00", b"\n\x00")):
+        probe = probe[2:]
+    if probe.startswith(b"<\x00"):
+        return "utf-16-le", 0, "utf16le"
+    probe = xml[:64]
+    while probe.startswith((b"\x00 ", b"\x00\t", b"\x00\r", b"\x00\n")):
+        probe = probe[2:]
+    if probe.startswith(b"\x00<"):
+        return "utf-16-be", 0, "utf16be"
+    ascii_probe = xml[:64].lstrip(b" \t\r\n")
+    signature = "utf8-xml" if ascii_probe.startswith(b"<") else "other"
+    return "utf-8", 0, signature
+
+
+def _decode_xml(xml: bytes) -> str:
+    if not isinstance(xml, bytes) or not xml or len(xml) > _MAX_TASK_XML_BYTES:
+        raise ValueError(_MANAGED_ERROR)
+    encoding, offset, _signature = _xml_transport(xml)
+    return xml[offset:].decode(encoding, errors="strict")
 
 
 def _invalid() -> RuntimeError:
