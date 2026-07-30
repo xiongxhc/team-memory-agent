@@ -34,15 +34,17 @@ it separately:
 memberkit setup
 ```
 
-Setup asks for the roster slug and inbox URL. On macOS it then offers a daily 17:30
-reminder in the Mac's local timezone. Press Enter to accept, enter another
-`HH:MM`, or enter `no` to decline. It stores private configuration at
-`~/.config/teammem/memberkit.env`.
+Setup asks for the roster slug and inbox URL. On macOS and Windows it then offers
+a daily 17:30 reminder in the machine's local timezone. Press Enter to accept,
+enter another `HH:MM`, or enter `no` to decline. Scheduling is opt-in:
+installation alone never schedules. Private configuration is stored at
+`~/.config/teammem/memberkit.env` on macOS and Linux and at
+`%APPDATA%\TeamMemory\memberkit.env` on Windows.
 
 For a machine whose host timezone differs from the member, pass an IANA timezone
 such as `memberkit setup --timezone Asia/Dubai`. Invalid explicit timezone names
-are rejected. This setting controls member-calendar attribution, not the
-host-local launchd trigger.
+are rejected. This setting controls member-calendar attribution, not the native
+scheduler's host-local trigger.
 
 ## Review workflow
 
@@ -91,16 +93,37 @@ memberkit schedule remove
 memberkit scheduled-run
 ```
 
-MemberKit supports macOS launchd for automatic schedule installation. Other
-platforms can schedule the portable `memberkit scheduled-run` command. A scheduled
-run is triggered at the configured time in the host scheduler's local clock. Once
-running, it checks yesterday and today in the configured member timezone, even if
-that differs from the host. Late work remains attributed to its member-local date,
-work after member-local midnight belongs to the new day, and unfinished dates
-remain in later reminders. `MEMBERKIT_TIMEZONE` does not dynamically change the
-launchd trigger. Scheduling uses the same evidence-first projection as direct
-drafting and never replaces an existing draft; explicitly regenerate with
-`memberkit draft --force` after review if later observations need to be included.
+The same commands automatically dispatch to macOS launchd or Windows Task
+Scheduler. Linux automatic installation remains deferred; a Linux scheduler may
+invoke the portable `memberkit scheduled-run` command manually.
+
+On Windows, MemberKit stores scheduler state under
+`%LOCALAPPDATA%\TeamMemory\MemberKit` and derives one task name from the current
+user SID. The least-privilege task runs only while that user is logged in; a
+locked session is eligible, but logout prevents a run. `StartWhenAvailable`
+catches up a missed trigger when an interactive session is available, `IgnoreNew`
+prevents overlap, and the task does not wake a sleeping machine. The `msg.exe`
+reminder is best effort. Scheduled diagnostics stay under `MEMBERKIT_WORKDIR` in
+`schedule.log` and `schedule.err`, each capped at 1 MiB with one `.1` rollover.
+
+MemberKit refuses a same-name task whose complete managed definition conflicts,
+and initial creation refuses a name collision instead of overwriting it, so
+MemberKit does not overwrite or delete tasks it does not own. The lifecycle lock
+serializes cooperating MemberKit commands. A different Task Scheduler client
+running as the same Windows identity can still mutate the name between query,
+revalidation, and mutation; Task Scheduler provides no atomic compare-and-swap,
+so non-cooperating same-identity concurrency is outside the transaction
+guarantee.
+
+A scheduled run is triggered at the configured time in the host scheduler's
+local clock. Once running, it checks yesterday and today in the configured member
+timezone, even if that differs from the host. Late work remains attributed to its
+member-local date, work after member-local midnight belongs to the new day, and
+unfinished dates remain in later reminders. `MEMBERKIT_TIMEZONE` does not
+dynamically change the host trigger. Scheduling uses the same evidence-first
+projection as direct drafting and never replaces an existing draft; explicitly
+regenerate with `memberkit draft --force` after review if later observations need
+to be included. Scheduled runs never approve, commit, push, or transmit anything.
 
 ## Upgrade and uninstall
 

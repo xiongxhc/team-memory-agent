@@ -41,10 +41,12 @@ pipx install teammem-memberkit
 memberkit setup
 ```
 
-Setup asks for the roster slug and inbox Git URL. On macOS it then proposes a daily
-17:30 reminder in the Mac's local timezone: press Enter to accept, enter another
-`HH:MM`, or enter `no` to decline. The configuration is stored with user-only
-permissions at `~/.config/teammem/memberkit.env`.
+Setup asks for the roster slug and inbox Git URL. On macOS and Windows it then
+proposes a daily 17:30 reminder in the machine's local timezone: press Enter to
+accept, enter another `HH:MM`, or enter `no` to decline. This is explicit opt-in;
+installing the package never creates a schedule. Private configuration is stored
+at `~/.config/teammem/memberkit.env` on macOS and Linux and at
+`%APPDATA%\TeamMemory\memberkit.env` on Windows.
 
 For unattended setup:
 
@@ -57,9 +59,9 @@ memberkit setup \
 ```
 
 Use `--no-schedule` instead of `--time` to configure MemberKit without installing
-the macOS schedule. `--timezone` is optional; without it, MemberKit detects the
-machine's local timezone. It controls observation calendar attribution, not the
-launchd trigger clock.
+a schedule. `--timezone` is optional; without it, MemberKit detects the machine's
+local timezone. It controls observation calendar attribution, not the native
+scheduler's host-local trigger clock.
 
 ### 3. Review before sharing
 
@@ -118,15 +120,17 @@ for the five required event fields.
 
 ### Schedule behavior
 
-On macOS, launchd triggers at 17:30 in the Mac's local timezone. When the command
-runs, `MEMBERKIT_TIMEZONE` determines member-local yesterday and today, observation
-bounds, and emitted timestamps; it does not move the launchd trigger. In the normal
-same-zone case, work from 17:30–23:59 remains attributable to the earlier member
-date when that draft is explicitly regenerated. If the zones differ, the trigger
-may occur at another member-local hour, but the same member-calendar attribution
-applies. The schedule never changes an existing draft; finish reviewing it, then
-use an explicit `memberkit draft --force` if you want to include later observations
-from the same date. Older unfinished dates remain in later host-local reminders.
+On macOS, launchd triggers at 17:30 in the Mac's local timezone; on Windows, Task
+Scheduler uses the same host-local time. When the command runs,
+`MEMBERKIT_TIMEZONE` determines member-local yesterday and today, observation
+bounds, and emitted timestamps; it does not move the native trigger. In the
+normal same-zone case, work from 17:30–23:59 remains attributable to the earlier
+member date when that draft is explicitly regenerated. If the zones differ, the
+trigger may occur at another member-local hour, but the same member-calendar
+attribution applies. The schedule never changes an existing draft; finish
+reviewing it, then use an explicit `memberkit draft --force` if you want to
+include later observations from the same date. Older unfinished dates remain in
+later host-local reminders.
 
 ```bash
 memberkit schedule status
@@ -135,11 +139,31 @@ memberkit schedule remove
 memberkit scheduled-run
 ```
 
-Automatic schedule installation currently supports macOS launchd. Other platforms
-can schedule the portable `memberkit scheduled-run` command. If an edited draft is
-invalid JSON, a scheduled run leaves it untouched and keeps reminding the member
-to repair it. To discard a malformed draft, delete that local draft file before
-running `memberkit dismiss --date YYYY-MM-DD`.
+These same commands automatically use launchd on macOS and Task Scheduler on
+Windows. The Windows task name is SID-specific, runs only for the current
+logged-in user at least privilege, and remains eligible while the session is
+locked. It does not run after logout or wake a sleeping machine. A missed trigger
+runs when the interactive session is available; `IgnoreNew` prevents overlap.
+Windows reminder delivery through `msg.exe` is best effort, while bounded
+`schedule.log` and `schedule.err` files remain available under the configured
+work directory; each is capped at 1 MiB with one `.1` rollover. Windows
+scheduler lock and temporary-definition state is kept under
+`%LOCALAPPDATA%\TeamMemory\MemberKit`.
+
+MemberKit refuses to replace or remove any task whose complete managed definition
+does not match, and initial creation refuses a same-name collision instead of
+overwriting it. Its lifecycle lock coordinates MemberKit commands, but another
+Task Scheduler client running as the same Windows identity can still race
+between query, revalidation, and mutation because Task Scheduler offers no
+atomic compare-and-swap. Linux automatic schedule installation remains deferred;
+on Linux, configure a scheduler manually to invoke `memberkit scheduled-run`.
+
+Scheduled runs create or preserve local drafts and reminders only: they never
+approve, commit, push, or transmit anything. If an edited draft is invalid JSON,
+a scheduled run leaves it untouched and keeps reminding the member to repair it.
+To discard a malformed draft, delete that local draft file before running
+`memberkit dismiss --date YYYY-MM-DD`. Run `memberkit schedule remove` before
+upgrading or uninstalling the executable used by the schedule.
 
 See the complete
 [MemberKit guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/member-guide.md)

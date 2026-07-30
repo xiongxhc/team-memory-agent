@@ -61,3 +61,16 @@ jobs:
       - run: python scripts/windows-schedule-smoke.py
       - if: always()
         run: python scripts/windows-schedule-smoke.py --cleanup-only
+
+  memberkit-windows-schedule:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e "packages/memberkit[dev]"
+      - run: pytest -q packages/memberkit/tests -k windows
+      - run: python scripts/memberkit-windows-schedule-smoke.py
+      - if: always()
+        run: python scripts/memberkit-windows-schedule-smoke.py --cleanup-only
