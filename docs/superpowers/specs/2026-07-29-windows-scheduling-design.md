@@ -164,9 +164,17 @@ The generated XML uses the Task Scheduler schema and contains exactly one
 principal, one daily calendar trigger, and one executable action.
 
 Generated task files use deterministic UTF-16LE with a BOM and an XML encoding
-declaration. `schtasks.exe` query output is captured as bytes and passed to the
-XML parser so its BOM/declaration controls decoding; scheduler output is not
-decoded through the active console code page.
+declaration. `schtasks.exe` query output is captured as bytes and decoded with
+bounded, strict BOM or UTF-16 signature detection before XML parsing; scheduler
+output is not decoded through the active console code page.
+
+Query validation treats only documented Task Scheduler defaults as
+semantically equivalent to the explicit generated form. It accepts omitted
+default values for `RunLevel`, task or trigger `Enabled`,
+`RunOnlyIfNetworkAvailable`, and `WakeToRun`, plus scheduler-added
+default-valued `IdleSettings` and `UseUnifiedSchedulingEngine`. Non-default
+values, duplicates, and any other additions remain conflicts. Ownership, the
+current SID, action, trigger time, executable, and argument vector remain exact.
 
 ### Principal
 
