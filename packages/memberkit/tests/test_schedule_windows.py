@@ -1,5 +1,7 @@
 import hashlib
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1047,6 +1049,81 @@ def test_status_exception_chain_never_retains_runner_details():
     assert "secret" not in " ".join(messages)
 
 
+def test_default_runner_preserves_byte_output_without_text_decoding():
+    result = windows._run(
+        None,
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'\\xff\\xfeok')",
+        ],
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == b"\xff\xfeok"
+    assert result.stderr == b""
+
+
+@pytest.mark.parametrize("stream", ("stdout", "stderr"))
+def test_default_runner_terminates_before_excess_output_can_continue(
+    tmp_path,
+    stream,
+):
+    marker = tmp_path / "continued"
+    source = (
+        "import pathlib,sys,time;"
+        f"sys.{stream}.buffer.write(b'secret'+b'x'*(1024*1024));"
+        f"sys.{stream}.flush();"
+        "time.sleep(2);"
+        f"pathlib.Path({str(marker)!r}).write_text('unsafe')"
+    )
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="status is unavailable") as error:
+        windows._run(None, [sys.executable, "-c", source])
+
+    assert time.monotonic() - started < 1.5
+    assert not marker.exists()
+    messages = []
+    current = error.value
+    while current is not None:
+        messages.append(str(current))
+        current = current.__cause__ or current.__context__
+    assert "secret" not in " ".join(messages)
+
+
+def test_default_runner_times_out_and_reaps_the_child(
+    tmp_path,
+    monkeypatch,
+):
+    marker = tmp_path / "continued"
+    source = (
+        "import pathlib,time;"
+        "time.sleep(2);"
+        f"pathlib.Path({str(marker)!r}).write_text('unsafe')"
+    )
+    real_popen = subprocess.Popen
+    processes = []
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(windows.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(windows, "_SCHEDULER_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(windows, "_PROCESS_STOP_GRACE_SECONDS", 0.1)
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="status is unavailable"):
+        windows._run(None, [sys.executable, "-c", source])
+
+    assert time.monotonic() - started < 1
+    assert len(processes) == 1
+    assert processes[0].returncode is not None
+    assert not marker.exists()
+
+
 @pytest.mark.parametrize("stream", ("xml", "csv", "stderr"))
 def test_status_rejects_oversized_command_output_before_parsing(stream):
     schedule = _schedule()
@@ -1182,12 +1259,19 @@ def test_install_rolls_back_exact_prior_xml_after_verification_failure(
         FakeTaskRunner({previous.task_name: prior_xml}),
     )
     creates = 0
+    corrupted = False
 
     def corrupt_first_verification(command, result):
-        nonlocal creates
+        nonlocal creates, corrupted
         if command[1] == "/Create":
             creates += 1
-        if command[1] == "/Query" and "/XML" in command and creates == 1:
+        if (
+            command[1] == "/Query"
+            and "/XML" in command
+            and creates == 1
+            and not corrupted
+        ):
+            corrupted = True
             return subprocess.CompletedProcess(command, 0, b"secret bad xml", b"")
         return result
 
@@ -1205,6 +1289,93 @@ def test_install_rolls_back_exact_prior_xml_after_verification_failure(
 
     assert runner.tasks[previous.task_name] == prior_xml
     assert "secret" not in str(error.value)
+
+
+def test_first_install_rollback_never_deletes_concurrently_appearing_foreign_task(
+    tmp_path,
+    monkeypatch,
+):
+    schedule = _schedule()
+    foreign = _xml_bytes(
+        _xml_text().replace(
+            "<Arguments>scheduled-run</Arguments>",
+            "<Arguments>foreign-action</Arguments>",
+            1,
+        )
+    )
+    runner, events, api = _lifecycle_args(tmp_path, monkeypatch)
+    created = False
+
+    def replace_candidate_before_verification(command, result):
+        nonlocal created
+        if command[1] == "/Create":
+            created = True
+        if command[1] == "/Query" and "/XML" in command and created:
+            runner.tasks[schedule.task_name] = foreign
+            return subprocess.CompletedProcess(command, 0, foreign, b"")
+        return result
+
+    runner.hook = replace_candidate_before_verification
+    with pytest.raises(RuntimeError, match="rollback failed"):
+        windows.install_schedule(
+            17,
+            30,
+            schedule.executable,
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert runner.tasks[schedule.task_name] == foreign
+    assert not any(call[1] == "/Delete" for call in runner.calls)
+
+
+def test_prior_snapshot_rollback_never_overwrites_concurrent_foreign_task(
+    tmp_path,
+    monkeypatch,
+):
+    previous = _schedule()
+    replacement = _schedule(time="07:05")
+    foreign = _xml_bytes(
+        _xml_text().replace(
+            "<Arguments>scheduled-run</Arguments>",
+            "<Arguments>foreign-action</Arguments>",
+            1,
+        )
+    )
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner(
+            {previous.task_name: windows.build_task_xml(previous)}
+        ),
+    )
+    creates = 0
+
+    def replace_candidate_before_verification(command, result):
+        nonlocal creates
+        if command[1] == "/Create":
+            creates += 1
+        if command[1] == "/Query" and "/XML" in command and creates == 1:
+            runner.tasks[replacement.task_name] = foreign
+            return subprocess.CompletedProcess(command, 0, foreign, b"")
+        return result
+
+    runner.hook = replace_candidate_before_verification
+    with pytest.raises(RuntimeError, match="rollback failed"):
+        windows.install_schedule(
+            7,
+            5,
+            replacement.executable,
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert runner.tasks[replacement.task_name] == foreign
+    assert creates == 1
 
 
 def test_first_install_failure_rolls_back_to_confirmed_absence(
@@ -1323,6 +1494,7 @@ def test_remove_is_idempotent_and_restores_after_failed_absence_verification(
             and "/XML" in command
             and schedule.task_name not in runner.tasks
         ):
+            runner.tasks[schedule.task_name] = prior_xml
             return subprocess.CompletedProcess(command, 0, prior_xml, b"")
         return result
 
