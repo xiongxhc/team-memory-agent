@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import memberkit.schedule_windows as schedule_windows
+import memberkit.windows_security as windows_security
 from memberkit.config import default_config_file, load, write_config
 from memberkit.schedule import install_schedule, remove_schedule, schedule_status
 from memberkit.schedule_windows import (
@@ -38,12 +40,282 @@ _MAX_SHAPE_CHARACTERS = 4096
 _SENTINEL_VERSION = 1
 _SMOKE_MEMBER = "memberkit-ci-smoke"
 _SMOKE_INBOX = "file:///memberkit-windows-schedule-smoke-disabled"
+_DIAGNOSTIC_PREFIX = "memberkit.private-config"
+_FAILURE_CATEGORIES = (
+    (FileNotFoundError, "file-not-found"),
+    (FileExistsError, "file-exists"),
+    (PermissionError, "permission"),
+    (OSError, "os-error"),
+    (ValueError, "value-error"),
+    (RuntimeError, "runtime-error"),
+)
 _CLEANUP_ERRORS = (
     OSError,
     RuntimeError,
     subprocess.SubprocessError,
     ValueError,
 )
+
+
+class _PrivateConfigDiagnosticApi:
+    """Value-free CI diagnostics around the real Windows filesystem API."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        parent: Path,
+        sid: str,
+        destination: Path | None = None,
+    ) -> None:
+        self._delegate = delegate
+        self._parent = Path(parent)
+        self._destination = (
+            None if destination is None else Path(destination)
+        )
+        self._sid = sid
+        self._parent_handles: set[int] = set()
+        self._events: list[dict[str, object]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def _start(self, stage: str) -> dict[str, object]:
+        event: dict[str, object] = {"stage": stage}
+        self._events.append(event)
+        return event
+
+    @staticmethod
+    def _finish(
+        event: dict[str, object],
+        status: str,
+        failure: Exception | None = None,
+    ) -> None:
+        event["status"] = status
+        if failure is None:
+            return
+        event["category"] = next(
+            (
+                category
+                for exception, category in _FAILURE_CATEGORIES
+                if isinstance(failure, exception)
+            ),
+            "other",
+        )
+        for name in ("winerror", "errno"):
+            value = getattr(failure, name, None)
+            if type(value) is int:
+                event[name] = value
+                break
+
+    def _call(
+        self,
+        stage: str,
+        action: Callable[[], Any],
+        *,
+        missing: bool = False,
+        event: dict[str, object] | None = None,
+    ) -> Any:
+        event = self._start(stage) if event is None else event
+        try:
+            result = action()
+        except Exception as failure:
+            status = "missing" if missing and isinstance(
+                failure, FileNotFoundError
+            ) else "failed"
+            self._finish(event, status, failure)
+            raise
+        self._finish(event, "ok")
+        return result
+
+    @staticmethod
+    def _delegate_open(
+        opener: Callable[..., Any],
+        path: Path,
+        directory: bool,
+        write_dac: bool,
+    ) -> Any:
+        kwargs = {"directory": directory}
+        if write_dac:
+            kwargs["write_dac"] = True
+        return opener(path, **kwargs)
+
+    def _open_parent(
+        self,
+        opener: Callable[..., Any],
+        path: Path,
+        *,
+        directory: bool,
+        write_dac: bool,
+    ) -> Any:
+        handle = self._call(
+            "parent.open-write-dac" if write_dac else "parent.open-existing",
+            lambda: self._delegate_open(opener, path, directory, write_dac),
+            missing=not write_dac,
+        )
+        self._parent_handles.add(id(handle))
+        return handle
+
+    def open_file(
+        self,
+        path: Path,
+        *,
+        directory: bool = False,
+        write_dac: bool = False,
+    ) -> Any:
+        if directory and Path(path) == self._parent:
+            return self._open_parent(
+                self._delegate.open_file,
+                Path(path),
+                directory=directory,
+                write_dac=write_dac,
+            )
+        return self._delegate_open(
+            self._delegate.open_file, Path(path), directory, write_dac
+        )
+
+    def create_directory(self, path: Path) -> Any:
+        if Path(path) != self._parent:
+            return self._delegate.create_directory(path)
+
+        event = self._start("parent.create-directory")
+        instance_opener = getattr(self._delegate, "__dict__", {}).get("open_file")
+        original_opener = self._delegate.open_file
+
+        def observed_opener(
+            opened_path: Path,
+            *,
+            directory: bool = False,
+            write_dac: bool = False,
+        ) -> Any:
+            if directory and Path(opened_path) == self._parent:
+                return self._open_parent(
+                    original_opener,
+                    Path(opened_path),
+                    directory=directory,
+                    write_dac=write_dac,
+                )
+            return self._delegate_open(
+                original_opener, Path(opened_path), directory, write_dac
+            )
+
+        setattr(self._delegate, "open_file", observed_opener)
+        try:
+            handle = self._call(
+                "parent.create-directory",
+                lambda: self._delegate.create_directory(path),
+                event=event,
+            )
+        except FileExistsError as failure:
+            self._finish(event, "exists", failure)
+            raise
+        else:
+            self._parent_handles.add(id(handle))
+            return handle
+        finally:
+            if instance_opener is not None:
+                setattr(self._delegate, "open_file", instance_opener)
+            else:
+                delattr(self._delegate, "open_file")
+
+    def apply_protected_dacl(
+        self,
+        handle: Any,
+        sid: str,
+        principals: Any,
+    ) -> None:
+        if id(handle) not in self._parent_handles:
+            return self._delegate.apply_protected_dacl(handle, sid, principals)
+        self._call(
+            "parent.apply-dacl",
+            lambda: self._delegate.apply_protected_dacl(handle, sid, principals),
+        )
+
+    def describe_handle(self, handle: Any) -> dict[str, Any]:
+        if id(handle) not in self._parent_handles:
+            return self._delegate.describe_handle(handle)
+        event = self._start("parent.describe-handle")
+        record = self._call(
+            "parent.describe-handle",
+            lambda: self._delegate.describe_handle(handle),
+            event=event,
+        )
+        aces = record.get("allow_aces")
+        event.update(
+            owner_matches_current_sid=record.get("owner_sid") == self._sid,
+            dacl_protected=record.get("dacl_protected") is True,
+            disk=record.get("file_type") in {"disk", 1},
+            directory=record.get("directory") is True,
+            not_reparse=record.get("reparse_point") is False,
+            acl_parseable=aces is not None,
+            no_unapproved_read=aces is not None
+            and not windows_security._unapproved_read_grant(aces, self._sid),
+        )
+        return record
+
+    def close_handle(self, handle: Any) -> None:
+        if id(handle) not in self._parent_handles:
+            return self._delegate.close_handle(handle)
+        self._call(
+            "parent.close-handle",
+            lambda: self._delegate.close_handle(handle),
+        )
+        self._parent_handles.remove(id(handle))
+
+    def path_exists(self, path: Path) -> bool:
+        if self._destination is None or Path(path) != self._destination:
+            return self._delegate.path_exists(path)
+        event = self._start("destination.path-exists")
+        exists = self._call(
+            "destination.path-exists",
+            lambda: self._delegate.path_exists(path),
+            event=event,
+        )
+        self._finish(event, "ok" if exists else "missing")
+        return exists
+
+    def lines(self) -> list[str]:
+        def render(value: object) -> str:
+            return str(value).lower() if type(value) is bool else str(value)
+
+        return [
+            _DIAGNOSTIC_PREFIX
+            + " "
+            + " ".join(f"{key}={render(value)}" for key, value in event.items())
+            for event in self._events
+        ]
+
+
+def _write_config_with_diagnostics(
+    values: dict[str, str],
+    *,
+    config_file: Path,
+    sid: str,
+    windows_api: Any = None,
+) -> Path:
+    delegate = (
+        windows_security.NativeWindowsApi()
+        if windows_api is None
+        else windows_api
+    )
+    parent = Path(ntpath.dirname(str(config_file)))
+    diagnostic_api = _PrivateConfigDiagnosticApi(
+        delegate,
+        parent=parent,
+        destination=config_file,
+        sid=sid,
+    )
+    try:
+        return write_config(
+            values,
+            config_file=config_file,
+            platform="win32",
+            windows_api=diagnostic_api,
+        )
+    except Exception:
+        for line in diagnostic_api.lines():
+            print(line, file=sys.stderr)
+        raise
 
 
 def _structure_name(qualified: str) -> str:
@@ -403,7 +675,11 @@ def run_smoke(suffix: str) -> None:
 
     workdir.mkdir(parents=False, exist_ok=False)
     _create_empty_database(db)
-    write_config(_config_values(db, workdir), platform="win32")
+    _write_config_with_diagnostics(
+        _config_values(db, workdir),
+        config_file=config_file,
+        sid=sid,
+    )
     config = load(
         env={"APPDATA": os.environ["APPDATA"]},
         platform="win32",

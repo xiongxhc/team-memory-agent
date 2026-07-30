@@ -1,5 +1,6 @@
 """Pure safety tests for the MemberKit Windows scheduler CI smoke."""
 
+import errno
 import shutil
 from datetime import datetime
 from importlib.util import module_from_spec, spec_from_file_location
@@ -22,6 +23,279 @@ def _smoke_module():
     module = module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class _ParentProvisioningApi:
+    def __init__(self, parent, sid):
+        self.parent = Path(parent)
+        self.sid = sid
+        self.handle = object()
+        self.calls = []
+
+    def current_process_sid(self):
+        return self.sid
+
+    def open_file(self, path, *, directory=False, write_dac=False):
+        self.calls.append(("open_file", Path(path), directory, write_dac))
+        if Path(path) == self.parent and directory and not write_dac:
+            failure = FileNotFoundError(errno.ENOENT, "PLANTED_EXCEPTION")
+            failure.winerror = 3
+            raise failure
+        return self.handle
+
+    def create_directory(self, path):
+        self.calls.append(("create_directory", Path(path)))
+        return self.open_file(path, directory=True, write_dac=True)
+
+    def apply_protected_dacl(self, handle, sid, principals):
+        self.calls.append(("apply_protected_dacl", handle, sid, tuple(principals)))
+
+    def describe_handle(self, handle):
+        self.calls.append(("describe_handle", handle))
+        return {
+            "owner_sid": self.sid,
+            "dacl_protected": True,
+            "file_type": "disk",
+            "directory": True,
+            "reparse_point": False,
+            "allow_aces": [
+                (self.sid, 0x10000000),
+                ("S-1-5-18", 0x10000000),
+                ("S-1-5-32-544", 0x10000000),
+            ],
+        }
+
+    def close_handle(self, handle):
+        self.calls.append(("close_handle", handle))
+
+    def path_exists(self, path):
+        self.calls.append(("path_exists", Path(path)))
+        return False
+
+
+class _AtomicWriteApi(_ParentProvisioningApi):
+    def __init__(self, parent, sid, *, fail_candidate=False):
+        super().__init__(parent, sid)
+        self.records = {}
+        self.fail_candidate = fail_candidate
+
+    def open_file(self, path, *, directory=False, write_dac=False):
+        path = Path(path)
+        if (
+            path == self.parent
+            and directory
+            and not write_dac
+            and path not in self.records
+        ):
+            failure = FileNotFoundError(errno.ENOENT, "PLANTED_EXCEPTION")
+            failure.winerror = 3
+            raise failure
+        return self.records[path]
+
+    def create_directory(self, path):
+        record = {
+            "owner_sid": self.sid,
+            "dacl_protected": False,
+            "file_type": "disk",
+            "directory": True,
+            "regular": False,
+            "reparse_point": False,
+            "allow_aces": [],
+        }
+        self.records[Path(path)] = record
+        return self.open_file(path, directory=True, write_dac=True)
+
+    def create_empty_file(self, path):
+        if self.fail_candidate:
+            raise PermissionError(errno.EACCES, "PLANTED_CANDIDATE_SECRET")
+        record = {
+            "owner_sid": self.sid,
+            "dacl_protected": False,
+            "file_type": "disk",
+            "directory": False,
+            "regular": True,
+            "reparse_point": False,
+            "allow_aces": [],
+            "data": b"",
+        }
+        self.records[Path(path)] = record
+        return record
+
+    def apply_protected_dacl(self, handle, sid, principals):
+        handle["dacl_protected"] = True
+        handle["allow_aces"] = [
+            (principal, 0x10000000) for principal in principals
+        ]
+
+    def describe_handle(self, handle):
+        return handle
+
+    def close_handle(self, handle):
+        pass
+
+    def path_exists(self, path):
+        return Path(path) in self.records
+
+    def write_utf8(self, handle, data):
+        handle["data"] = bytes(data)
+
+    def flush_handle(self, handle):
+        pass
+
+    def move_file(self, candidate, destination):
+        self.records[Path(destination)] = self.records.pop(Path(candidate))
+
+    def delete_file(self, path):
+        self.records.pop(Path(path), None)
+
+
+def test_real_write_config_emits_exact_safe_sequence_only_on_failure(
+    capsys,
+):
+    smoke = _smoke_module()
+    config_file = Path(r"C:\PLANTED_PATH\memberkit.env")
+    parent = Path(r"C:\PLANTED_PATH")
+    sid = "S-1-5-21-PLANTED-SID"
+    values = {"MEMBERKIT_MEMBER": "PLANTED_CONFIG_SECRET"}
+
+    assert smoke._write_config_with_diagnostics(
+        values,
+        config_file=config_file,
+        sid=sid,
+        windows_api=_AtomicWriteApi(parent, sid),
+    ) == config_file
+    assert capsys.readouterr().err == ""
+
+    with pytest.raises(RuntimeError):
+        smoke._write_config_with_diagnostics(
+            values,
+            config_file=config_file,
+            sid=sid,
+            windows_api=_AtomicWriteApi(parent, sid, fail_candidate=True),
+        )
+
+    diagnostic = capsys.readouterr().err
+    assert diagnostic.splitlines() == [
+        (
+            "memberkit.private-config stage=parent.open-existing "
+            "status=missing category=file-not-found winerror=3"
+        ),
+        "memberkit.private-config stage=parent.create-directory status=ok",
+        "memberkit.private-config stage=parent.open-write-dac status=ok",
+        "memberkit.private-config stage=parent.apply-dacl status=ok",
+        (
+            "memberkit.private-config stage=parent.describe-handle status=ok "
+            "owner_matches_current_sid=true dacl_protected=true disk=true "
+            "directory=true not_reparse=true acl_parseable=true "
+            "no_unapproved_read=true"
+        ),
+        "memberkit.private-config stage=parent.close-handle status=ok",
+        "memberkit.private-config stage=destination.path-exists status=missing",
+    ]
+    for secret in (
+        r"C:\PLANTED_PATH",
+        sid,
+        "PLANTED_CONFIG_SECRET",
+        "PLANTED_EXCEPTION",
+        "PLANTED_CANDIDATE_SECRET",
+        "Traceback",
+    ):
+        assert secret not in diagnostic
+
+
+def test_destination_path_exists_diagnostics_distinguish_ok_and_failed():
+    smoke = _smoke_module()
+    destination = Path(r"C:\PLANTED_PATH\memberkit.env")
+    parent = Path(r"C:\PLANTED_PATH")
+    sid = "S-1-5-21-PLANTED-SID"
+
+    class ExistingApi(_ParentProvisioningApi):
+        def path_exists(self, path):
+            return True
+
+    existing = smoke._PrivateConfigDiagnosticApi(
+        ExistingApi(parent, sid),
+        parent=parent,
+        destination=destination,
+        sid=sid,
+    )
+    assert existing.path_exists(destination) is True
+    assert existing.lines() == [
+        "memberkit.private-config stage=destination.path-exists status=ok"
+    ]
+
+    class FailingApi(_ParentProvisioningApi):
+        def path_exists(self, path):
+            raise OSError(errno.EIO, "PLANTED_PATH_EXISTS_SECRET")
+
+    failing = smoke._PrivateConfigDiagnosticApi(
+        FailingApi(parent, sid),
+        parent=parent,
+        destination=destination,
+        sid=sid,
+    )
+    with pytest.raises(OSError):
+        failing.path_exists(destination)
+    assert failing.lines() == [
+        (
+            "memberkit.private-config stage=destination.path-exists "
+            "status=failed category=os-error errno=5"
+        )
+    ]
+
+
+def test_private_config_diagnostics_reduce_unsafe_handle_to_false_booleans():
+    smoke = _smoke_module()
+    parent = Path(r"C:\PLANTED_PATH")
+    sid = "S-1-5-21-CURRENT"
+    record = {
+        "owner_sid": "S-1-5-21-FOREIGN-PLANTED",
+        "dacl_protected": False,
+        "file_type": "pipe",
+        "directory": False,
+        "reparse_point": True,
+        "allow_aces": [("S-1-1-0", 0x80000000)],
+    }
+
+    class DescribeApi(_ParentProvisioningApi):
+        def describe_handle(self, handle):
+            return record
+
+    delegate = DescribeApi(parent, sid)
+    api = smoke._PrivateConfigDiagnosticApi(delegate, parent=parent, sid=sid)
+    handle = api.create_directory(parent)
+    api.describe_handle(handle)
+
+    diagnostic = api.lines()[-1]
+    assert diagnostic == (
+        "memberkit.private-config stage=parent.describe-handle status=ok "
+        "owner_matches_current_sid=false dacl_protected=false disk=false "
+        "directory=false not_reparse=false acl_parseable=true "
+        "no_unapproved_read=false"
+    )
+    for secret in (
+        r"C:\PLANTED_PATH",
+        "S-1-5-21-CURRENT",
+        "S-1-5-21-FOREIGN-PLANTED",
+        "S-1-1-0",
+        "2147483648",
+    ):
+        assert secret not in diagnostic
+
+
+def test_private_config_diagnostics_delegate_unrelated_operations_transparently():
+    smoke = _smoke_module()
+    parent = Path(r"C:\PLANTED_PATH")
+    delegate = _ParentProvisioningApi(parent, "S-1-5-21-CURRENT")
+    api = smoke._PrivateConfigDiagnosticApi(
+        delegate,
+        parent=parent,
+        sid="S-1-5-21-CURRENT",
+    )
+
+    assert api.path_exists(Path(r"C:\OTHER-PLANTED")) is False
+    assert delegate.calls == [("path_exists", Path(r"C:\OTHER-PLANTED"))]
+    assert api.lines() == []
 
 
 def test_capturing_runner_defaults_to_the_production_bounded_runner(monkeypatch):
