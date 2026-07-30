@@ -24,6 +24,61 @@ def _smoke_module():
     return module
 
 
+def test_capturing_runner_defaults_to_the_production_bounded_runner(monkeypatch):
+    smoke = _smoke_module()
+    command = ["schtasks.exe", "/Query", "/TN", "\\smoke", "/XML"]
+
+    def bounded_runner(observed_command, **kwargs):
+        assert observed_command == command
+        assert kwargs == {"capture_output": True, "text": False}
+        return smoke.subprocess.CompletedProcess(
+            observed_command,
+            0,
+            b"<Task/>",
+            b"",
+        )
+
+    monkeypatch.setattr(windows, "_default_runner", bounded_runner)
+    monkeypatch.setattr(
+        smoke.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "smoke runner must not call unbounded subprocess.run"
+        ),
+    )
+    runner = smoke._CapturingRunner()
+
+    result = runner(command, capture_output=True, text=False)
+
+    assert result.stdout == b"<Task/>"
+    assert runner.last_query_xml == b"<Task/>"
+
+
+def test_capturing_runner_accepts_an_injected_byte_delegate():
+    smoke = _smoke_module()
+    outputs = iter((b"", b"<Task/>"))
+
+    def delegate(command, **kwargs):
+        assert kwargs == {"capture_output": True, "text": False}
+        return smoke.subprocess.CompletedProcess(command, 0, next(outputs), b"")
+
+    runner = smoke._CapturingRunner(delegate)
+    runner.arm()
+    runner(
+        ["schtasks.exe", "/Create", "/TN", "\\smoke", "/XML", "candidate.xml"],
+        capture_output=True,
+        text=False,
+    )
+    result = runner(
+        ["schtasks.exe", "/Query", "/TN", "\\smoke", "/XML"],
+        capture_output=True,
+        text=False,
+    )
+
+    assert result.stdout == b"<Task/>"
+    assert runner.candidate_xml == b"<Task/>"
+
+
 def test_smoke_times_are_ten_and_twenty_minutes_ahead_on_same_date():
     smoke = _smoke_module()
 

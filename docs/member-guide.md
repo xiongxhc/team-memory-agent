@@ -238,8 +238,10 @@ runs, and `WakeToRun=false` means MemberKit does not wake a sleeping computer.
 
 Windows reminders use `msg.exe` for the current username with a 60-second expiry.
 Delivery is best effort: an unavailable or denied reminder does not fail draft
-preparation. `schedule.log` and `schedule.err` under `MEMBERKIT_WORKDIR` record
-bounded diagnostics; each is capped at 1 MiB and keeps one `.1` rollover.
+preparation. On Windows, `schedule.log` and `schedule.err` under
+`MEMBERKIT_WORKDIR` record bounded diagnostics; each is capped at 1 MiB and keeps
+one `.1` rollover. On macOS, launchd redirects output to those filenames
+directly, without MemberKit's bounded rotation.
 
 MemberKit refuses to replace or delete any same-name task whose complete
 definition does not validate as MemberKit-managed. Initial creation also refuses
@@ -271,8 +273,8 @@ MemberKit on Linux.
 | `~/.memberkit/out/` | Local review drafts |
 | `~/.memberkit/state.json` | Pending, approved, and excluded fingerprints |
 | `~/.memberkit/inbox/` | Local clone used only by explicit push |
-| `~/.memberkit/schedule.log` | Bounded scheduled-run log |
-| `~/.memberkit/schedule.err` | Bounded scheduled-run error log |
+| `~/.memberkit/schedule.log` | Scheduled-run output; bounded with one rollover on Windows, direct launchd output on macOS |
+| `~/.memberkit/schedule.err` | Scheduled-run errors; bounded with one rollover on Windows, direct launchd output on macOS |
 
 The configured source database is opened read-only. Scheduled runs never push,
 commit, or transmit. `~/.memberkit` represents the default
@@ -284,6 +286,16 @@ normal `~/.memberkit` directory, use a temporary work directory:
 
 ```bash
 MEMBERKIT_WORKDIR="$(mktemp -d)" memberkit draft --date YYYY-MM-DD
+```
+
+PowerShell:
+
+```powershell
+$temporaryWorkdir = Join-Path $env:TEMP ("memberkit-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $temporaryWorkdir | Out-Null
+$env:MEMBERKIT_WORKDIR = $temporaryWorkdir
+memberkit draft --date YYYY-MM-DD
+Remove-Item Env:MEMBERKIT_WORKDIR
 ```
 
 This opens the configured observation database read-only and writes the draft and

@@ -14,8 +14,9 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import memberkit.schedule_windows as schedule_windows
 from memberkit.config import default_config_file, load, write_config
 from memberkit.schedule import install_schedule, remove_schedule, schedule_status
 from memberkit.schedule_windows import (
@@ -105,7 +106,13 @@ def _safe_task_shape(xml: bytes) -> str:
 class _CapturingRunner:
     """Capture queried XML for value-free failure diagnostics."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        delegate: Callable[..., subprocess.CompletedProcess[bytes]] | None = None,
+    ) -> None:
+        self._delegate = (
+            schedule_windows._default_runner if delegate is None else delegate
+        )
         self.last_query_xml: bytes | None = None
         self.candidate_xml: bytes | None = None
         self._armed = False
@@ -121,7 +128,7 @@ class _CapturingRunner:
         command: list[str],
         **kwargs: Any,
     ) -> subprocess.CompletedProcess[bytes]:
-        result = subprocess.run(command, **kwargs)
+        result = self._delegate(command, **kwargs)
         successful_query = (
             result.returncode == 0
             and "/Query" in command
