@@ -3,8 +3,11 @@
 from datetime import datetime
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+import subprocess
 
 import pytest
+
+import teammem.schedule_windows as windows
 
 
 def _smoke_module():
@@ -73,6 +76,84 @@ def test_smoke_unparseable_shape_reports_only_bounded_byte_profile():
     assert "zero-even=" in shape
     assert "zero-odd=" in shape
     assert "secret-value" not in shape
+
+
+def test_smoke_mismatch_report_contains_only_safe_categories(capsys):
+    smoke = _smoke_module()
+    schedule = windows.WindowsSchedule(
+        sid="S-1-5-21-expected-secret",
+        task_name=windows.task_name("S-1-5-21-expected-secret"),
+        time="18:20",
+        executable=r"C:\expected-secret\teammem.exe",
+        env_file=r"C:\expected-secret\hub.env",
+    )
+    text = windows.build_task_xml(schedule)[2:].decode("utf-16-le")
+    text = text.replace(
+        "<UserId>S-1-5-21-expected-secret</UserId>",
+        "<UserId>S-1-5-21-observed-secret</UserId>",
+        1,
+    )
+    runner = smoke._CapturingRunner()
+    runner.last_query_xml = windows.build_task_xml(schedule)
+    runner.candidate_xml = b"\xef\xbb\xbf" + text.encode("utf-8")
+
+    smoke._report_task_shape(runner, schedule)
+
+    candidate_diagnostic = capsys.readouterr().err
+    runner.last_query_xml = runner.candidate_xml
+    runner.candidate_xml = None
+    smoke._report_task_shape(runner, schedule)
+    fallback_diagnostic = capsys.readouterr().err
+
+    for diagnostic in (candidate_diagnostic, fallback_diagnostic):
+        assert "Mismatch categories: principal.sid" in diagnostic
+    for secret in (
+        "S-1-5-21-expected-secret",
+        "S-1-5-21-observed-secret",
+        r"C:\expected-secret",
+    ):
+        assert secret not in candidate_diagnostic
+        assert secret not in fallback_diagnostic
+
+
+def test_smoke_capture_keeps_replacement_candidate_through_rollback(monkeypatch):
+    smoke = _smoke_module()
+    snapshot = b"snapshot"
+    first_candidate = b"first-candidate"
+    replacement_candidate = b"replacement-candidate"
+    rollback = b"rollback"
+    outputs = iter(
+        (
+            snapshot,
+            b"",
+            first_candidate,
+            first_candidate,
+            b"",
+            replacement_candidate,
+            b"",
+            rollback,
+        )
+    )
+
+    def fake_run(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, next(outputs), b"")
+
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+    runner = smoke._CapturingRunner()
+
+    runner.arm()
+    runner(["schtasks.exe", "/Query", "/XML"])
+    runner(["schtasks.exe", "/Create", "/XML", "first.xml"])
+    runner(["schtasks.exe", "/Query", "/XML"])
+    runner.arm()
+    runner(["schtasks.exe", "/Query", "/XML"])
+    runner(["schtasks.exe", "/Create", "/XML", "replacement.xml"])
+    runner(["schtasks.exe", "/Query", "/XML"])
+    runner(["schtasks.exe", "/Create", "/XML", "rollback.xml"])
+    runner(["schtasks.exe", "/Query", "/XML"])
+
+    assert runner.candidate_xml == replacement_candidate
+    assert runner.last_query_xml == rollback
 
 
 def test_smoke_allows_only_github_hosted_runners(monkeypatch):

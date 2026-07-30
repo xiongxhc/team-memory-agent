@@ -20,7 +20,13 @@ from typing import Any
 
 from teammem.config import Config
 from teammem.schedule import install_schedule, remove_schedule, schedule_status
-from teammem.schedule_windows import _decode_xml, _xml_transport, task_name
+from teammem.schedule_windows import (
+    WindowsSchedule,
+    _decode_xml,
+    _xml_transport,
+    task_name,
+    task_xml_mismatch_categories,
+)
 from teammem.windows_security import current_user_sid
 
 
@@ -77,30 +83,57 @@ def _safe_task_shape(xml: bytes) -> str:
 
 
 class _CapturingRunner:
-    """Capture only the latest successful queried definition for safe diagnostics."""
+    """Capture the first post-create query, never a snapshot or rollback query."""
 
     def __init__(self) -> None:
         self.last_query_xml: bytes | None = None
+        self.candidate_xml: bytes | None = None
+        self._armed = False
+        self._created = False
+
+    def arm(self) -> None:
+        self.candidate_xml = None
+        self._armed = True
+        self._created = False
 
     def __call__(
         self, command: list[str], **kwargs: Any
     ) -> subprocess.CompletedProcess[bytes]:
         result = subprocess.run(command, **kwargs)
-        if (
+        successful_query = (
             result.returncode == 0
             and "/Query" in command
             and "/XML" in command
             and isinstance(result.stdout, bytes)
-        ):
+        )
+        if successful_query:
             self.last_query_xml = result.stdout
+        if self._armed and result.returncode == 0 and "/Create" in command:
+            self._created = True
+        if self._armed and self._created and "/Query" in command and "/XML" in command:
+            if successful_query:
+                self.candidate_xml = result.stdout
+            self._armed = False
         return result
 
 
-def _report_task_shape(runner: _CapturingRunner) -> None:
-    if runner.last_query_xml is not None:
+def _report_task_shape(
+    runner: _CapturingRunner, expected: WindowsSchedule
+) -> None:
+    definition = (
+        runner.candidate_xml
+        if runner.candidate_xml is not None
+        else runner.last_query_xml
+    )
+    if definition is not None:
         print(
             "Queried Task Scheduler XML shape: "
-            + _safe_task_shape(runner.last_query_xml),
+            + _safe_task_shape(definition),
+            file=sys.stderr,
+        )
+        categories = task_xml_mismatch_categories(definition, expected)
+        print(
+            "Mismatch categories: " + ",".join(categories),
             file=sys.stderr,
         )
 
@@ -216,6 +249,14 @@ def run_smoke(suffix: str) -> None:
     executable = _teammem_executable()
     install_time, replace_time = _select_future_schedule_times()
     runner = _CapturingRunner()
+    expected = WindowsSchedule(
+        sid=sid,
+        task_name=task_name(sid),
+        time=install_time,
+        executable=executable,
+        env_file=env_file,
+    )
+    runner.arm()
     try:
         install_schedule(
             cfg,
@@ -235,6 +276,14 @@ def run_smoke(suffix: str) -> None:
         if not installed.installed or installed.time != install_time:
             raise RuntimeError("Windows scheduler did not retain the installed task")
 
+        expected = WindowsSchedule(
+            sid=sid,
+            task_name=task_name(sid),
+            time=replace_time,
+            executable=executable,
+            env_file=env_file,
+        )
+        runner.arm()
         install_schedule(
             cfg,
             replace_time,
@@ -271,7 +320,7 @@ def run_smoke(suffix: str) -> None:
         if removed.installed:
             raise RuntimeError("Windows scheduler retained the removed smoke task")
     except RuntimeError:
-        _report_task_shape(runner)
+        _report_task_shape(runner, expected)
         raise
 
 
