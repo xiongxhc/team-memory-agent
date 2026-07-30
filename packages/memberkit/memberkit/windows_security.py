@@ -75,12 +75,16 @@ def _validate_path_syntax(path: Path) -> None:
         raise _path_error(path, "must be an absolute Windows filesystem path")
 
 
-def _restricted_read_grant(aces: Iterable[tuple[str, int]] | None) -> bool:
+def _unapproved_read_grant(
+    aces: Iterable[tuple[str, int]] | None,
+    sid: str,
+) -> bool:
     if aces is None:
         return True
+    allowed_sids = {sid, *PRIVATE_DACL_SIDS}
     return any(
-        sid in RESTRICTED_READ_SIDS and bool(mask & _READ_CAPABLE_MASK)
-        for sid, mask in aces
+        ace_sid not in allowed_sids and bool(mask & _READ_CAPABLE_MASK)
+        for ace_sid, mask in aces
     )
 
 
@@ -106,8 +110,11 @@ def _validate_handle(
             raise _path_error(path, "must be a directory")
     elif record.get("regular") is not True:
         raise _path_error(path, "must be a regular file")
-    if _restricted_read_grant(record.get("allow_aces")):
-        raise _path_error(path, "grants read access to a shared principal")
+    if _unapproved_read_grant(record.get("allow_aces"), sid):
+        raise _path_error(
+            path,
+            "grants read access to an unapproved principal (shared principal)",
+        )
 
 
 def _open_and_validate(
@@ -254,6 +261,7 @@ def atomic_write_windows_private_text(
     had_destination = False
     installed = False
     phase = "provision private parent"
+    boundary_error = None
 
     try:
         encoded = text.encode("utf-8")
@@ -280,9 +288,8 @@ def atomic_write_windows_private_text(
         native.flush_handle(handle)
 
         phase = "close candidate handle"
-        candidate_handle = handle
+        native.close_handle(handle)
         handle = None
-        native.close_handle(candidate_handle)
 
         phase = "atomically replace destination"
         if had_destination:
@@ -304,7 +311,7 @@ def atomic_write_windows_private_text(
         if cleanup_failure is not None:
             raise cleanup_failure
         return path
-    except Exception as failure:
+    except Exception:
         close_failure = None
         if handle is not None:
             try:
@@ -322,18 +329,23 @@ def atomic_write_windows_private_text(
             except Exception as restore_failure:
                 rollback_failure = restore_failure
 
-        cleanup_failure = _best_effort_cleanup(native, candidate, backup)
         if rollback_failure is not None:
-            raise RuntimeError(
+            _best_effort_cleanup(native, candidate)
+            boundary_error = RuntimeError(
                 f"Windows private file write failed during {phase}; rollback failed"
-            ) from rollback_failure
-        if cleanup_failure is not None or close_failure is not None:
-            raise RuntimeError(
-                f"Windows private file write failed during {phase}; cleanup failed"
-            ) from (cleanup_failure or close_failure)
-        raise RuntimeError(
-            f"Windows private file write failed during {phase}"
-        ) from failure
+            )
+        else:
+            cleanup_failure = _best_effort_cleanup(native, candidate, backup)
+            if cleanup_failure is not None or close_failure is not None:
+                boundary_error = RuntimeError(
+                    f"Windows private file write failed during {phase}; cleanup failed"
+                )
+            else:
+                boundary_error = RuntimeError(
+                    f"Windows private file write failed during {phase}"
+                )
+
+    raise boundary_error
 
 
 class NativeWindowsApi:

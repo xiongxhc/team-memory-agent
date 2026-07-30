@@ -1,5 +1,6 @@
 import ctypes
 import ntpath
+import traceback
 from pathlib import Path
 
 import pytest
@@ -80,10 +81,13 @@ class FakeWindowsApi:
         self.destination = None
         self.parent = None
         self._cleanup_recorded = False
+        self._failed_phases = set()
+        self.open_handles = set()
 
     def _phase(self, phase):
         self.phases.append(phase)
-        if self.fail_phase == phase:
+        if self.fail_phase == phase and phase not in self._failed_phases:
+            self._failed_phases.add(phase)
             raise OSError(f"{phase} failed while processing {SECRET_TEXT}")
 
     def current_process_sid(self):
@@ -103,6 +107,7 @@ class FakeWindowsApi:
         except KeyError:
             raise FileNotFoundError(path) from None
         self.opened.append((path, directory, handle))
+        self.open_handles.add(id(handle))
         return handle
 
     def describe_handle(self, handle):
@@ -136,6 +141,7 @@ class FakeWindowsApi:
             and handle not in self.closed
         ):
             self._phase("close candidate handle")
+        self.open_handles.discard(id(handle))
         self.closed.append(handle)
 
     def create_directory(self, path):
@@ -146,6 +152,7 @@ class FakeWindowsApi:
         record = _directory(dacl_protected=False)
         record["path"] = path
         self.records[path] = record
+        self.open_handles.add(id(record))
         return record
 
     def create_empty_file(self, path):
@@ -156,6 +163,7 @@ class FakeWindowsApi:
         record = _file(data=b"", dacl_protected=False)
         record["path"] = path
         self.records[path] = record
+        self.open_handles.add(id(record))
         return record
 
     def apply_protected_dacl(self, handle, sid, principals):
@@ -213,6 +221,11 @@ class FakeWindowsApi:
         if not self._cleanup_recorded:
             self._cleanup_recorded = True
             self._phase("remove backup and candidate")
+        record = self.records.get(path)
+        if record is not None and id(record) in self.open_handles:
+            raise PermissionError(
+                f"cannot delete open candidate while processing {SECRET_TEXT}"
+            )
         self.records.pop(path, None)
 
 
@@ -382,12 +395,26 @@ def test_windows_private_file_allows_non_read_grants_and_privileged_principals()
     record = _file(
         allow_aces=[
             ("S-1-1-0", 0x00000002),
+            (SID, 0x80000000),
             (SYSTEM_SID, 0x10000000),
             (ADMINISTRATORS_SID, 0x10000000),
         ]
     )
 
     assert validate_windows_private_file(path, SID, FakeWindowsApi({path: record})) == path
+
+
+def test_windows_private_file_rejects_read_grant_to_unapproved_sid():
+    path = Path(r"C:\Users\Alex\AppData\Roaming\TeamMemory\memberkit.env")
+    record = _file(
+        allow_aces=[
+            (SID, 0x10000000),
+            ("S-1-5-21-999-888-777-1002", 0x00000081),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="unapproved principal"):
+        validate_windows_private_file(path, SID, FakeWindowsApi({path: record}))
 
 
 def test_windows_private_directory_requires_directory_handle():
@@ -545,4 +572,48 @@ def test_atomic_private_write_reports_rollback_failure_separately():
     with pytest.raises(RuntimeError, match="rollback failed") as error:
         atomic_write_windows_private_text(path, SECRET_TEXT, SID, api)
 
+    backups = [
+        record["data"]
+        for candidate, record in api.records.items()
+        if str(candidate).endswith(".bak")
+    ]
+    assert backups == [b"old private bytes\n"]
     assert SECRET_TEXT.strip() not in str(error.value)
+
+
+def test_atomic_private_write_removes_secret_from_entire_exception_chain():
+    path = Path(r"C:\Users\Alex\AppData\Roaming\TeamMemory\memberkit.env")
+    parent, records = _private_records(path)
+    api = FakeWindowsApi(records, fail_phase="write UTF-8 through candidate handle")
+    api.parent = parent
+    api.destination = path
+
+    with pytest.raises(RuntimeError) as error:
+        atomic_write_windows_private_text(path, SECRET_TEXT, SID, api)
+
+    exception = error.value
+    formatted = "".join(
+        traceback.format_exception(type(exception), exception, exception.__traceback__)
+    )
+    assert exception.__cause__ is None
+    assert exception.__context__ is None
+    assert SECRET_TEXT.strip() not in formatted
+
+
+def test_atomic_private_write_retries_failed_close_before_candidate_cleanup():
+    path = Path(r"C:\Users\Alex\AppData\Roaming\TeamMemory\memberkit.env")
+    parent, records = _private_records(path)
+    api = FakeWindowsApi(records, fail_phase="close candidate handle")
+    api.parent = parent
+    api.destination = path
+
+    with pytest.raises(RuntimeError, match="close candidate handle"):
+        atomic_write_windows_private_text(path, SECRET_TEXT, SID, api)
+
+    assert api.phases.count("close candidate handle") == 2
+    assert api.open_handles == set()
+    assert all(
+        not (str(candidate).endswith(".tmp") or str(candidate).endswith(".bak"))
+        for candidate in api.records
+    )
+    assert api.records[path]["data"] == b"old private bytes\n"
