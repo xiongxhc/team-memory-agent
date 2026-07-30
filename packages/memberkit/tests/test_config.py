@@ -1,4 +1,5 @@
 from pathlib import Path
+import traceback
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -69,6 +70,27 @@ def test_invalid_explicit_timezone_is_rejected(tmp_path):
             },
             config_file=tmp_path / "memberkit.env",
         )
+
+
+def test_invalid_timezone_does_not_expose_value_through_exception_chain(tmp_path):
+    secret = "secret-timezone-47a9"
+
+    with pytest.raises(SystemExit) as raised:
+        config.load(
+            {
+                "MEMBERKIT_MEMBER": "alex",
+                "MEMBERKIT_INBOX_URL": "https://inbox.example.invalid",
+                "MEMBERKIT_TIMEZONE": secret,
+            },
+            config_file=tmp_path / "memberkit.env",
+        )
+
+    error = raised.value
+    traceback_text = "".join(traceback.format_exception(error))
+
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert secret not in traceback_text
 
 
 def test_default_config_file_uses_appdata_on_windows():

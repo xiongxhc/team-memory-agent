@@ -116,12 +116,14 @@ def resolve_timezone(name: str | None, *, config_file: Path | None = None) -> Zo
         return None
     try:
         return ZoneInfo(name.removeprefix(":"))
-    except ZoneInfoNotFoundError as exc:
-        location = f" in {config_file}" if config_file is not None else ""
-        raise SystemExit(
-            "invalid MEMBERKIT_TIMEZONE"
-            f"{location}: use an IANA timezone such as Asia/Dubai"
-        ) from exc
+    except ZoneInfoNotFoundError:
+        pass
+
+    location = f" in {config_file}" if config_file is not None else ""
+    raise SystemExit(
+        "invalid MEMBERKIT_TIMEZONE"
+        f"{location}: use an IANA timezone such as Asia/Dubai"
+    )
 
 
 def load(
