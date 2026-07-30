@@ -614,6 +614,41 @@ def test_xml_rejects_noncanonical_lexical_spelling_of_managed_text(tampered):
         windows.parse_task_xml(_xml_bytes(text), schedule)
 
 
+def test_xml_rejects_apos_named_entity_alias_in_executable_text():
+    schedule = _schedule(
+        executable=r"C:\Chris's Tools\memberkit.exe",
+    )
+    text = _xml_text(schedule)
+    assert "Chris's Tools" in text
+    assert windows.parse_task_xml(_xml_bytes(text), schedule) == "17:30"
+
+    tampered = text.replace("Chris's Tools", "Chris&apos;s Tools", 1)
+    with pytest.raises(RuntimeError, match="not managed"):
+        windows.parse_task_xml(_xml_bytes(tampered), schedule)
+
+
+def test_xml_rejects_quot_named_entity_alias_in_scheduler_metadata():
+    schedule = _schedule()
+    text = _xml_text(schedule).replace(
+        "<RegistrationInfo>",
+        '<RegistrationInfo><Author>CI"runner</Author>',
+        1,
+    )
+    assert windows.parse_task_xml(_xml_bytes(text), schedule) == "17:30"
+
+    tampered = text.replace('CI"runner', "CI&quot;runner", 1)
+    with pytest.raises(RuntimeError, match="not managed"):
+        windows.parse_task_xml(_xml_bytes(tampered), schedule)
+
+
+def test_xml_accepts_required_amp_named_entity_escape():
+    schedule = _schedule(executable=r"C:\R&D\memberkit.exe")
+    xml = windows.build_task_xml(schedule)
+
+    assert "R&amp;D" in xml[2:].decode("utf-16-le")
+    assert windows.parse_task_xml(xml, schedule) == "17:30"
+
+
 def _scheduler_normalized_xml(schedule):
     text = _xml_text(schedule)
     text = text.replace(

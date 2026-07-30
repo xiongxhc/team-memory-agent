@@ -19,6 +19,7 @@ from .windows_security import (
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _NUMERIC_ENTITY = re.compile(r"&#(?:[0-9]+|[xX][0-9a-fA-F]+);")
+_NONCANONICAL_NAMED_ENTITY = re.compile(r"&(?:apos|quot);")
 _NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 _TAG = "{" + _NAMESPACE + "}"
 _TASK_NAME = re.compile(r"\\TeamMem-MemberKit-Daily-[0-9a-f]{12}\Z")
@@ -376,6 +377,7 @@ def _validate_task_xml(xml: bytes, expected: WindowsSchedule) -> str:
             or "<!--" in source
             or "<?" in after_declaration
             or _NUMERIC_ENTITY.search(source)
+            or _NONCANONICAL_NAMED_ENTITY.search(source)
         ):
             raise ValueError(_MANAGED_ERROR)
         parser = ET.XMLParser(
