@@ -1,6 +1,8 @@
 import json
 import plistlib
 import sqlite3
+import sys
+import types
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -8,6 +10,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from memberkit import bundle
+from memberkit import schedule
 from memberkit.config import Config
 from memberkit.schedule import (
     install_schedule,
@@ -48,6 +51,135 @@ def _local_ts(iso):
         _row("", iso)[-1] / 1000,
         tz=bundle._local_timezone(),
     ).isoformat(timespec="milliseconds")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("00:00", (0, 0)),
+        ("17:30", (17, 30)),
+        ("23:59", (23, 59)),
+    ),
+)
+def test_schedule_time_strictly_parses_two_digit_hour_and_minute(value, expected):
+    """Catches accepting a schedule time that is not exactly HH:MM."""
+    assert schedule._parse_time(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("7:30", "07:3", "24:00", "12:60", " 07:30", "07:30 "),
+)
+def test_schedule_time_strictly_rejects_non_hhmm_values(value):
+    """Catches shortened, out-of-range, or whitespace-padded times."""
+    with pytest.raises(ValueError, match="schedule time must be HH:MM"):
+        schedule._parse_time(value)
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    (("darwin", "macos"), ("win32", "windows")),
+)
+def test_platform_facade_selects_the_supported_scheduler(platform, expected):
+    """Catches mapping a supported platform to the wrong backend."""
+    assert schedule._backend(platform) == expected
+
+
+@pytest.mark.parametrize("platform", ("linux", "freebsd"))
+def test_platform_facade_rejects_unsupported_platform_before_mutation(
+    tmp_path, platform,
+):
+    """Catches unsupported platforms creating schedule or work directories."""
+    cfg = _cfg(tmp_path)
+    agents = tmp_path / "LaunchAgents"
+
+    with pytest.raises(
+        ValueError,
+        match=rf"unsupported scheduling platform: {platform}",
+    ):
+        schedule.install_schedule(
+            cfg,
+            agents_dir=agents,
+            executable="/opt/memberkit",
+            platform=platform,
+        )
+
+    assert not agents.exists()
+    assert not cfg.workdir.exists()
+
+
+def test_facade_rejects_invalid_time_before_loading_a_backend(tmp_path, monkeypatch):
+    """Catches importing a backend for an invalid schedule time."""
+    cfg = _cfg(tmp_path)
+    attempted_imports = []
+
+    def no_backend_import(name, package=None):
+        attempted_imports.append((name, package))
+        raise AssertionError("an invalid schedule time must not load a backend")
+
+    monkeypatch.setattr(schedule, "import_module", no_backend_import, raising=False)
+
+    with pytest.raises(ValueError, match="schedule time must be HH:MM"):
+        schedule.install_schedule(
+            cfg,
+            time="7:30",
+            agents_dir=tmp_path / "LaunchAgents",
+            executable="/opt/memberkit",
+            platform="darwin",
+        )
+
+    assert attempted_imports == []
+
+
+def test_facade_win32_does_not_import_the_macos_backend(tmp_path, monkeypatch):
+    """Catches Windows dispatch importing its unselected macOS backend."""
+    observed = {}
+    windows = types.ModuleType("memberkit.schedule_windows")
+
+    def windows_status(**kwargs):
+        observed.update(kwargs)
+        return schedule.ScheduleStatus(True, tmp_path / "windows-task", "17:30")
+
+    windows.schedule_status = windows_status
+    monkeypatch.setitem(sys.modules, "memberkit.schedule_windows", windows)
+    monkeypatch.setitem(sys.modules, "memberkit.schedule_macos", None)
+
+    result = schedule.schedule_status(
+        platform="win32",
+        windows_api="api",
+        windows_runner="runner",
+        windows_state_dir=tmp_path / "state",
+        windows_task_name="task",
+        windows_executable="C:/memberkit.exe",
+    )
+
+    assert result == schedule.ScheduleStatus(
+        True, tmp_path / "windows-task", "17:30"
+    )
+    assert observed == {
+        "api": "api",
+        "runner": "runner",
+        "state_dir": tmp_path / "state",
+        "task_name_override": "task",
+        "executable": "C:/memberkit.exe",
+    }
+
+
+def test_facade_darwin_does_not_import_the_windows_backend(tmp_path, monkeypatch):
+    """Catches macOS dispatch importing its unselected Windows backend."""
+    agents = tmp_path / "LaunchAgents"
+    monkeypatch.setitem(sys.modules, "memberkit.schedule_windows", None)
+
+    path = schedule.install_schedule(
+        _cfg(tmp_path),
+        agents_dir=agents,
+        executable="/opt/example/memberkit",
+        platform="darwin",
+    )
+
+    assert schedule.schedule_status(agents, platform="darwin") == (
+        schedule.ScheduleStatus(True, path, "17:30")
+    )
 
 
 def test_install_defaults_to_1730_and_calls_only_scheduled_run(tmp_path):

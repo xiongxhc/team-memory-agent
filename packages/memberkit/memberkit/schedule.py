@@ -4,19 +4,19 @@ The scheduled command never imports the push module and never transmits data.
 """
 
 import json
-import plistlib
 import shutil
-import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from importlib import import_module
 from pathlib import Path
+from typing import Any, Callable, Literal
 
 from . import bundle
 from .config import Config
 from .state import DraftState
 
 
-LABEL = "org.teammem.memberkit-daily"
 DEFAULT_TIME = "17:30"
 
 
@@ -27,95 +27,124 @@ class ScheduleStatus:
     time: str | None = None
 
 
-def _agents_dir(agents_dir: Path | None) -> Path:
-    return agents_dir or Path.home() / "Library" / "LaunchAgents"
-
-
-def _schedule_path(agents_dir: Path | None) -> Path:
-    return _agents_dir(agents_dir) / f"{LABEL}.plist"
+def _backend(platform: str | None) -> Literal["macos", "windows"]:
+    selected = platform or sys.platform
+    if selected == "darwin":
+        return "macos"
+    if selected == "win32":
+        return "windows"
+    raise ValueError(f"unsupported scheduling platform: {selected}")
 
 
 def _parse_time(value: str) -> tuple[int, int]:
-    try:
-        hour_text, minute_text = value.split(":", 1)
-        hour, minute = int(hour_text), int(minute_text)
-    except (ValueError, AttributeError) as exc:
-        raise ValueError("schedule time must be HH:MM") from exc
+    if (
+        not isinstance(value, str)
+        or len(value) != 5
+        or value[2] != ":"
+        or not all("0" <= digit <= "9" for digit in value[:2] + value[3:])
+    ):
+        raise ValueError("schedule time must be HH:MM")
+    hour, minute = int(value[:2]), int(value[3:])
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         raise ValueError("schedule time must be HH:MM")
     return hour, minute
 
 
-def install_schedule(config: Config, time: str = DEFAULT_TIME,
-                     agents_dir: Path | None = None,
-                     executable: str | None = None) -> Path:
-    hour, minute = _parse_time(time)
-    path = _schedule_path(agents_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    config.workdir.mkdir(parents=True, exist_ok=True)
-    command = executable or shutil.which("memberkit")
+def _executable(value: str | None) -> str:
+    command = value or shutil.which("memberkit")
     if not command:
         raise RuntimeError("memberkit executable is not on PATH")
-    payload = {
-        "Label": LABEL,
-        "ProgramArguments": [command, "scheduled-run"],
-        "StartCalendarInterval": {"Hour": hour, "Minute": minute},
-        "StandardOutPath": str(config.workdir / "schedule.log"),
-        "StandardErrorPath": str(config.workdir / "schedule.err"),
-    }
-    path.write_bytes(plistlib.dumps(payload, sort_keys=True))
-    if agents_dir is None:
-        domain = f"gui/{__import__('os').getuid()}"
-        subprocess.run(
-            ["launchctl", "bootout", domain, str(path)],
-            capture_output=True,
-            text=True,
+    return command
+
+
+def _load_backend(backend: Literal["macos", "windows"]) -> Any:
+    return import_module(f".schedule_{backend}", package=__package__)
+
+
+def install_schedule(
+    config: Config,
+    time: str = DEFAULT_TIME,
+    agents_dir: Path | None = None,
+    executable: str | None = None,
+    platform: str | None = None,
+    runner: Callable[..., Any] | None = None,
+    windows_api: Any = None,
+    windows_runner: Callable[..., Any] | None = None,
+    windows_state_dir: Path | None = None,
+    windows_task_name: str | None = None,
+) -> Path:
+    backend = _backend(platform)
+    hour, minute = _parse_time(time)
+    command = _executable(executable)
+    module = _load_backend(backend)
+    if backend == "macos":
+        return module.install_schedule(
+            config,
+            hour,
+            minute,
+            command,
+            agents_dir=agents_dir,
+            runner=runner,
         )
-        subprocess.run(
-            ["launchctl", "bootstrap", domain, str(path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    return path
+    return module.install_schedule(
+        hour,
+        minute,
+        command,
+        api=windows_api,
+        runner=windows_runner,
+        state_dir=windows_state_dir,
+        task_name_override=windows_task_name,
+    )
 
 
-def schedule_status(agents_dir: Path | None = None) -> ScheduleStatus:
-    path = _schedule_path(agents_dir)
-    if not path.exists():
-        return ScheduleStatus(False, path)
-    try:
-        interval = plistlib.loads(path.read_bytes())["StartCalendarInterval"]
-        time = f"{interval['Hour']:02d}:{interval['Minute']:02d}"
-    except (KeyError, ValueError, TypeError):
-        time = None
-    return ScheduleStatus(True, path, time)
+def schedule_status(
+    agents_dir: Path | None = None,
+    platform: str | None = None,
+    runner: Callable[..., Any] | None = None,
+    windows_api: Any = None,
+    windows_runner: Callable[..., Any] | None = None,
+    windows_state_dir: Path | None = None,
+    windows_task_name: str | None = None,
+    windows_executable: str | None = None,
+) -> ScheduleStatus:
+    backend = _backend(platform)
+    module = _load_backend(backend)
+    if backend == "macos":
+        return module.schedule_status(agents_dir=agents_dir, runner=runner)
+    return module.schedule_status(
+        api=windows_api,
+        runner=windows_runner,
+        state_dir=windows_state_dir,
+        task_name_override=windows_task_name,
+        executable=_executable(windows_executable),
+    )
 
 
-def remove_schedule(agents_dir: Path | None = None) -> bool:
-    path = _schedule_path(agents_dir)
-    if not path.exists():
-        return False
-    if agents_dir is None:
-        domain = f"gui/{__import__('os').getuid()}"
-        subprocess.run(
-            ["launchctl", "bootout", domain, str(path)],
-            capture_output=True,
-            text=True,
-        )
-    path.unlink()
-    return True
+def remove_schedule(
+    agents_dir: Path | None = None,
+    platform: str | None = None,
+    runner: Callable[..., Any] | None = None,
+    windows_api: Any = None,
+    windows_runner: Callable[..., Any] | None = None,
+    windows_state_dir: Path | None = None,
+    windows_task_name: str | None = None,
+    windows_executable: str | None = None,
+) -> bool:
+    backend = _backend(platform)
+    module = _load_backend(backend)
+    if backend == "macos":
+        return module.remove_schedule(agents_dir=agents_dir, runner=runner)
+    return module.remove_schedule(
+        api=windows_api,
+        runner=windows_runner,
+        state_dir=windows_state_dir,
+        task_name_override=windows_task_name,
+        executable=_executable(windows_executable),
+    )
 
 
 def _notify_pending(dates: list[str]) -> None:
-    if not dates:
-        return
-    joined = ", ".join(dates)
-    script = (
-        f'display notification "Review: {joined}" '
-        'with title "MemberKit drafts ready"'
-    )
-    subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    _load_backend("macos").notify_pending(dates)
 
 
 def _valid_existing_draft(data: object, config: Config, date: str) -> bool:
