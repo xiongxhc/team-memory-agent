@@ -48,6 +48,16 @@ def current_username(api: Any = None) -> str:
     return (api or _native_api()).current_username()
 
 
+def current_session_id(api: Any = None) -> int:
+    """Return the current process's validated non-reserved Windows session ID."""
+    value = (api or _native_api()).current_session_id()
+    if type(value) is not int:
+        raise ValueError("invalid Windows session ID")
+    if not 0 <= value < 0xFFFFFFFF:
+        raise ValueError("invalid Windows session ID")
+    return value
+
+
 def _is_absolute_windows_filesystem_path(path: Path) -> bool:
     value = str(path)
     if not value or "\0" in value:
@@ -373,6 +383,10 @@ class NativeWindowsApi:
 
         kernel32.GetCurrentProcess.argtypes = []
         kernel32.GetCurrentProcess.restype = handle
+        kernel32.GetCurrentProcessId.argtypes = []
+        kernel32.GetCurrentProcessId.restype = dword
+        kernel32.ProcessIdToSessionId.argtypes = [dword, pointer(dword)]
+        kernel32.ProcessIdToSessionId.restype = boolean
         kernel32.CloseHandle.argtypes = [handle]
         kernel32.CloseHandle.restype = boolean
         kernel32.LocalFree.argtypes = [handle]
@@ -543,6 +557,20 @@ class NativeWindowsApi:
         if not advapi32.GetUserNameW(buffer, ctypes.byref(size)):
             raise OSError(ctypes.get_last_error(), "GetUserNameW failed")
         return buffer.value
+
+    def current_session_id(self) -> int:
+        ctypes, kernel32, _advapi32 = self._libraries()
+        process_id = kernel32.GetCurrentProcessId()
+        session_id = ctypes.c_ulong()
+        if not kernel32.ProcessIdToSessionId(
+            process_id,
+            ctypes.byref(session_id),
+        ):
+            raise OSError(
+                ctypes.get_last_error(),
+                "ProcessIdToSessionId failed",
+            )
+        return session_id.value
 
     def open_file(
         self,

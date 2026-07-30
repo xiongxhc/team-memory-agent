@@ -22,6 +22,10 @@ from .state import DraftState
 DEFAULT_TIME = "17:30"
 
 
+class UnsupportedSchedulingPlatformError(RuntimeError):
+    """Automatic schedule installation is unavailable on this platform."""
+
+
 @dataclass(frozen=True)
 class ScheduleStatus:
     installed: bool
@@ -35,7 +39,9 @@ def _backend(platform: str | None) -> Literal["macos", "windows"]:
         return "macos"
     if selected == "win32":
         return "windows"
-    raise ValueError(f"unsupported scheduling platform: {selected}")
+    raise UnsupportedSchedulingPlatformError(
+        f"unsupported scheduling platform: {selected}"
+    )
 
 
 def _parse_time(value: str) -> tuple[int, int]:
@@ -211,7 +217,14 @@ def _append_bounded_log(
     except FileNotFoundError:
         current_size = 0
     if current_size + len(record) > max_bytes:
-        os.replace(path, Path(f"{path}.1"))
+        backup = Path(f"{path}.1")
+        os.replace(path, backup)
+        if current_size > max_bytes:
+            with backup.open("rb") as stream:
+                stream.seek(-max_bytes, os.SEEK_END)
+                retained = stream.read(max_bytes)
+            retained = retained.decode("utf-8", "ignore").encode("utf-8")
+            backup.write_bytes(retained)
     with path.open("ab") as stream:
         stream.write(record)
 

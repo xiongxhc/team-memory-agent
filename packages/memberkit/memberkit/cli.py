@@ -5,8 +5,14 @@ from datetime import datetime
 from pathlib import Path
 
 from . import bundle, config
-from .schedule import (DEFAULT_TIME, install_schedule, remove_schedule,
-                       schedule_status, scheduled_run)
+from .schedule import (
+    DEFAULT_TIME,
+    UnsupportedSchedulingPlatformError,
+    install_schedule,
+    remove_schedule,
+    schedule_status,
+    scheduled_run,
+)
 from .state import DraftState
 
 
@@ -80,10 +86,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"configured {config_path}; schedule disabled")
         else:
             schedule_failed = False
+            schedule_unsupported = False
             try:
                 path = install_schedule(cfg, time=schedule_time)
+            except UnsupportedSchedulingPlatformError:
+                schedule_unsupported = True
             except Exception:
                 schedule_failed = True
+            if schedule_unsupported:
+                raise SystemExit(
+                    f"configuration saved at {config_path}; automatic scheduling "
+                    "is unavailable on this platform; rerun setup with "
+                    "`--no-schedule` or configure a scheduler to invoke "
+                    "`memberkit scheduled-run`"
+                )
             if schedule_failed:
                 raise SystemExit(
                     f"configuration saved at {config_path}; scheduling failed; "

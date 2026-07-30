@@ -21,8 +21,8 @@ from typing import Any, Callable, Iterator, Sequence
 from .schedule import ScheduleStatus
 from .windows_security import (
     _is_absolute_windows_filesystem_path,
+    current_session_id,
     current_user_sid,
-    current_username,
     provision_windows_private_dir,
 )
 
@@ -59,7 +59,7 @@ def notify_pending(
     api: Any = None,
     runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> str | None:
-    """Notify the current Windows user without surfacing native output."""
+    """Notify the current process's Windows session without native output."""
     validated_dates: list[str] = []
     for value in dates:
         if not isinstance(value, str) or _ISO_DATE.fullmatch(value) is None:
@@ -76,24 +76,18 @@ def notify_pending(
         return None
 
     try:
-        username = current_username(api)
-    except OSError:
-        return "reminder.unavailable"
-    if (
-        not isinstance(username, str)
-        or not username
-        or username[0] in {"/", "-"}
-        or "*" in username
-        or _CONTROL.search(username)
-    ):
+        session_id = current_session_id(api)
+    except ValueError:
         return "reminder.invalid-target"
+    except Exception:
+        return "reminder.unavailable"
 
     execute = subprocess.run if runner is None else runner
     try:
         result = execute(
             [
                 "msg.exe",
-                username,
+                str(session_id),
                 "/TIME:60",
                 "MemberKit drafts ready for review: "
                 + ", ".join(validated_dates),

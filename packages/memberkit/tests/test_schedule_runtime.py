@@ -14,14 +14,17 @@ from memberkit.config import Config
 from memberkit.state import DraftState
 
 
-class UsernameApi:
-    def __init__(self, username="Alex"):
-        self.username = username
+class SessionApi:
+    def __init__(self, session_id=42, failure=None):
+        self.session_id = session_id
+        self.failure = failure
         self.calls = 0
 
-    def current_username(self):
+    def current_session_id(self):
         self.calls += 1
-        return self.username
+        if self.failure is not None:
+            raise self.failure
+        return self.session_id
 
 
 class ReminderRunner:
@@ -74,8 +77,8 @@ def runtime_row(title, iso):
     )
 
 
-def test_windows_reminder_targets_only_current_user_with_exact_safe_argv():
-    api = UsernameApi()
+def test_windows_reminder_targets_only_current_process_session_with_exact_argv():
+    api = SessionApi()
     runner = ReminderRunner()
 
     result = schedule_windows.notify_pending(
@@ -90,7 +93,7 @@ def test_windows_reminder_targets_only_current_user_with_exact_safe_argv():
         (
             [
                 "msg.exe",
-                "Alex",
+                "42",
                 "/TIME:60",
                 (
                     "MemberKit drafts ready for review: "
@@ -138,7 +141,7 @@ def test_windows_reminder_process_failures_return_fixed_safe_categories(
 ):
     result = schedule_windows.notify_pending(
         ["2026-07-27"],
-        api=UsernameApi(),
+        api=SessionApi(),
         runner=ReminderRunner(failure=failure),
     )
 
@@ -149,7 +152,7 @@ def test_windows_reminder_process_failures_return_fixed_safe_categories(
 def test_windows_reminder_nonzero_exit_is_nonfatal_and_output_free():
     result = schedule_windows.notify_pending(
         ["2026-07-27"],
-        api=UsernameApi(),
+        api=SessionApi(),
         runner=ReminderRunner(returncode=5),
     )
 
@@ -157,14 +160,10 @@ def test_windows_reminder_nonzero_exit_is_nonfatal_and_output_free():
     assert "localized" not in result
 
 
-def test_windows_reminder_username_lookup_failure_is_nonfatal_and_secret_safe():
-    class FailingUsernameApi:
-        def current_username(self):
-            raise OSError("secret-token from GetUserNameW")
-
+def test_windows_reminder_session_lookup_failure_is_nonfatal_and_secret_safe():
     result = schedule_windows.notify_pending(
         ["2026-07-27"],
-        api=FailingUsernameApi(),
+        api=SessionApi(failure=OSError("secret-token from ProcessIdToSessionId")),
         runner=ReminderRunner(),
     )
 
@@ -185,7 +184,7 @@ def test_windows_reminder_username_lookup_failure_is_nonfatal_and_secret_safe():
     ],
 )
 def test_windows_reminder_rejects_non_iso_dates_before_process_execution(date):
-    api = UsernameApi()
+    api = SessionApi()
     runner = ReminderRunner()
 
     with pytest.raises(ValueError, match="ISO YYYY-MM-DD"):
@@ -195,13 +194,16 @@ def test_windows_reminder_rejects_non_iso_dates_before_process_execution(date):
     assert runner.calls == []
 
 
-@pytest.mark.parametrize("username", ["", "*", "Alex\n*", "Alex\0Admin"])
-def test_windows_reminder_never_uses_an_empty_wildcard_or_control_target(username):
+@pytest.mark.parametrize(
+    "session_id",
+    [-1, 2**32 - 1, 2**32, True, "42", "@sessions", None],
+)
+def test_windows_reminder_never_uses_an_invalid_or_ambiguous_target(session_id):
     runner = ReminderRunner()
 
     result = schedule_windows.notify_pending(
         ["2026-07-27"],
-        api=UsernameApi(username),
+        api=SessionApi(session_id),
         runner=runner,
     )
 
@@ -210,7 +212,7 @@ def test_windows_reminder_never_uses_an_empty_wildcard_or_control_target(usernam
 
 
 def test_windows_reminder_with_no_dates_has_no_native_side_effect():
-    api = UsernameApi()
+    api = SessionApi()
     runner = ReminderRunner()
 
     assert schedule_windows.notify_pending([], api=api, runner=runner) is None
@@ -304,6 +306,21 @@ def test_bounded_log_truncates_multibyte_record_without_splitting_utf8(tmp_path)
 
     assert path.stat().st_size <= 17
     assert path.read_text(encoding="utf-8").endswith("\n")
+
+
+def test_bounded_log_caps_oversized_utf8_current_and_replaces_backup(tmp_path):
+    path = tmp_path / "schedule.log"
+    backup = Path(f"{path}.1")
+    path.write_text("é" * 9, encoding="utf-8")
+    backup.write_text("stale-backup" * 3, encoding="utf-8")
+
+    schedule._append_bounded_log(path, "界", max_bytes=17)
+
+    assert path.read_text(encoding="utf-8") == "界\n"
+    assert path.stat().st_size <= 17
+    assert backup.stat().st_size <= 17
+    backup.read_text(encoding="utf-8")
+    assert not Path(f"{path}.2").exists()
 
 
 def test_windows_scheduled_run_keeps_positional_contract_and_logs_safe_success(
@@ -443,14 +460,14 @@ def test_windows_scheduled_run_filters_malformed_persisted_pending_dates(
         cfg,
         datetime(2026, 7, 28, 18, 0),
         platform="win32",
-        windows_api=UsernameApi(),
+        windows_api=SessionApi(),
         windows_runner=runner,
     )
 
     assert pending == ["2026-07-20"]
     assert runner.calls[0][0] == [
         "msg.exe",
-        "Alex",
+        "42",
         "/TIME:60",
         "MemberKit drafts ready for review: 2026-07-20",
     ]

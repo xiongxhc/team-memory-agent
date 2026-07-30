@@ -95,7 +95,7 @@ def test_platform_facade_rejects_unsupported_platform_before_mutation(
     agents = tmp_path / "LaunchAgents"
 
     with pytest.raises(
-        ValueError,
+        schedule.UnsupportedSchedulingPlatformError,
         match=rf"unsupported scheduling platform: {platform}",
     ):
         schedule.install_schedule(
@@ -123,7 +123,10 @@ def test_facade_rejects_explicit_empty_platform_before_backend_import(
 
     monkeypatch.setattr(schedule, "import_module", no_backend_import)
 
-    with pytest.raises(ValueError, match=r"unsupported scheduling platform: "):
+    with pytest.raises(
+        schedule.UnsupportedSchedulingPlatformError,
+        match=r"unsupported scheduling platform: ",
+    ):
         schedule.install_schedule(
             cfg,
             agents_dir=agents,

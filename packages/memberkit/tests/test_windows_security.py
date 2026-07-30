@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from memberkit import windows_security
 from memberkit.windows_security import (
     NativeWindowsApi,
     atomic_write_windows_private_text,
@@ -19,6 +20,7 @@ from memberkit.windows_security import (
 
 SID = "S-1-5-21-111-222-333-1001"
 USERNAME = "Alex"
+SESSION_ID = 42
 SYSTEM_SID = "S-1-5-18"
 ADMINISTRATORS_SID = "S-1-5-32-544"
 SECRET_TEXT = (
@@ -98,6 +100,9 @@ class FakeWindowsApi:
 
     def current_username(self):
         return USERNAME
+
+    def current_session_id(self):
+        return SESSION_ID
 
     def open_file(self, path, *, directory=False):
         path = Path(path)
@@ -249,6 +254,21 @@ def test_current_windows_identity_uses_injected_native_api():
 
     assert current_user_sid(api) == SID
     assert current_username(api) == USERNAME
+    assert windows_security.current_session_id(api) == SESSION_ID
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1, 2**32 - 1, 2**32, True, "42", "@sessions", None],
+)
+def test_current_windows_session_rejects_unsafe_or_reserved_values(value):
+    class InvalidSessionApi:
+        @staticmethod
+        def current_session_id():
+            return value
+
+    with pytest.raises(ValueError, match="Windows session ID"):
+        windows_security.current_session_id(InvalidSessionApi())
 
 
 def test_native_bindings_use_pointer_width_handles():
@@ -266,11 +286,43 @@ def test_native_bindings_use_pointer_width_handles():
     NativeWindowsApi._configure_api(ctypes, kernel32, advapi32)
 
     assert kernel32.CreateFileW.restype is ctypes.c_void_p
+    assert kernel32.GetCurrentProcessId.restype is ctypes.c_ulong
+    assert kernel32.ProcessIdToSessionId.argtypes == [
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
     assert kernel32.CloseHandle.argtypes == [ctypes.c_void_p]
     assert kernel32.FlushFileBuffers.argtypes == [ctypes.c_void_p]
     assert advapi32.OpenProcessToken.argtypes[0] is ctypes.c_void_p
     assert advapi32.GetSecurityInfo.argtypes[0] is ctypes.c_void_p
     assert advapi32.SetSecurityInfo.argtypes[0] is ctypes.c_void_p
+
+
+def test_native_current_session_uses_the_current_process_id(monkeypatch):
+    calls = []
+
+    class Kernel32:
+        @staticmethod
+        def GetCurrentProcessId():
+            calls.append(("process",))
+            return 987
+
+        @staticmethod
+        def ProcessIdToSessionId(process_id, session_id):
+            calls.append(("session", process_id))
+            session_id._obj.value = SESSION_ID
+            return 1
+
+    monkeypatch.setattr(
+        NativeWindowsApi,
+        "_libraries",
+        staticmethod(lambda: (ctypes, Kernel32(), object())),
+    )
+
+    api = object.__new__(NativeWindowsApi)
+
+    assert api.current_session_id() == SESSION_ID
+    assert calls == [("process",), ("session", 987)]
 
 
 def test_native_created_handles_request_write_dac_before_protection(

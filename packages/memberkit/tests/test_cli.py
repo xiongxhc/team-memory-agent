@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from memberkit import cli
+from memberkit import cli, schedule
 from memberkit.config import Config
 from memberkit.state import DraftState, event_fingerprint
 
@@ -488,7 +488,7 @@ def test_setup_and_schedule_help_name_host_local_timezone(argv, capsys):
     assert "host's local timezone" in capsys.readouterr().out
 
 
-def test_setup_schedule_failure_preserves_config_and_names_retry_command(
+def test_setup_operational_schedule_failure_preserves_config_and_names_retry(
     tmp_path,
     monkeypatch,
 ):
@@ -511,7 +511,7 @@ def test_setup_schedule_failure_preserves_config_and_names_retry_command(
         cli,
         "install_schedule",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            ValueError("unsupported scheduling platform: linux secret-token")
+            RuntimeError("scheduler backend failed with secret-token")
         ),
     )
 
@@ -538,6 +538,45 @@ def test_setup_schedule_failure_preserves_config_and_names_retry_command(
         related.append(exception)
         pending.extend([exception.__cause__, exception.__context__])
     assert related == []
+
+
+def test_setup_unsupported_schedule_preserves_config_and_gives_manual_guidance(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _setup_cfg(tmp_path)
+    config_path = tmp_path / "platform" / "memberkit.env"
+
+    def write_config(_values):
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text("saved\n", encoding="utf-8")
+        return config_path
+
+    monkeypatch.setattr(cli.config, "write_config", write_config)
+    monkeypatch.setattr(
+        cli.config,
+        "load",
+        lambda *, config_file: cfg if config_file == config_path else None,
+    )
+    monkeypatch.setattr(schedule.sys, "platform", "linux-secret-token")
+
+    with pytest.raises(SystemExit) as error:
+        cli.main([
+            "setup",
+            "--member", cfg.member,
+            "--inbox-url", cfg.inbox_url,
+            "--time", "17:30",
+        ])
+
+    message = str(error.value)
+    assert str(config_path) in message
+    assert "--no-schedule" in message
+    assert "memberkit scheduled-run" in message
+    assert "memberkit schedule install" not in message
+    assert "secret-token" not in message
+    assert config_path.read_text(encoding="utf-8") == "saved\n"
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
 
 def test_dismiss_excludes_pending_date_without_transmitting(tmp_path, monkeypatch):

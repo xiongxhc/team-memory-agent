@@ -283,14 +283,18 @@ After draft preparation, notification dispatch is platform-specific:
 
 - macOS keeps the existing `osascript` notification listing pending dates.
 - Windows invokes `msg.exe` directly, never through a shell, targeting only the
-  current username and never `*`. The message contains only ISO pending dates
+  verified current-process session ID as a decimal value. MemberKit obtains it
+  with `GetCurrentProcessId` plus `ProcessIdToSessionId`; it never passes a
+  username, `*`, or `@list` target. The message contains only ISO pending dates
   and expires after 60 seconds.
 - Other platforms skip desktop notification without failing draft preparation.
 
 Windows `msg.exe` delivery is best-effort because it can be unavailable or
-denied by session permissions. Missing executables, permission errors, timeouts,
-and non-zero results never change a successful draft run into a failure. Local
-drafts and `memberkit schedule status` remain authoritative.
+denied by session permissions. Native session lookup errors, invalid session
+values, missing executables, permission errors, timeouts, and non-zero results
+return fixed non-sensitive categories and never change a successful draft run
+into a failure. Local drafts and `memberkit schedule status` remain
+authoritative.
 
 Because a direct Task Scheduler action has no shell redirection, Windows
 `memberkit scheduled-run` writes bounded internal diagnostics to:
@@ -300,10 +304,12 @@ Because a direct Task Scheduler action has no shell redirection, Windows
 <MEMBERKIT_WORKDIR>\schedule.err
 ```
 
-Each file is capped at 1 MiB with one `.1` rollover. Success records only the
-invocation time and pending ISO dates. Error records contain the phase, exception
-type, and one bounded single-line diagnostic. Logs never contain configuration
-values, inbox URLs, tokens, event summaries, journals, or bundle content.
+Each file is capped at 1 MiB with one `.1` rollover; both the current file and
+backup are capped even when the pre-existing current file is already oversized.
+Success records only the invocation time and pending ISO dates. Error records
+contain the phase, exception type, and one bounded single-line diagnostic. Logs
+never contain configuration values, inbox URLs, tokens, event summaries,
+journals, or bundle content.
 Uncaught draft failures and `msg.exe` delivery failures are recorded before the
 command returns non-zero or, for notification-only failure, returns success.
 
@@ -323,8 +329,10 @@ separate packaging feature rather than a scheduler patch.
 - Existing malformed or member-edited drafts retain their current preservation
   behavior.
 - Setup may leave a successfully written private configuration when scheduler
-  installation fails; the error explicitly identifies scheduling as the failed
-  stage so the member can retry `memberkit schedule install`.
+  installation fails. Operational macOS/Windows errors identify the scheduling
+  stage so the member can retry `memberkit schedule install`; unsupported
+  platforms instead direct the member to `--no-schedule` or a manually
+  configured `memberkit scheduled-run`.
 
 ## Testing
 

@@ -53,8 +53,8 @@ pytest, GitHub Actions
   the threat boundary.
 - Windows configuration is private before content is written and is validated
   through the same opened handle on every read.
-- Windows reminders target only the current username with `/TIME:60`; reminder
-  failure is non-fatal.
+- Windows reminders target only the verified current-process session ID with
+  `/TIME:60`; reminder failure is non-fatal.
 - Scheduled runs never import push code, approve, commit, push, or transmit.
 - Existing member-edited and malformed draft preservation remains unchanged.
 - Unit tests never touch a production scheduler.
@@ -79,6 +79,7 @@ pytest, GitHub Actions
 ```python
 def current_user_sid(api: Any = None) -> str: ...
 def current_username(api: Any = None) -> str: ...
+def current_session_id(api: Any = None) -> int: ...
 def validate_windows_private_file(
     path: Path, sid: str, api: Any = None
 ) -> Path: ...
@@ -107,10 +108,11 @@ reference before editing tests.
 
 - [ ] **Step 2: Write the failing identity, path, and handle-validation tests**
 
-Create fake file/directory records and an injected API. Cover current SID and
-username, drive-absolute and complete UNC paths, and rejection of device paths,
-drive-relative paths, incomplete UNC paths, non-disk handles, reparse points,
-wrong owners, inherited DACLs, and read ACEs for these principals:
+Create fake file/directory records and an injected API. Cover current SID,
+username, validated current-process session ID, drive-absolute and complete UNC
+paths, and rejection of device paths, drive-relative paths, incomplete UNC
+paths, non-disk handles, reparse points, wrong owners, inherited DACLs, and read
+ACEs for these principals:
 
 ```python
 RESTRICTED_READ_SIDS = {
@@ -896,10 +898,13 @@ git commit -m "feat: manage MemberKit Windows schedules"
 
 **Interfaces:**
 
-- Consumes: Task 1 username, Task 2 config, and Tasks 3–5 scheduling.
+- Consumes: Task 1 current-process session ID, Task 2 config, and Tasks 3–5
+  scheduling.
 - Produces:
 
 ```python
+class UnsupportedSchedulingPlatformError(RuntimeError): ...
+
 def notify_pending(
     dates: Sequence[str],
     *,
@@ -948,15 +953,17 @@ The exact argv is:
 ```python
 [
     "msg.exe",
-    current_username(api),
+    str(current_session_id(api)),
     "/TIME:60",
     "MemberKit drafts ready for review: 2026-07-27, 2026-07-28",
 ]
 ```
 
 Validate all dates as ISO `YYYY-MM-DD`. Assert there is no shell and never a
-`*` target. Missing executable, permission error, timeout, and nonzero exit
-return fixed safe categories and do not raise.
+`*`, username, or `@list` target. The target is the validated decimal session
+ID for the current process. Missing executable, permission error, timeout,
+native/API lookup failure, and nonzero exit return fixed safe categories and do
+not raise.
 
 - [ ] **Step 2: Run reminder RED**
 
@@ -971,8 +978,9 @@ Expected: runtime test module or notification interface is missing.
 
 - [ ] **Step 3: Implement platform notification dispatch**
 
-macOS calls the moved `osascript` helper. Windows calls `msg.exe` directly with
-a short timeout and discards localized output. Linux/other platforms skip
+macOS calls the moved `osascript` helper. Windows resolves the current process
+ID to its Windows session ID, calls `msg.exe` directly with that decimal target,
+a short timeout, and discarded localized output. Linux/other platforms skip
 desktop notification. Do not interpolate exception messages into returned
 categories.
 
@@ -1006,8 +1014,10 @@ Expected: bounded logging behavior is missing.
 
 Rotate `schedule.log` to `schedule.log.1` and `schedule.err` to
 `schedule.err.1` before an append would exceed 1 MiB. Retain one backup only.
-Normalize each record to one bounded line. Never log configuration values,
-URLs, event summaries, journals, bundle data, or `str(exception)`.
+Both current and backup files remain capped even when a pre-existing current
+file is already oversized. Normalize each record to one bounded UTF-8 line.
+Never log configuration values, URLs, event summaries, journals, bundle data,
+or `str(exception)`.
 
 - [ ] **Step 7: Write failing platform-neutral CLI tests**
 
@@ -1021,10 +1031,12 @@ install_schedule(cfg, time=schedule_time)
 ```
 
 The same CLI path serves macOS and Windows; no `sys.platform` branch belongs in
-`cli.py`. `--no-schedule` writes config and skips scheduling. A schedule failure
-preserves config and raises a concise message naming
-`memberkit schedule install`. Linux accepting scheduling fails explicitly after
-config is saved and creates no scheduler artifacts.
+`cli.py`. `--no-schedule` writes config and skips scheduling. An operational
+macOS or Windows schedule failure preserves config and raises a concise message
+naming `memberkit schedule install`. A distinct unsupported-platform exception
+lets Linux preserve the saved config while directing the member to rerun setup
+with `--no-schedule` or configure `memberkit scheduled-run` manually. Linux
+creates no scheduler artifacts.
 
 - [ ] **Step 8: Run CLI RED**
 
