@@ -10,7 +10,6 @@ import os
 import re
 import subprocess
 import tempfile
-import threading
 import time as clock
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
@@ -36,7 +35,7 @@ _MAX_TASK_XML_BYTES = 1024 * 1024
 _SCHEDULER_TIMEOUT_SECONDS = 30.0
 _PROCESS_STOP_GRACE_SECONDS = 1.0
 _PROCESS_POLL_INTERVAL_SECONDS = 0.01
-_PIPE_CHUNK_BYTES = 64 * 1024
+_SPOOL_FACTORY = tempfile.TemporaryFile
 _MANAGED_ERROR = "Windows schedule definition is not managed by TeamMem MemberKit"
 _PRINCIPAL_ID = "Author"
 OWNERSHIP_SOURCE = "TeamMem-MemberKit"
@@ -718,36 +717,13 @@ def task_xml_mismatch_categories(
 WindowsRunner = Callable[..., subprocess.CompletedProcess[bytes]]
 _CONFLICT = "Windows schedule definition conflicts with an existing task"
 _UNAVAILABLE = "Windows scheduler status is unavailable"
+_RECOVERY_RESTORED = "restored"
+_RECOVERY_CONFLICT = "conflict"
+_RECOVERY_FAILED = "failed"
 
 
 class _SchedulerProcessError(subprocess.SubprocessError):
     pass
-
-
-def _read_bounded_pipe(
-    pipe: Any,
-    output: bytearray,
-    overflow: threading.Event,
-    failed: threading.Event,
-) -> None:
-    try:
-        while not overflow.is_set():
-            remaining = _MAX_TASK_XML_BYTES + 1 - len(output)
-            if remaining <= 0:
-                overflow.set()
-                return
-            chunk = pipe.read(min(_PIPE_CHUNK_BYTES, remaining))
-            if not chunk:
-                return
-            if not isinstance(chunk, bytes):
-                failed.set()
-                return
-            output.extend(chunk)
-            if len(output) > _MAX_TASK_XML_BYTES:
-                overflow.set()
-                return
-    except Exception:
-        failed.set()
 
 
 def _stop_and_reap(process: subprocess.Popen[bytes]) -> bool:
@@ -770,6 +746,24 @@ def _stop_and_reap(process: subprocess.Popen[bytes]) -> bool:
     return process.poll() is not None
 
 
+def _spool_size(spool: Any) -> int:
+    return os.fstat(spool.fileno()).st_size
+
+
+def _read_spool(spool: Any, deadline: float) -> bytes:
+    if clock.monotonic() > deadline or _spool_size(spool) > _MAX_TASK_XML_BYTES:
+        raise _SchedulerProcessError()
+    spool.seek(0)
+    output = spool.read(_MAX_TASK_XML_BYTES + 1)
+    if (
+        clock.monotonic() > deadline
+        or not isinstance(output, bytes)
+        or len(output) > _MAX_TASK_XML_BYTES
+    ):
+        raise _SchedulerProcessError()
+    return output
+
+
 def _default_runner(
     command: list[str],
     **kwargs: Any,
@@ -777,77 +771,63 @@ def _default_runner(
     if kwargs != {"capture_output": True, "text": False}:
         raise _SchedulerProcessError()
 
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-    )
-    assert process.stdout is not None
-    assert process.stderr is not None
-    stdout = bytearray()
-    stderr = bytearray()
-    overflow = threading.Event()
-    failed = threading.Event()
-    readers = [
-        threading.Thread(
-            target=_read_bounded_pipe,
-            args=(process.stdout, stdout, overflow, failed),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=_read_bounded_pipe,
-            args=(process.stderr, stderr, overflow, failed),
-            daemon=True,
-        ),
-    ]
-    for reader in readers:
-        reader.start()
-
-    deadline = clock.monotonic() + _SCHEDULER_TIMEOUT_SECONDS
-    timed_out = False
-    while process.poll() is None and not overflow.is_set() and not failed.is_set():
-        remaining = deadline - clock.monotonic()
-        if remaining <= 0:
-            timed_out = True
-            break
-        clock.sleep(min(_PROCESS_POLL_INTERVAL_SECONDS, remaining))
-
+    spools = []
+    process: subprocess.Popen[bytes] | None = None
+    result: subprocess.CompletedProcess[bytes] | None = None
+    failed = False
+    cleanup_failed = False
     stopped = True
-    if timed_out or overflow.is_set() or failed.is_set():
-        stopped = _stop_and_reap(process)
-    else:
-        process.wait()
+    try:
+        stdout_spool = _SPOOL_FACTORY(mode="w+b")
+        spools.append(stdout_spool)
+        stderr_spool = _SPOOL_FACTORY(mode="w+b")
+        spools.append(stderr_spool)
+        deadline = clock.monotonic() + _SCHEDULER_TIMEOUT_SECONDS
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_spool,
+            stderr=stderr_spool,
+            text=False,
+        )
+        while process.poll() is None:
+            if (
+                clock.monotonic() >= deadline
+                or _spool_size(stdout_spool) > _MAX_TASK_XML_BYTES
+                or _spool_size(stderr_spool) > _MAX_TASK_XML_BYTES
+            ):
+                failed = True
+                stopped = _stop_and_reap(process)
+                break
+            remaining = deadline - clock.monotonic()
+            clock.sleep(min(_PROCESS_POLL_INTERVAL_SECONDS, remaining))
 
-    for reader in readers:
-        reader.join(timeout=_PROCESS_STOP_GRACE_SECONDS)
-    readers_alive = any(reader.is_alive() for reader in readers)
-    for pipe in (process.stdout, process.stderr):
-        try:
-            pipe.close()
-        except OSError:
-            failed.set()
-    if readers_alive:
-        for reader in readers:
-            reader.join(timeout=_PROCESS_STOP_GRACE_SECONDS)
+        if not failed:
+            if clock.monotonic() > deadline:
+                failed = True
+            else:
+                stdout = _read_spool(stdout_spool, deadline)
+                stderr = _read_spool(stderr_spool, deadline)
+                result = subprocess.CompletedProcess(
+                    command,
+                    process.returncode,
+                    stdout,
+                    stderr,
+                )
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        failed = True
+    finally:
+        if process is not None and process.poll() is None:
+            stopped = _stop_and_reap(process) and stopped
+        for spool in spools:
+            try:
+                spool.close()
+            except Exception:
+                cleanup_failed = True
 
-    if (
-        timed_out
-        or overflow.is_set()
-        or failed.is_set()
-        or not stopped
-        or readers_alive
-        or any(reader.is_alive() for reader in readers)
-    ):
+    if failed or cleanup_failed or not stopped or result is None:
         raise _SchedulerProcessError()
-
-    return subprocess.CompletedProcess(
-        command,
-        process.returncode,
-        bytes(stdout),
-        bytes(stderr),
-    )
+    return result
 
 
 def _run(
@@ -1020,6 +1000,7 @@ def _lock_byte(
 
 @contextmanager
 def _native_lock(path: Path) -> Iterator[None]:
+    """Serialize cooperating MemberKit commands, not Task Scheduler clients."""
     if os.name != "nt":
         raise RuntimeError("Windows scheduling is unavailable on this platform")
     import msvcrt
@@ -1102,25 +1083,33 @@ class _TempWriteFailure(OSError):
         self.cleanup_ok = cleanup_ok
 
 
+class _CreateRejected(RuntimeError):
+    pass
+
+
 def _create(
     name: str,
     xml_path: Path,
     runner: WindowsRunner | None,
+    *,
+    replace: bool,
 ) -> None:
+    command = [
+        "schtasks.exe",
+        "/Create",
+        "/TN",
+        name,
+        "/XML",
+        str(xml_path),
+    ]
+    if replace:
+        command.append("/F")
     result = _run(
         runner,
-        [
-            "schtasks.exe",
-            "/Create",
-            "/TN",
-            name,
-            "/XML",
-            str(xml_path),
-            "/F",
-        ],
+        command,
     )
     if result.returncode != 0:
-        raise RuntimeError("Windows schedule installation failed")
+        raise _CreateRejected("Windows schedule installation failed")
 
 
 def _delete(name: str, runner: WindowsRunner | None) -> None:
@@ -1151,6 +1140,23 @@ def _verify_absent(name: str, runner: WindowsRunner | None) -> None:
         raise RuntimeError(_CONFLICT)
 
 
+def _require_exact_snapshot(
+    name: str,
+    snapshot: bytes,
+    runner: WindowsRunner | None,
+) -> None:
+    if _query_xml(name, runner) != snapshot:
+        raise RuntimeError(_CONFLICT)
+
+
+def _matches_schedule(xml: bytes, expected: WindowsSchedule) -> bool:
+    try:
+        parse_task_xml(xml, expected)
+    except RuntimeError:
+        return False
+    return True
+
+
 def _restore(
     name: str,
     snapshot: bytes | None,
@@ -1158,45 +1164,76 @@ def _restore(
     candidate: WindowsSchedule | None,
     xml_path: Path | None,
     runner: WindowsRunner | None,
-) -> bool:
+) -> str:
     try:
         current = _query_xml(name, runner)
         if snapshot is None:
             if current is None:
-                return True
+                return _RECOVERY_RESTORED
             if candidate is None:
-                return False
+                return _RECOVERY_CONFLICT
+            if not _matches_schedule(current, candidate):
+                return _RECOVERY_CONFLICT
             try:
-                parse_task_xml(current, candidate)
+                _delete(name, runner)
             except RuntimeError:
-                return False
-            _delete(name, runner)
-            _verify_absent(name, runner)
+                observed = _query_xml(name, runner)
+                if observed is None:
+                    return _RECOVERY_RESTORED
+                if _matches_schedule(observed, candidate):
+                    return _RECOVERY_FAILED
+                return _RECOVERY_CONFLICT
+            observed = _query_xml(name, runner)
+            if observed is None:
+                return _RECOVERY_RESTORED
+            if not _matches_schedule(observed, candidate):
+                return _RECOVERY_CONFLICT
+            return _RECOVERY_FAILED
         else:
             assert previous is not None
             if current is not None:
                 if current == snapshot:
-                    return True
+                    return _RECOVERY_RESTORED
                 if candidate is None:
-                    return False
-                try:
-                    parse_task_xml(current, candidate)
-                except RuntimeError:
-                    return False
+                    return _RECOVERY_CONFLICT
+                if not _matches_schedule(current, candidate):
+                    return _RECOVERY_CONFLICT
             if xml_path is None:
-                return False
+                return _RECOVERY_FAILED
             xml_path.write_bytes(snapshot)
-            _create(name, xml_path, runner)
+            try:
+                _create(
+                    name,
+                    xml_path,
+                    runner,
+                    replace=current is not None,
+                )
+            except RuntimeError:
+                observed = _query_xml(name, runner)
+                if observed is None:
+                    return _RECOVERY_FAILED
+                if observed == snapshot or _matches_schedule(observed, previous):
+                    return _RECOVERY_RESTORED
+                if candidate is not None and _matches_schedule(
+                    observed,
+                    candidate,
+                ):
+                    return _RECOVERY_FAILED
+                return _RECOVERY_CONFLICT
             _verify_installed(name, previous, runner)
     except (OSError, RuntimeError):
-        return False
-    return True
+        return _RECOVERY_FAILED
+    return _RECOVERY_RESTORED
 
 
-def _transaction_error(operation: str, restored: bool) -> RuntimeError:
-    if restored:
+def _transaction_error(operation: str, recovery: str) -> RuntimeError:
+    if recovery == _RECOVERY_RESTORED:
         return RuntimeError(
             f"Windows schedule {operation} failed; previous state restored"
+        )
+    if recovery == _RECOVERY_CONFLICT:
+        return RuntimeError(
+            f"Windows schedule {operation} failed; conflicting state preserved"
         )
     return RuntimeError(
         f"Windows schedule {operation} failed and rollback failed"
@@ -1250,15 +1287,27 @@ def install_schedule(
         transaction_error: RuntimeError | None = None
         try:
             xml_path = _write_xml(directory, definition)
-            _create(name, xml_path, runner)
+            if snapshot is not None:
+                _require_exact_snapshot(name, snapshot, runner)
+            _create(
+                name,
+                xml_path,
+                runner,
+                replace=snapshot is not None,
+            )
             if _verify_installed(name, schedule, runner) != schedule.time:
                 raise RuntimeError(_CONFLICT)
         except (OSError, RuntimeError) as failure:
-            restored = _restore(
+            recovery_candidate = (
+                None
+                if snapshot is None and isinstance(failure, _CreateRejected)
+                else schedule
+            )
+            recovery = _restore(
                 name,
                 snapshot,
                 previous,
-                schedule,
+                recovery_candidate,
                 xml_path,
                 runner,
             )
@@ -1267,14 +1316,15 @@ def install_schedule(
                 if isinstance(failure, _TempWriteFailure)
                 else _cleanup_temp(xml_path)
             )
-            restored = cleanup_ok and restored
-            transaction_error = _transaction_error("installation", restored)
+            if not cleanup_ok:
+                recovery = _RECOVERY_FAILED
+            transaction_error = _transaction_error("installation", recovery)
         if transaction_error is not None:
             raise transaction_error
 
         assert xml_path is not None
         if not _cleanup_temp(xml_path):
-            restored = _restore(
+            recovery = _restore(
                 name,
                 snapshot,
                 previous,
@@ -1282,8 +1332,9 @@ def install_schedule(
                 xml_path,
                 runner,
             )
-            restored = _cleanup_temp(xml_path) and restored
-            raise _transaction_error("installation", restored) from None
+            if not _cleanup_temp(xml_path):
+                recovery = _RECOVERY_FAILED
+            raise _transaction_error("installation", recovery) from None
     return Path(name)
 
 
@@ -1308,10 +1359,11 @@ def remove_schedule(
         transaction_error: RuntimeError | None = None
         try:
             xml_path = _write_xml(directory, snapshot)
+            _require_exact_snapshot(name, snapshot, runner)
             _delete(name, runner)
             _verify_absent(name, runner)
         except (OSError, RuntimeError) as failure:
-            restored = _restore(
+            recovery = _restore(
                 name,
                 snapshot,
                 previous,
@@ -1324,14 +1376,15 @@ def remove_schedule(
                 if isinstance(failure, _TempWriteFailure)
                 else _cleanup_temp(xml_path)
             )
-            restored = cleanup_ok and restored
-            transaction_error = _transaction_error("removal", restored)
+            if not cleanup_ok:
+                recovery = _RECOVERY_FAILED
+            transaction_error = _transaction_error("removal", recovery)
         if transaction_error is not None:
             raise transaction_error
 
         assert xml_path is not None
         if not _cleanup_temp(xml_path):
-            restored = _restore(
+            recovery = _restore(
                 name,
                 snapshot,
                 previous,
@@ -1339,6 +1392,7 @@ def remove_schedule(
                 xml_path,
                 runner,
             )
-            restored = _cleanup_temp(xml_path) and restored
-            raise _transaction_error("removal", restored) from None
+            if not _cleanup_temp(xml_path):
+                recovery = _RECOVERY_FAILED
+            raise _transaction_error("removal", recovery) from None
     return True

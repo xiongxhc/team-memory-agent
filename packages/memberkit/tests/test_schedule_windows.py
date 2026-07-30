@@ -1,6 +1,7 @@
 import hashlib
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -851,8 +852,16 @@ class FakeTaskRunner:
         elif operation == "/Create":
             name = command[command.index("/TN") + 1]
             path = Path(command[command.index("/XML") + 1])
-            self.tasks[name] = path.read_bytes()
-            result = subprocess.CompletedProcess(command, 0, b"", b"")
+            if name in self.tasks and "/F" not in command:
+                result = subprocess.CompletedProcess(
+                    command,
+                    1,
+                    b"",
+                    b"collision",
+                )
+            else:
+                self.tasks[name] = path.read_bytes()
+                result = subprocess.CompletedProcess(command, 0, b"", b"")
         elif operation == "/Delete":
             name = command[command.index("/TN") + 1]
             self.tasks.pop(name, None)
@@ -1064,6 +1073,87 @@ def test_default_runner_preserves_byte_output_without_text_decoding():
     assert result.stderr == b""
 
 
+def test_default_runner_uses_two_closed_temporary_file_spools(monkeypatch):
+    spools = []
+    real_factory = tempfile.TemporaryFile
+
+    def recording_factory(*args, **kwargs):
+        spool = real_factory(*args, **kwargs)
+        spools.append(spool)
+        return spool
+
+    monkeypatch.setattr(windows, "_SPOOL_FACTORY", recording_factory)
+
+    result = windows._run(
+        None,
+        [sys.executable, "-c", "print('bounded')"],
+    )
+
+    assert result.stdout == b"bounded\n"
+    assert result.stderr == b""
+    assert len(spools) == 2
+    assert all(spool.closed for spool in spools)
+
+
+def test_default_runner_sanitizes_temporary_spool_cleanup_failure(monkeypatch):
+    wrappers = []
+    real_factory = tempfile.TemporaryFile
+
+    class CloseFailure:
+        def __init__(self, spool):
+            self.spool = spool
+
+        def __getattr__(self, name):
+            return getattr(self.spool, name)
+
+        def close(self):
+            self.spool.close()
+            raise OSError("secret cleanup detail")
+
+        @property
+        def closed(self):
+            return self.spool.closed
+
+    def failing_factory(*args, **kwargs):
+        wrapper = CloseFailure(real_factory(*args, **kwargs))
+        wrappers.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(windows, "_SPOOL_FACTORY", failing_factory)
+
+    with pytest.raises(RuntimeError, match="status is unavailable") as error:
+        windows._run(None, [sys.executable, "-c", "print('bounded')"])
+
+    assert len(wrappers) == 2
+    assert all(wrapper.closed for wrapper in wrappers)
+    messages = []
+    current = error.value
+    while current is not None:
+        messages.append(str(current))
+        current = current.__cause__ or current.__context__
+    assert "secret" not in " ".join(messages)
+
+
+def test_default_runner_does_not_wait_for_inherited_output_descendant():
+    grandchild = (
+        "import sys,time;"
+        "time.sleep(3);"
+        "sys.stdout.write('late');"
+        "sys.stdout.flush()"
+    )
+    direct = (
+        "import subprocess,sys;"
+        f"subprocess.Popen([sys.executable,'-c',{grandchild!r}],"
+        "stdout=sys.stdout,stderr=sys.stderr,close_fds=False)"
+    )
+    started = time.monotonic()
+
+    result = windows._run(None, [sys.executable, "-c", direct])
+
+    assert time.monotonic() - started < 1.5
+    assert result.returncode == 0
+
+
 @pytest.mark.parametrize("stream", ("stdout", "stderr"))
 def test_default_runner_terminates_before_excess_output_can_continue(
     tmp_path,
@@ -1192,6 +1282,209 @@ def test_install_replaces_under_lock_and_removes_private_temp(
     assert list(tmp_path.glob("*.xml")) == []
 
 
+def test_first_install_success_uses_create_only_without_force(
+    tmp_path,
+    monkeypatch,
+):
+    schedule = _schedule()
+    runner, events, api = _lifecycle_args(tmp_path, monkeypatch)
+
+    path = windows.install_schedule(
+        17,
+        30,
+        schedule.executable,
+        api=api,
+        runner=runner,
+        state_dir=tmp_path,
+        lock_factory=lambda _path: RecordingLock(events),
+    )
+
+    assert path == Path(schedule.task_name)
+    assert windows.parse_task_xml(
+        runner.tasks[schedule.task_name],
+        schedule,
+    ) == "17:30"
+    create = next(call for call in runner.calls if call[1] == "/Create")
+    assert create[:5] == [
+        "schtasks.exe",
+        "/Create",
+        "/TN",
+        schedule.task_name,
+        "/XML",
+    ]
+    assert len(create) == 6
+    assert Path(create[5]).parent == tmp_path
+
+
+def test_first_install_uses_create_only_and_preserves_collision_winner(
+    tmp_path,
+    monkeypatch,
+):
+    schedule = _schedule()
+    foreign = _xml_bytes(
+        _xml_text().replace(
+            "<Arguments>scheduled-run</Arguments>",
+            "<Arguments>foreign-action</Arguments>",
+            1,
+        )
+    )
+    runner, events, api = _lifecycle_args(tmp_path, monkeypatch)
+    absent_queries = 0
+
+    def collide_after_absence(command, result):
+        nonlocal absent_queries
+        if command[1] == "/Query" and "/XML" not in command:
+            absent_queries += 1
+            if absent_queries == 1:
+                runner.tasks[schedule.task_name] = foreign
+        return result
+
+    runner.hook = collide_after_absence
+    with pytest.raises(RuntimeError, match="conflicting state preserved"):
+        windows.install_schedule(
+            17,
+            30,
+            schedule.executable,
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert runner.tasks[schedule.task_name] == foreign
+    create = next(call for call in runner.calls if call[1] == "/Create")
+    assert create[:5] == [
+        "schtasks.exe",
+        "/Create",
+        "/TN",
+        schedule.task_name,
+        "/XML",
+    ]
+    assert len(create) == 6
+
+
+def test_first_install_collision_preserves_matching_managed_winner(
+    tmp_path,
+    monkeypatch,
+):
+    schedule = _schedule()
+    managed = windows.build_task_xml(schedule)
+    runner, events, api = _lifecycle_args(tmp_path, monkeypatch)
+    absent_queries = 0
+
+    def collide_after_absence(command, result):
+        nonlocal absent_queries
+        if command[1] == "/Query" and "/XML" not in command:
+            absent_queries += 1
+            if absent_queries == 1:
+                runner.tasks[schedule.task_name] = managed
+        return result
+
+    runner.hook = collide_after_absence
+    with pytest.raises(RuntimeError, match="conflicting state preserved"):
+        windows.install_schedule(
+            17,
+            30,
+            schedule.executable,
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert runner.tasks[schedule.task_name] == managed
+    assert not any(call[1] == "/Delete" for call in runner.calls)
+
+
+def test_replacement_revalidates_exact_snapshot_before_force_create(
+    tmp_path,
+    monkeypatch,
+):
+    previous = _schedule()
+    replacement = _schedule(time="07:05")
+    prior_xml = windows.build_task_xml(previous)
+    foreign = _xml_bytes(
+        _xml_text().replace(
+            "<Arguments>scheduled-run</Arguments>",
+            "<Arguments>foreign-action</Arguments>",
+            1,
+        )
+    )
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner({previous.task_name: prior_xml}),
+    )
+    exact_queries = 0
+
+    def replace_after_snapshot(command, result):
+        nonlocal exact_queries
+        if command[1] == "/Query" and "/XML" in command:
+            exact_queries += 1
+            if exact_queries == 1:
+                runner.tasks[previous.task_name] = foreign
+        return result
+
+    runner.hook = replace_after_snapshot
+    with pytest.raises(RuntimeError, match="conflicting state preserved"):
+        windows.install_schedule(
+            7,
+            5,
+            replacement.executable,
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert exact_queries >= 2
+    assert runner.tasks[previous.task_name] == foreign
+    assert not any(call[1] == "/Create" for call in runner.calls)
+
+
+def test_remove_revalidates_exact_snapshot_before_delete(
+    tmp_path,
+    monkeypatch,
+):
+    schedule = _schedule()
+    prior_xml = windows.build_task_xml(schedule)
+    foreign = _xml_bytes(
+        _xml_text().replace(
+            "<Arguments>scheduled-run</Arguments>",
+            "<Arguments>foreign-action</Arguments>",
+            1,
+        )
+    )
+    runner, events, api = _lifecycle_args(
+        tmp_path,
+        monkeypatch,
+        FakeTaskRunner({schedule.task_name: prior_xml}),
+    )
+    exact_queries = 0
+
+    def replace_after_snapshot(command, result):
+        nonlocal exact_queries
+        if command[1] == "/Query" and "/XML" in command:
+            exact_queries += 1
+            if exact_queries == 1:
+                runner.tasks[schedule.task_name] = foreign
+        return result
+
+    runner.hook = replace_after_snapshot
+    with pytest.raises(RuntimeError, match="conflicting state preserved"):
+        windows.remove_schedule(
+            api=api,
+            runner=runner,
+            state_dir=tmp_path,
+            executable=schedule.executable,
+            lock_factory=lambda _path: RecordingLock(events),
+        )
+
+    assert exact_queries >= 2
+    assert runner.tasks[schedule.task_name] == foreign
+    assert not any(call[1] == "/Delete" for call in runner.calls)
+
+
 def test_private_state_validation_precedes_lock_or_temp_writes(
     tmp_path,
     monkeypatch,
@@ -1316,7 +1609,7 @@ def test_first_install_rollback_never_deletes_concurrently_appearing_foreign_tas
         return result
 
     runner.hook = replace_candidate_before_verification
-    with pytest.raises(RuntimeError, match="rollback failed"):
+    with pytest.raises(RuntimeError, match="conflicting state preserved"):
         windows.install_schedule(
             17,
             30,
@@ -1363,7 +1656,7 @@ def test_prior_snapshot_rollback_never_overwrites_concurrent_foreign_task(
         return result
 
     runner.hook = replace_candidate_before_verification
-    with pytest.raises(RuntimeError, match="rollback failed"):
+    with pytest.raises(RuntimeError, match="conflicting state preserved"):
         windows.install_schedule(
             7,
             5,
