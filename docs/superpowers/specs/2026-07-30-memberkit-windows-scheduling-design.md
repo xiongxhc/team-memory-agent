@@ -154,6 +154,10 @@ cannot guarantee integrity against a malicious process with the same user's
 access. That stronger boundary requires a separately privileged principal or
 service and is not part of this design.
 
+The runner also trusts the resolved system `schtasks.exe`. A malicious same-user
+replacement executable or deliberately noisy descendant is outside this threat
+boundary.
+
 ## Canonical Windows Task
 
 MemberKit generates deterministic UTF-16LE Task Scheduler XML with a BOM and
@@ -167,16 +171,21 @@ schtasks.exe /Create /TN <task-name> /XML <private-xml-path>
 Omitting `/F` makes a same-name collision fail instead of overwriting the task.
 Replacement of a queried and revalidated managed definition, and best-effort
 restoration of such a definition, may use the same command with `/F`. MemberKit
-does not use PowerShell or `cmd.exe`. Query output is bounded to 1 MiB and
+does not use PowerShell or `cmd.exe`.
+
+The direct process runner captures stdout and stderr into separate bounded
+temporary-file spools, not anonymous pipes. One finite deadline covers the
+direct process and collection of retained output. The runner polls both spool
+sizes while the direct process runs, fails on overflow, and retains/parses at
+most 1 MiB from stdout and 1 MiB from stderr. It does not wait for pipe EOF or
+attempt process-tree termination, so descendants that inherit stdout or stderr
+cannot cause an indefinite wait after the direct process exits. Scheduler output
+spools are transient: their handles are closed and the files are cleaned after
+the operation. A deadline, overflow, collection, or cleanup failure is a
+sanitized scheduler failure; MemberKit does not infer that a mutation succeeded
+and continues only through query-based recovery. Retained query output is
 decoded with strict BOM or UTF-16 signature detection rather than the active
 console code page.
-
-The direct process runner captures byte output and applies a bounded deadline to
-the whole operation, including completion of captured-pipe draining. Inherited
-stdout or stderr handles held open after the direct child exits must not make
-MemberKit wait indefinitely. A timeout or inability to complete safe pipe
-draining is a sanitized scheduler failure; MemberKit does not infer that the
-mutation succeeded and continues only through query-based recovery.
 
 The definition contains exactly one principal, one daily calendar trigger, and
 one executable action.
@@ -263,7 +272,10 @@ revalidation or during recovery. In that case MemberKit reports the uncertain
 or conflicting result and preserves every foreign definition it observes, but
 cannot promise rollback to the pre-operation state.
 
-Status is read-only. It creates no directories, locks, or temporary files.
+Status is read-only. It creates no persistent MemberKit state directory,
+lifecycle lock, or private task-XML artifact. The native runner may create only
+its transient bounded stdout/stderr spools, which it closes and cleans after the
+query.
 
 ## Desktop Reminder
 
@@ -331,8 +343,9 @@ Hermetic tests cover:
   cleanup, and idempotent removal;
 - deterministic race hooks at query/revalidation/recovery boundaries proving
   that observed foreign tasks are preserved;
-- bounded process execution through captured-pipe drain completion, including
-  safe failure when inherited handles keep a pipe open;
+- finite process-and-output-collection deadlines using transient bounded
+  temporary-file spools, with 1 MiB caps for stdout and stderr, in-process size
+  polling, cleanup, and no indefinite wait on inherited output handles;
 - Windows configuration path selection, atomic creation, DACL application, and
   handle-based validation on both setup and every read;
 - Windows `tzdata` installation and named IANA-zone behavior across one
@@ -391,3 +404,5 @@ The root README, MemberKit README, and member guide explain:
 - Integrity against malicious or non-cooperating mutation by another Task
   Scheduler client running as the same Windows identity.
 - A separately privileged scheduler principal or service.
+- A malicious same-user replacement for the trusted system `schtasks.exe` or a
+  deliberately noisy descendant.

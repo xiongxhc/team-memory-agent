@@ -48,6 +48,9 @@ pytest, GitHub Actions
   the transaction guarantee; no atomic compare-and-swap or malicious same-user
   integrity is claimed. A stronger boundary requires a separately privileged
   principal or service.
+- The native runner trusts the resolved system `schtasks.exe`. A malicious
+  same-user replacement executable or deliberately noisy descendant is outside
+  the threat boundary.
 - Windows configuration is private before content is written and is validated
   through the same opened handle on every read.
 - Windows reminders target only the current username with `/TIME:60`; reminder
@@ -702,10 +705,14 @@ def remove_schedule(
 ```
 
 - Consumed by: Tasks 6 and 7.
-- `WindowsRunner` captures byte streams and has one bounded deadline covering
-  direct-child execution and captured-pipe drain completion. Inherited handles
-  must not cause an indefinite wait; timeout or incomplete safe drain returns a
-  sanitized failure and leaves mutation outcome determination to a fresh query.
+- `WindowsRunner` captures stdout and stderr into separate bounded
+  temporary-file spools rather than anonymous pipes. One finite deadline covers
+  direct-process execution and retained-output collection. It polls both spool
+  sizes while the direct process runs, retains/parses no more than 1 MiB from
+  each stream, and fails safely on timeout or overflow. It never waits for pipe
+  EOF or requires process-tree termination, so inherited stdout/stderr handles
+  cannot cause an indefinite wait. It closes and cleans all transient scheduler
+  output spools and leaves mutation outcome determination to a fresh query.
 
 - [ ] **Step 1: Write the fake byte-only `schtasks.exe` runner**
 
@@ -719,22 +726,32 @@ Model only:
 /Delete /TN <name> /F
 ```
 
-Assert every call uses `capture_output=True, text=False`. The fake runner stores
-task XML bytes and supports deterministic injected failures and race hooks.
-Create without `/F` must fail on a name collision and preserve the stored
-definition.
+The fake runner returns byte stdout/stderr and stores task XML bytes while
+supporting deterministic injected failures and race hooks. Separately test that
+the native runner redirects both streams to bounded temporary-file spools, not
+anonymous pipes; uses a finite deadline for direct-process execution plus output
+collection; polls both spool sizes while the direct process runs; caps retained
+and parsed stdout and stderr at 1 MiB each; and closes and cleans its transient
+spools. Create without `/F` must fail on a name collision and preserve the
+stored definition.
 
 - [ ] **Step 2: Write failing status/conflict tests**
 
 Cover absent status, exact managed status, localized query failure, malformed
 managed task, unexpected action, foreign ownership, and the read-only rule:
-status creates no state directory, lock, or temporary file. Also cover
-successful XML output, CSV fallback output, and stderr that each exceed 1 MiB;
-all must fail with sanitized unavailable/conflict categories before parsing or
-exposing content. Exercise the real process-runner contract with controlled
-children: its timeout covers captured-pipe drain completion, and a descendant
-that inherits a pipe handle cannot keep the operation waiting indefinitely.
-Failure remains sanitized and does not assume whether a mutation succeeded.
+status creates no persistent MemberKit state directory, lifecycle lock, or
+private task-XML artifact. Its transient native-runner output spools are allowed
+only for the query and must be closed and cleaned. Also cover successful XML
+output, CSV fallback output, and stdout or stderr that exceeds 1 MiB while the
+direct process is still running; size polling must detect overflow before
+unbounded collection or parsing.
+
+Exercise the native runner with controlled children. Its finite deadline covers
+the direct process and collection from both spools. A descendant that inherits
+stdout or stderr cannot keep the operation waiting indefinitely after the direct
+process exits. The test must not require process-tree termination. Timeout,
+overflow, collection, and cleanup failures remain sanitized and do not assume
+whether a mutation succeeded.
 
 - [ ] **Step 3: Run lifecycle RED**
 
@@ -758,7 +775,7 @@ Resolve:
 
 at operation time. Status does not provision it. Query exact XML first and use a
 bounded CSV list only to distinguish an absent task from localized query errors.
-Never parse or return command output.
+Parse only the retained bounded output and never return raw command output.
 
 - [ ] **Step 5: Write failing install/remove/rollback tests**
 
@@ -847,10 +864,13 @@ Expected: all schedule tests pass without a real scheduler call.
 Task 5 is accepted only when the tests prove collision-safe initial create,
 cooperating-command lock serialization, managed query/revalidation before
 replacement and removal, best-effort rollback, bounded runner completion through
-pipe drain, and preservation of every foreign definition observed by the
-deterministic race hooks. The accepted guarantee excludes unobserved mutation by
-a non-cooperating same-identity Task Scheduler client between the final
-revalidation and mutation.
+the direct process and temporary-spool output collection, 1 MiB retained/parsed
+caps on each stream with size polling during execution, transient spool cleanup,
+no indefinite wait on inherited output handles, and preservation of every
+foreign definition observed by the deterministic race hooks. The accepted
+guarantee excludes unobserved mutation by a non-cooperating same-identity Task
+Scheduler client between the final revalidation and mutation, and excludes a
+malicious same-user replacement executable or deliberately noisy descendant.
 
 - [ ] **Step 10: Commit Task 5**
 
