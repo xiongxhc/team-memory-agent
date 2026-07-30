@@ -1134,6 +1134,100 @@ def test_default_runner_sanitizes_temporary_spool_cleanup_failure(monkeypatch):
     assert "secret" not in " ".join(messages)
 
 
+def test_reaper_attempts_bounded_terminate_wait_kill_wait_after_native_errors():
+    events = []
+
+    class PersistentWaitFailure:
+        def poll(self):
+            events.append("poll")
+            raise OSError("secret poll failure")
+
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self, *, timeout):
+            events.append(("wait", timeout))
+            raise OSError("secret wait failure")
+
+        def kill(self):
+            events.append("kill")
+
+    assert windows._stop_and_reap(PersistentWaitFailure()) is False
+    assert events == [
+        "poll",
+        "terminate",
+        ("wait", windows._PROCESS_STOP_GRACE_SECONDS),
+        "kill",
+        ("wait", windows._PROCESS_STOP_GRACE_SECONDS),
+    ]
+
+
+def test_reaper_failure_still_attempts_every_spool_close(monkeypatch):
+    process_events = []
+    spools = []
+
+    class PersistentWaitFailure:
+        returncode = None
+
+        def poll(self):
+            process_events.append("poll")
+            raise OSError("secret poll failure")
+
+        def terminate(self):
+            process_events.append("terminate")
+
+        def wait(self, *, timeout):
+            process_events.append(("wait", timeout))
+            raise OSError("secret wait failure")
+
+        def kill(self):
+            process_events.append("kill")
+
+    class RecordingSpool:
+        def __init__(self, fail_close):
+            self.fail_close = fail_close
+            self.close_attempts = 0
+
+        def close(self):
+            self.close_attempts += 1
+            if self.fail_close:
+                raise OSError("secret close failure")
+
+        def fileno(self):
+            return 1
+
+    def spool_factory(*_args, **_kwargs):
+        spool = RecordingSpool(fail_close=not spools)
+        spools.append(spool)
+        return spool
+
+    monkeypatch.setattr(windows, "_SPOOL_FACTORY", spool_factory)
+    monkeypatch.setattr(
+        windows.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: PersistentWaitFailure(),
+    )
+
+    with pytest.raises(RuntimeError, match="status is unavailable") as error:
+        windows._run(None, ["schtasks.exe", "/Query"])
+
+    assert [spool.close_attempts for spool in spools] == [1, 1]
+    assert process_events == [
+        "poll",
+        "poll",
+        "terminate",
+        ("wait", windows._PROCESS_STOP_GRACE_SECONDS),
+        "kill",
+        ("wait", windows._PROCESS_STOP_GRACE_SECONDS),
+    ]
+    messages = []
+    current = error.value
+    while current is not None:
+        messages.append(str(current))
+        current = current.__cause__ or current.__context__
+    assert "secret" not in " ".join(messages)
+
+
 def test_default_runner_does_not_wait_for_inherited_output_descendant():
     grandchild = (
         "import sys,time;"

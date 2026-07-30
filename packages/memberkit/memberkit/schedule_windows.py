@@ -727,23 +727,33 @@ class _SchedulerProcessError(subprocess.SubprocessError):
 
 
 def _stop_and_reap(process: subprocess.Popen[bytes]) -> bool:
-    if process.poll() is None:
-        try:
-            process.terminate()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            try:
-                process.kill()
-            except OSError:
-                pass
-            try:
-                process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                return False
-    return process.poll() is not None
+    try:
+        returncode = process.poll()
+    except (OSError, subprocess.SubprocessError):
+        returncode = None
+    if returncode is not None:
+        return True
+
+    try:
+        process.terminate()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    else:
+        return True
+
+    try:
+        process.kill()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        process.wait(timeout=_PROCESS_STOP_GRACE_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
 
 
 def _spool_size(spool: Any) -> int:
@@ -817,13 +827,18 @@ def _default_runner(
     except (OSError, subprocess.SubprocessError, TypeError, ValueError):
         failed = True
     finally:
-        if process is not None and process.poll() is None:
-            stopped = _stop_and_reap(process) and stopped
-        for spool in spools:
-            try:
-                spool.close()
-            except Exception:
-                cleanup_failed = True
+        try:
+            if process is not None:
+                try:
+                    stopped = _stop_and_reap(process) and stopped
+                except Exception:
+                    stopped = False
+        finally:
+            for spool in spools:
+                try:
+                    spool.close()
+                except Exception:
+                    cleanup_failed = True
 
     if failed or cleanup_failed or not stopped or result is None:
         raise _SchedulerProcessError()
