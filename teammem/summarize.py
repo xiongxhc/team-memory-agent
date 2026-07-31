@@ -86,8 +86,9 @@ def claude_cli_llm(model: str, claude_bin: str = "claude") -> LLM:
              "--strict-mcp-config", "--setting-sources="],
             input=user, capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
-            raise ValueError(f"claude cli failed ({proc.returncode}): "
-                             f"{proc.stderr.strip()[:300]}")
+            # The CLI reports errors (bad model, usage limits) on stdout.
+            detail = (proc.stderr.strip() or proc.stdout.strip())[:300]
+            raise ValueError(f"claude cli failed ({proc.returncode}): {detail}")
         text = proc.stdout.strip()
         if not text:
             raise ValueError("claude cli returned empty output")

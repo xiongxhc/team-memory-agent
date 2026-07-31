@@ -156,3 +156,18 @@ def test_claude_cli_llm_raises_on_failure_and_empty_output(tmp_path):
     empty = _stub_claude(tmp_path / "sub", "cat > /dev/null") if (tmp_path / "sub").mkdir() is None else None
     with pytest.raises(ValueError, match="empty"):
         claude_cli_llm("m", claude_bin=empty)("s", "u")
+
+
+def test_claude_cli_failure_surfaces_stdout_detail(monkeypatch):
+    """The CLI reports bad-model/usage errors on stdout with empty stderr."""
+    import subprocess
+    import types
+
+    import pytest
+
+    from teammem.summarize import claude_cli_llm
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: types.SimpleNamespace(
+        returncode=1, stdout="There's an issue with the selected model\n", stderr=""))
+    with pytest.raises(ValueError, match="issue with the selected model"):
+        claude_cli_llm("some-model")("system", "user")
