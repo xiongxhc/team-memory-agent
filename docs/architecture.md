@@ -48,7 +48,7 @@ silently discarded.
 | Provider | Query boundary | Event source and kinds |
 |---|---|---|
 | GitHub | Only `github_repos` explicitly mapped to projects | `github`: `commit`, `pr` |
-| GitLab | Projects in the `TEAMMEM_GITLAB_GROUP` hierarchy, including subgroups but excluding projects merely shared into it; `gitlab_repos` maps known projects and unknown in-scope projects remain visible without project attribution | `gitlab`: `commit`, `mr` |
+| GitLab | Projects in the `TEAMMEM_GITLAB_GROUP` hierarchy, including subgroups but excluding projects merely shared into it; `gitlab_repos` maps known projects and unknown in-scope projects remain visible without project attribution | `gitlab`: `commit`, `mr`, `issue`, `repo` |
 | Slack | Only `slack_channels` whose metadata identifies a public or private project channel containing the app | `slack-channel`: `message` |
 | Feishu | Only `feishu_channels` whose metadata identifies a group chat containing the app | `feishu-channel`: `message` |
 | Discord | Only `discord_channels` whose metadata includes a guild ID | `discord-channel`: `message` |

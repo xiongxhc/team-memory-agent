@@ -137,7 +137,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                       f"{len(rs)} events ({detail})\n")
             work = [
                 r for r in rs
-                if r["kind"] in ("commit", "pr", "mr", "journal-highlight")
+                if r["kind"] in ("commit", "pr", "mr", "issue", "repo", "journal-highlight")
             ]
             msgs = [r for r in rs if r["kind"] == "message"]
             tally += [_line(r) for r in work[:5]]
@@ -206,7 +206,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                 md.append("\n**Activity detail**\n")
             work = [
                 r for r in mine
-                if r["kind"] in ("commit", "pr", "mr", "journal-highlight")
+                if r["kind"] in ("commit", "pr", "mr", "issue", "repo", "journal-highlight")
             ]
             msgs = [r for r in mine if r["kind"] == "message"]
             md += [_line(r) for r in work]
@@ -239,7 +239,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                         else f"`{person}`")
                 work = [
                     r for r in prs
-                    if r["kind"] in ("commit", "pr", "mr", "journal-highlight")
+                    if r["kind"] in ("commit", "pr", "mr", "issue", "repo", "journal-highlight")
                 ]
                 msgs = [r for r in prs if r["kind"] == "message"]
                 md.append(f"\n### {link} — {len(prs)} events\n")

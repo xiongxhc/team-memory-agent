@@ -24,7 +24,7 @@ present in each collected public/private project channel or group/guild channel.
 | Connector | Can see through Team Memory Agent | Deliberately excluded |
 |---|---|---|
 | GitHub | Default-branch commits and updated pull requests in explicitly mapped repositories | Unmapped repositories |
-| GitLab | Commits and merge requests in the operator-configured group hierarchy and subgroups; known repositories receive project attribution | Projects outside the configured hierarchy and projects merely shared into it |
+| GitLab | Commits, merge requests, issue open/close transitions, and repository creations in the operator-configured group hierarchy and subgroups; known repositories receive project attribution | Projects outside the configured hierarchy, projects merely shared into it, and issue/commit comments |
 | Slack | Human top-level messages in explicitly mapped public or private project channels containing the app | DMs, multi-person DMs, unlisted channels, thread replies, bot messages |
 | Feishu | Human messages in explicitly mapped group chats containing the app | Direct chats, unlisted group chats, non-user senders |
 | Discord | Human content messages in explicitly mapped guild channels visible to the bot | DMs/group DMs, unlisted guild channels, bot and webhook messages |

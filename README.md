@@ -290,7 +290,7 @@ upgrades, and removal.
 | Connector | Collection boundary |
 |---|---|
 | GitHub | Commits and pull requests from explicitly mapped repositories |
-| GitLab | Commits and merge requests in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
+| GitLab | Commits, merge requests, issue open/close transitions, and repository creations in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
 | Slack | Human top-level messages in explicitly mapped public or private project channels containing the app; no DMs and no thread replies |
 | Feishu | Human messages in explicitly mapped group chats; no direct chats |
 | Discord | Human messages in explicitly mapped guild channels; no DMs, bot messages, or webhooks |

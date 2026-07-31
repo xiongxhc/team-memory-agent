@@ -263,6 +263,29 @@ def test_github_pull_requests_render_as_work_items(tmp_path):
     ).read_text()
 
 
+def test_gitlab_issues_and_repos_render_as_work_items(tmp_path):
+    conn = _seed(tmp_path)
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T12:00:00+00:00", source="gitlab",
+              kind="issue", summary="[closed] Login rate limit",
+              refs='{"iid": 31, "url": "https://gitlab.test/issues/31"}',
+              hash="issue-31-closed", project="project-alpha"),
+        Event(person="alex", ts="2026-07-14T08:00:00+00:00", source="gitlab",
+              kind="repo", summary="[created] team/project-alpha",
+              refs='{"id": 1, "url": "https://gitlab.test/team/project-alpha"}',
+              hash="repo-1-created", project="project-alpha"),
+    ])
+
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    person = (vault / "Person" / "Alex Rivera.md").read_text()
+    assert "[closed] Login rate limit" in person
+    assert "[created] team/project-alpha" in person
+    project = (vault / "Projects" / "project-alpha.md").read_text()
+    assert "[closed] Login rate limit" in project
+
+
 def test_channel_id_refs_are_counted_with_legacy_chat_id_refs(tmp_path):
     conn = _seed(tmp_path)
     insert_events(conn, [

@@ -75,6 +75,18 @@ class GitLabConnector:
                                   })
         for p in projects:
             project = ids.project_for_repo(p["path_with_namespace"])
+            if (p.get("created_at") or "") >= since:
+                events.append(Event(
+                    person=ids.person("gitlab", self._creator_username(fetch_json, p)),
+                    project=project,
+                    ts=p["created_at"],
+                    source="gitlab",
+                    kind="repo",
+                    summary=f"[created] {p['path_with_namespace']}",
+                    refs=json.dumps({"id": p["id"], "url": p.get("web_url")}),
+                    raw=json.dumps(p),
+                    hash=event_hash("repo", str(p["id"]), "created"),
+                ))
             # Default-branch commits only (no all=true): branch work appears at merge via MRs.
             # Revisit during live dry-run / M2 gap logic if branch-level visibility is needed.
             for c in self._paginate(fetch_json, f"/projects/{p['id']}/repository/commits",
@@ -103,4 +115,32 @@ class GitLabConnector:
                     raw=json.dumps(mr),
                     hash=event_hash("mr", str(p["id"]), str(mr["iid"]), mr["state"]),
                 ))
+            for issue in self._paginate(fetch_json, f"/projects/{p['id']}/issues",
+                                        {"updated_after": since}):
+                # Closing is the assignee's work; opening is the author's.
+                worker = ((issue.get("assignee") or {}) if issue["state"] == "closed"
+                          else {}) or issue.get("author") or {}
+                events.append(Event(
+                    person=ids.person("gitlab", worker.get("username", "")),
+                    project=project,
+                    ts=issue.get("closed_at") or issue["updated_at"],
+                    source="gitlab",
+                    kind="issue",
+                    summary=f"[{issue['state']}] {issue['title']}",
+                    refs=json.dumps({"iid": issue["iid"], "url": issue.get("web_url")}),
+                    raw=json.dumps(issue),
+                    hash=event_hash("issue", str(p["id"]), str(issue["iid"]),
+                                    issue["state"]),
+                ))
         return events
+
+    @staticmethod
+    def _creator_username(fetch_json: FetchJson, p: dict) -> str:
+        # A deleted creator account must not lose the repo fact.
+        if not p.get("creator_id"):
+            return ""
+        try:
+            user = fetch_json(f"/users/{p['creator_id']}", {"page": 1})
+        except Exception:
+            return ""
+        return user.get("username", "") if isinstance(user, dict) else ""
