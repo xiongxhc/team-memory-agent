@@ -3,6 +3,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from teammem.config import Config
 from teammem.connectors.base import CollectionResult
 from teammem.connectors.config import ConnectorSettings
@@ -63,9 +65,136 @@ def _cfg(tmp_path, **values):
         "TEAMMEM_DB": str(tmp_path / "ledger.db"),
         "TEAMMEM_CONFIG_DIR": str(CONFIG_DIR),
         "TEAMMEM_VAULT": str(tmp_path / "vault"),
+        "TEAMMEM_INBOX": "",
+        "TEAMMEM_ARCHIVE": "",
+        "TEAMMEM_QUARANTINE": "",
+        "TEAMMEM_SNAPSHOTS": "",
+        "TEAMMEM_OBSIDIAN_PROJECTS": "",
+        "TEAMMEM_PUSH": "false",
     }
     env.update(values)
     return Config.load(env=env)
+
+
+def _run_with_failed_stage(tmp_path, monkeypatch, stage):
+    values = {}
+    settings = _settings()
+    connectors = {}
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
+
+    if stage == "ledger":
+        monkeypatch.setattr(
+            "teammem.daily.open_db",
+            lambda _path: (_ for _ in ()).throw(RuntimeError("ledger failure")),
+        )
+    elif stage in {"github", "gitlab", "slack", "feishu", "discord"}:
+        settings = _settings(stage)
+        connectors[stage] = FixtureConnector(
+            stage, error=RuntimeError(f"{stage} failure")
+        )
+    elif stage == "import":
+        values.update(
+            TEAMMEM_INBOX=str(tmp_path / "inbox"),
+            TEAMMEM_ARCHIVE=str(tmp_path / "archive"),
+            TEAMMEM_QUARANTINE=str(tmp_path / "quarantine"),
+        )
+        monkeypatch.setattr(
+            "teammem.daily.import_inbox",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("import failure")),
+        )
+    elif stage == "reclaim":
+        monkeypatch.setattr(
+            "teammem.daily.reclaim",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("reclaim failure")),
+        )
+    elif stage == "journal":
+        monkeypatch.setattr(
+            "teammem.daily.resolve_llm_backend", lambda *args: object()
+        )
+        monkeypatch.setattr(
+            "teammem.daily.run_journal",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("journal failure")
+            ),
+        )
+    elif stage == "report":
+        monkeypatch.setattr(
+            "teammem.daily.resolve_llm_backend", lambda *args: object()
+        )
+        monkeypatch.setattr(
+            "teammem.daily.run_journal", lambda *args, **kwargs: 0
+        )
+        monkeypatch.setattr(
+            "teammem.daily.run_report",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("report failure")
+            ),
+        )
+    elif stage == "docs-sync":
+        values["TEAMMEM_OBSIDIAN_PROJECTS"] = str(tmp_path / "obsidian-projects")
+        monkeypatch.setattr(
+            "teammem.daily.run_docs_sync",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("docs-sync failure")
+            ),
+        )
+    elif stage == "render":
+        monkeypatch.setattr(
+            "teammem.daily.run_render",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("render failure")
+            ),
+        )
+    elif stage == "push":
+        values["TEAMMEM_PUSH"] = "true"
+        monkeypatch.setattr(
+            "teammem.daily.push",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("push failure")),
+        )
+    elif stage == "snapshot":
+        values["TEAMMEM_SNAPSHOTS"] = str(tmp_path / "snapshots")
+        monkeypatch.setattr(
+            "teammem.daily._snapshot",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("snapshot failure")),
+        )
+
+    cfg = _cfg(tmp_path, **values)
+    return run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        settings,
+        NOW,
+        connectors=connectors,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_exit_code"),
+    [
+        ("ledger", 1),
+        ("reclaim", 1),
+        ("render", 1),
+        ("snapshot", 1),
+        ("github", 0),
+        ("gitlab", 0),
+        ("slack", 0),
+        ("feishu", 0),
+        ("discord", 0),
+        ("import", 0),
+        ("journal", 0),
+        ("report", 0),
+        ("docs-sync", 0),
+        ("push", 0),
+    ],
+)
+def test_daily_exit_policy_preserves_visible_stage_failures(
+    tmp_path, monkeypatch, stage, expected_exit_code
+):
+    result = _run_with_failed_stage(tmp_path, monkeypatch, stage)
+
+    assert result.exit_code == expected_exit_code
+    assert result.status(stage) == "failed"
+    assert f"{stage} failure" in result.step(stage).detail
 
 
 def test_daily_continues_after_one_network_connector_fails(tmp_path, monkeypatch):
@@ -84,7 +213,7 @@ def test_daily_continues_after_one_network_connector_fails(tmp_path, monkeypatch
         },
     )
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     assert result.status("github") == "failed"
     assert result.status("feishu") == "ok"
     assert result.status("render") == "ok"
@@ -330,7 +459,7 @@ def test_daily_journal_failure_skips_friday_report_but_keeps_local_projections(
         cfg, IdentityMaps.load(CONFIG_DIR), _settings(), NOW, connectors={}
     )
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     assert result.status("journal") == "failed"
     assert result.status("report") == "skipped"
     assert result.step("report").detail == "journal failed"

@@ -48,6 +48,20 @@ def test_empty_event_list_is_valid(tmp_path):
     assert bundle.events == ()
 
 
+def test_accepts_neighbouring_utc_calendar_dates_for_review_day(tmp_path):
+    inbox = tmp_path / "inbox"
+    for timestamp in ("2026-07-27T20:30:00Z", "2026-07-27T23:30:00"):
+        bundle = load_bundle(
+            _write(
+                inbox,
+                date="2026-07-28",
+                events=[{**_event(), "ts": timestamp}],
+            ),
+            inbox,
+        )
+        assert bundle.events[0]["ts"] == timestamp
+
+
 @pytest.mark.parametrize(
     ("change", "message"),
     [

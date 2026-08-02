@@ -1,11 +1,13 @@
 """The ledger — Layer 1, the single source of truth. INSERT OR IGNORE on the
 UNIQUE(person, source, hash) key makes every ingest path idempotent."""
 
+import json
 import sqlite3
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from .events import Event
+from .identity import IdentityMaps
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -52,6 +54,107 @@ def insert_events(conn: sqlite3.Connection, events: Iterable[Event]) -> int:
              for e in events],
         )
     return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] - before
+
+
+def reconcile_gitlab_events(
+    conn: sqlite3.Connection,
+    events: Iterable[Event],
+    ids: IdentityMaps,
+) -> int:
+    """Atomically replace authoritative GitLab issue/repo facts and insert others."""
+    with conn:
+        for repair in _legacy_opened_issue_repairs(conn, ids):
+            _replace_gitlab_event(conn, repair, existing_only=True)
+
+        inserted = 0
+        for event in events:
+            if event.source == "gitlab" and event.kind in {"issue", "repo"}:
+                inserted += _replace_gitlab_event(conn, event)
+            else:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO events "
+                    "(person, project, ts, source, kind, summary, refs, raw, hash) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    _event_values(event),
+                )
+                inserted += cursor.rowcount
+    return inserted
+
+
+def _legacy_opened_issue_repairs(
+    conn: sqlite3.Connection,
+    ids: IdentityMaps,
+) -> list[Event]:
+    repairs = []
+    rows = conn.execute(
+        "SELECT project, ts, raw, hash FROM events "
+        "WHERE source = 'gitlab' AND kind = 'issue' "
+        "AND summary LIKE '[opened] %' AND raw IS NOT NULL"
+    ).fetchall()
+    for project, timestamp, raw, event_hash in rows:
+        try:
+            issue = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(issue, dict):
+            continue
+        created_at = issue.get("created_at")
+        if not isinstance(created_at, str) or created_at == timestamp:
+            continue
+        author = issue.get("author") or {}
+        username = author.get("username", "") if isinstance(author, dict) else ""
+        repairs.append(Event(
+            person=ids.person("gitlab", username),
+            project=project,
+            ts=created_at,
+            source="gitlab",
+            kind="issue",
+            summary=f"[opened] {issue['title']}",
+            refs=json.dumps({"iid": issue["iid"], "url": issue.get("web_url")}),
+            raw=raw,
+            hash=event_hash,
+        ))
+    return repairs
+
+
+def _replace_gitlab_event(
+    conn: sqlite3.Connection,
+    event: Event,
+    *,
+    existing_only: bool = False,
+) -> int:
+    key = (event.source, event.kind, event.hash)
+    existed = conn.execute(
+        "SELECT 1 FROM events WHERE source = ? AND kind = ? AND hash = ? LIMIT 1",
+        key,
+    ).fetchone() is not None
+    if existing_only and not existed:
+        return 0
+    conn.execute(
+        "DELETE FROM events WHERE source = ? AND kind = ? AND hash = ?",
+        key,
+    )
+    conn.execute(
+        "INSERT INTO events "
+        "(person, project, ts, source, kind, summary, refs, raw, hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        _event_values(event),
+    )
+    return int(not existed)
+
+
+def _event_values(event: Event) -> tuple:
+    return (
+        event.person,
+        event.project,
+        event.ts,
+        event.source,
+        event.kind,
+        event.summary,
+        event.refs,
+        event.raw,
+        event.hash,
+    )
 
 
 def stats(conn: sqlite3.Connection) -> dict:

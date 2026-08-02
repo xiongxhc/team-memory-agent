@@ -33,8 +33,16 @@ def reclaim(conn: sqlite3.Connection, ids: IdentityMaps,
                              (person,)).fetchone()[0]
         else:
             with conn:
-                n = conn.execute("UPDATE events SET person=? WHERE person=?",
-                                 (slug, person)).rowcount
+                deleted = conn.execute(
+                    "DELETE FROM events WHERE person=? AND EXISTS ("
+                    "SELECT 1 FROM events AS mapped"
+                    " WHERE mapped.person=? AND mapped.source=events.source"
+                    " AND mapped.hash=events.hash)",
+                    (person, slug),
+                ).rowcount
+                updated = conn.execute("UPDATE events SET person=? WHERE person=?",
+                                       (slug, person)).rowcount
+                n = deleted + updated
         out.append((raw, slug, n))
     return out
 

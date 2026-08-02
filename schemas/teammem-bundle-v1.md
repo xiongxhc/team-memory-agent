@@ -38,7 +38,8 @@ UTF-8 JSON.
 - An empty `events` array is valid.
 - Event order has no semantic meaning.
 - `kind` is `journal-highlight` and `refs` is `null` in version 1.
-- `ts` is member-local time and must fall on the bundle's calendar date.
+- `date` is the member-selected review day. `ts` is preserved evidence time and
+  may show a neighbouring calendar date after timezone conversion.
 - The hub resolves the member slug and assigns `person`, `source`, and event hash.
 - Import is idempotent per event.
 - A later revision for the same member and date is valid. Unchanged events

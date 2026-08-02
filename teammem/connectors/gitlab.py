@@ -16,6 +16,10 @@ _PER_PAGE = 100
 FetchJson = Callable[[str, dict], list]
 
 
+def _parse_iso8601(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 class GitLabConnector:
     name = "gitlab"
 
@@ -51,7 +55,8 @@ class GitLabConnector:
         now: datetime,
     ) -> CollectionResult:
         fetch_json = self._fetch_json or self.http_fetch_json(cfg)
-        return CollectionResult(events=tuple(self._collect_events(cfg, ids, fetch_json, now)))
+        events, warnings = self._collect_events(cfg, ids, fetch_json, now)
+        return CollectionResult(events=tuple(events), warnings=tuple(warnings))
 
     @staticmethod
     def _paginate(fetch_json: FetchJson, path: str, params: dict) -> list:
@@ -65,28 +70,38 @@ class GitLabConnector:
 
     def _collect_events(
         self, cfg: Config, ids: IdentityMaps, fetch_json: FetchJson, now: datetime
-    ) -> list[Event]:
-        since = (now - timedelta(days=cfg.since_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ) -> tuple[list[Event], list[str]]:
+        since_time = now - timedelta(days=cfg.since_days)
+        since = since_time.strftime("%Y-%m-%dT%H:%M:%SZ")
         events: list[Event] = []
+        warnings: list[str] = []
         projects = self._paginate(fetch_json, f"/groups/{cfg.gitlab_group}/projects",
                                   {
                                       "include_subgroups": "true",
                                       "with_shared": "false",
-                                  })
+        })
         for p in projects:
             project = ids.project_for_repo(p["path_with_namespace"])
-            if (p.get("created_at") or "") >= since:
-                events.append(Event(
-                    person=ids.person("gitlab", self._creator_username(fetch_json, p)),
-                    project=project,
-                    ts=p["created_at"],
-                    source="gitlab",
-                    kind="repo",
-                    summary=f"[created] {p['path_with_namespace']}",
-                    refs=json.dumps({"id": p["id"], "url": p.get("web_url")}),
-                    raw=json.dumps(p),
-                    hash=event_hash("repo", str(p["id"]), "created"),
-                ))
+            created_at = p.get("created_at")
+            if created_at and _parse_iso8601(created_at) >= since_time:
+                creator = self._creator_username(fetch_json, p)
+                if creator is None:
+                    warnings.append(
+                        "repository creator lookup failed for "
+                        f"{p['path_with_namespace']}; creation deferred"
+                    )
+                else:
+                    events.append(Event(
+                        person=ids.person("gitlab", creator),
+                        project=project,
+                        ts=created_at,
+                        source="gitlab",
+                        kind="repo",
+                        summary=f"[created] {p['path_with_namespace']}",
+                        refs=json.dumps({"id": p["id"], "url": p.get("web_url")}),
+                        raw=json.dumps(p),
+                        hash=event_hash("repo", str(p["id"]), "created"),
+                    ))
             # Default-branch commits only (no all=true): branch work appears at merge via MRs.
             # Revisit during live dry-run / M2 gap logic if branch-level visibility is needed.
             for c in self._paginate(fetch_json, f"/projects/{p['id']}/repository/commits",
@@ -117,30 +132,45 @@ class GitLabConnector:
                 ))
             for issue in self._paginate(fetch_json, f"/projects/{p['id']}/issues",
                                         {"updated_after": since}):
-                # Closing is the assignee's work; opening is the author's.
-                worker = ((issue.get("assignee") or {}) if issue["state"] == "closed"
-                          else {}) or issue.get("author") or {}
-                events.append(Event(
-                    person=ids.person("gitlab", worker.get("username", "")),
-                    project=project,
-                    ts=issue.get("closed_at") or issue["updated_at"],
-                    source="gitlab",
-                    kind="issue",
-                    summary=f"[{issue['state']}] {issue['title']}",
-                    refs=json.dumps({"iid": issue["iid"], "url": issue.get("web_url")}),
-                    raw=json.dumps(issue),
-                    hash=event_hash("issue", str(p["id"]), str(issue["iid"]),
-                                    issue["state"]),
-                ))
-        return events
+                created_at = issue.get("created_at")
+                if created_at and _parse_iso8601(created_at) >= since_time:
+                    author = issue.get("author") or {}
+                    events.append(Event(
+                        person=ids.person("gitlab", author.get("username", "")),
+                        project=project,
+                        ts=created_at,
+                        source="gitlab",
+                        kind="issue",
+                        summary=f"[opened] {issue['title']}",
+                        refs=json.dumps({"iid": issue["iid"], "url": issue.get("web_url")}),
+                        raw=json.dumps(issue),
+                        hash=event_hash("issue", str(p["id"]), str(issue["iid"]),
+                                        "opened"),
+                    ))
+                closed_at = issue.get("closed_at")
+                if closed_at and _parse_iso8601(closed_at) >= since_time:
+                    closer = issue.get("closed_by") or {}
+                    events.append(Event(
+                        person=ids.person("gitlab", closer.get("username", "")),
+                        project=project,
+                        ts=closed_at,
+                        source="gitlab",
+                        kind="issue",
+                        summary=f"[closed] {issue['title']}",
+                        refs=json.dumps({"iid": issue["iid"], "url": issue.get("web_url")}),
+                        raw=json.dumps(issue),
+                        hash=event_hash("issue", str(p["id"]), str(issue["iid"]),
+                                        "closed"),
+                    ))
+        return events, warnings
 
     @staticmethod
-    def _creator_username(fetch_json: FetchJson, p: dict) -> str:
-        # A deleted creator account must not lose the repo fact.
+    def _creator_username(fetch_json: FetchJson, p: dict) -> str | None:
         if not p.get("creator_id"):
-            return ""
+            return None
         try:
             user = fetch_json(f"/users/{p['creator_id']}", {"page": 1})
         except Exception:
-            return ""
-        return user.get("username", "") if isinstance(user, dict) else ""
+            return None
+        username = user.get("username") if isinstance(user, dict) else None
+        return username if isinstance(username, str) and username else None

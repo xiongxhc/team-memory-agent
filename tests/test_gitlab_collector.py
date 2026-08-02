@@ -23,6 +23,7 @@ MR = {"iid": 7, "state": "merged", "title": "Auth middleware fix",
       "web_url": "https://gitlab.internal/team/project-alpha/-/merge_requests/7"}
 ISSUE = {"iid": 31, "state": "opened", "title": "Login rate limit",
          "author": {"username": "alexdev"}, "assignee": None,
+         "created_at": "2026-07-14T08:00:00Z",
          "updated_at": "2026-07-14T11:00:00Z", "closed_at": None,
          "web_url": "https://gitlab.internal/team/project-alpha/-/issues/31"}
 
@@ -40,6 +41,15 @@ def _collect(responses):
     cfg = Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"})
     ids = IdentityMaps.load(CONFIG_DIR)
     return collect_gitlab(cfg, ids, fake_fetch(responses), NOW)
+
+
+def _collect_result(fetch):
+    return GitLabConnector(fetch_json=fetch).collect(
+        Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
+        IdentityMaps.load(CONFIG_DIR),
+        ConnectorSettings(name="gitlab", enabled=True, options={}),
+        NOW,
+    )
 
 
 def test_commit_and_mr_become_events():
@@ -96,8 +106,8 @@ def test_since_and_updated_after_params_sent():
     assert seen["/groups/42/projects"]["with_shared"] == "false"
 
 
-def test_open_issue_attributes_to_author():
-    """Removing issue collection or its author attribution breaks this."""
+def test_new_issue_uses_creation_time_and_attributes_to_author():
+    """Using comment/update time as the opening fact fabricates activity."""
     events = _collect({
         "/groups/42/projects": [PROJECTS],
         "/projects/1/issues": [[ISSUE]],
@@ -105,14 +115,31 @@ def test_open_issue_attributes_to_author():
     issue = next(e for e in events if e.kind == "issue")
     assert (issue.person, issue.project, issue.source) == ("alex", "project-alpha", "gitlab")
     assert issue.summary == "[opened] Login rate limit"
-    assert issue.ts == "2026-07-14T11:00:00Z"
+    assert issue.ts == "2026-07-14T08:00:00Z"
     assert issue.hash == event_hash("issue", "1", "31", "opened")
 
 
-def test_closed_issue_attributes_to_assignee():
-    """Closing is the assignee's work; author attribution here breaks this."""
+def test_old_open_issue_updated_only_by_comment_emits_no_issue_fact():
+    old = dict(
+        ISSUE,
+        created_at="2026-01-01T08:00:00Z",
+        updated_at="2026-07-14T11:00:00Z",
+    )
+
+    events = _collect({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/issues": [[old]],
+    })
+
+    assert [event for event in events if event.kind == "issue"] == []
+
+
+def test_closed_issue_attributes_to_closed_by_not_assignee():
+    """Assignment does not prove who performed the provider-reported close."""
     closed = dict(ISSUE, state="closed", closed_at="2026-07-14T15:00:00Z",
-                  author={"username": "ghost"}, assignee={"username": "alexdev"})
+                  created_at="2026-01-01T08:00:00Z",
+                  author={"username": "ghost"}, assignee={"username": "samdev"},
+                  closed_by={"username": "alexdev"})
     events = _collect({
         "/groups/42/projects": [PROJECTS],
         "/projects/1/issues": [[closed]],
@@ -122,13 +149,32 @@ def test_closed_issue_attributes_to_assignee():
     assert events[0].hash == event_hash("issue", "1", "31", "closed")
 
 
-def test_closed_unassigned_issue_falls_back_to_author():
-    closed = dict(ISSUE, state="closed", closed_at="2026-07-14T15:00:00Z")
+def test_issue_created_and_closed_in_window_emits_both_lifecycle_facts():
+    closed = dict(
+        ISSUE,
+        state="closed",
+        closed_at="2026-07-14T15:00:00Z",
+        closed_by={"username": "samdev"},
+    )
     events = _collect({
         "/groups/42/projects": [PROJECTS],
         "/projects/1/issues": [[closed]],
     })
-    assert events[0].person == "alex"
+
+    assert [(event.person, event.ts, event.summary, event.hash) for event in events] == [
+        (
+            "alex",
+            "2026-07-14T08:00:00Z",
+            "[opened] Login rate limit",
+            event_hash("issue", "1", "31", "opened"),
+        ),
+        (
+            "sam",
+            "2026-07-14T15:00:00Z",
+            "[closed] Login rate limit",
+            event_hash("issue", "1", "31", "closed"),
+        ),
+    ]
 
 
 def test_ghost_issue_author_is_unmapped_not_crash():
@@ -160,20 +206,61 @@ def test_old_repo_emits_no_repo_event():
     assert [e for e in events if e.kind == "repo"] == []
 
 
-def test_repo_creator_lookup_failure_still_emits_event():
-    """A deleted creator account must not lose the repo fact."""
+def test_fractional_project_timestamp_at_exact_boundary_is_included():
+    boundary_project = dict(
+        PROJECTS[0],
+        created_at="2026-07-08T00:00:00.000000Z",
+        creator_id=5,
+    )
+    events = _collect({
+        "/groups/42/projects": [[boundary_project]],
+        "/users/5": [{"username": "alexdev"}],
+    })
+
+    repo = next(event for event in events if event.kind == "repo")
+    assert repo.ts == "2026-07-08T00:00:00.000000Z"
+
+
+def test_repo_creator_lookup_failure_defers_event_then_retries_successfully():
     new_project = dict(PROJECTS[0], created_at="2026-07-14T08:00:00Z", creator_id=9)
+    attempts = 0
+
     def fetch(path, params):
+        nonlocal attempts
         if path.startswith("/users/"):
-            raise RuntimeError("404")
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("private lookup detail")
+            return {"username": "new-user"}
         if path == "/groups/42/projects":
             return [new_project] if params["page"] == 1 else []
         return []
-    cfg = Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"})
-    ids = IdentityMaps.load(CONFIG_DIR)
-    events = collect_gitlab(cfg, ids, fetch, NOW)
-    repo = next(e for e in events if e.kind == "repo")
-    assert repo.person == "_unmapped/(none)"
+
+    first = _collect_result(fetch)
+    assert [event for event in first.events if event.kind == "repo"] == []
+    assert first.warnings == (
+        "repository creator lookup failed for team/project-alpha; creation deferred",
+    )
+    assert "private lookup detail" not in first.warnings[0]
+
+    second = _collect_result(fetch)
+    repos = [event for event in second.events if event.kind == "repo"]
+    assert len(repos) == 1
+    assert repos[0].person == "_unmapped/new-user"
+    assert second.warnings == ()
+
+
+def test_repo_creator_unusable_response_defers_event_with_warning():
+    new_project = dict(PROJECTS[0], created_at="2026-07-14T08:00:00Z", creator_id=9)
+    result = _collect_result(fake_fetch({
+        "/groups/42/projects": [[new_project]],
+        "/users/9": [[]],
+    }))
+
+    assert [event for event in result.events if event.kind == "repo"] == []
+    assert result.warnings == (
+        "repository creator lookup failed for team/project-alpha; creation deferred",
+    )
 
 
 def test_ghost_mr_author_is_unmapped_not_crash():
@@ -187,11 +274,18 @@ def test_ghost_mr_author_is_unmapped_not_crash():
 
 
 def test_connector_preserves_legacy_gitlab_event_identities():
+    closed = dict(
+        ISSUE,
+        state="closed",
+        created_at="2026-01-01T08:00:00Z",
+        closed_at="2026-07-14T15:00:00Z",
+        closed_by={"username": "alexdev"},
+    )
     result = GitLabConnector(fetch_json=fake_fetch({
         "/groups/42/projects": [PROJECTS],
         "/projects/1/repository/commits": [[COMMIT]],
         "/projects/1/merge_requests": [[MR]],
-        "/projects/1/issues": [[ISSUE]],
+        "/projects/1/issues": [[ISSUE, closed]],
     })).collect(
         Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
         IdentityMaps.load(CONFIG_DIR),
@@ -208,4 +302,7 @@ def test_connector_preserves_legacy_gitlab_event_identities():
         ("gitlab", "issue",
          '{"iid": 31, "url": "https://gitlab.internal/team/project-alpha/-/issues/31"}',
          "907928208df1c752749c3bea14cd056955dde724d7df620eaf597e7ac9c4beed"),
+        ("gitlab", "issue",
+         '{"iid": 31, "url": "https://gitlab.internal/team/project-alpha/-/issues/31"}',
+         "789bb2e605c8237773c1eb4c159aa90a6ad895365f1b86de054cb1cc1a23ccf8"),
     ]

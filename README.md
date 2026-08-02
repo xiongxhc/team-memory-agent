@@ -268,7 +268,11 @@ teammem run-daily
 `teammem run-daily` executes one idempotent run on the operator machine and
 returns a per-step result. It does not remain resident and does not create,
 change, or remove a schedule. Package installation alone never creates a
-background job.
+background job. Connector, import, synthesis, documentation-sync, and push
+failures remain visible as failed steps but are warning-level for the aggregate
+exit status and retry on the next run. Ledger, identity-reclaim, render, and
+snapshot failures return non-zero so the scheduler reports failures that threaten
+the ledger or its durable local projection.
 
 Only after the observed run succeeds, explicitly install the daily job. The
 default and example below are 18:20 in the operator machine's local timezone:
@@ -290,7 +294,7 @@ upgrades, and removal.
 | Connector | Collection boundary |
 |---|---|
 | GitHub | Commits and pull requests from explicitly mapped repositories |
-| GitLab | Commits, merge requests, issue open/close transitions, and repository creations in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
+| GitLab | Commits, merge requests, issue lifecycle observations, and repository creations in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; polling captures one initial-creation fact and one provider-reported closure fact per issue, while repeated reopen/reclose history requires a state-events or webhook source; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
 | Slack | Human top-level messages in explicitly mapped public or private project channels containing the app; no DMs and no thread replies |
 | Feishu | Human messages in explicitly mapped group chats; no direct chats |
 | Discord | Human messages in explicitly mapped guild channels; no DMs, bot messages, or webhooks |

@@ -154,6 +154,40 @@ def test_collect_connector_returns_provider_warnings(tmp_path):
     assert result.warnings == ("history may be incomplete",)
 
 
+def test_collect_connector_reclaims_roster_mapping_before_inserting(tmp_path):
+    from teammem.connectors.config import ConnectorSettings
+
+    cfg = _cfg(tmp_path)
+    conn = open_db(cfg.db_path)
+    insert_events(conn, [Event(
+        person="_unmapped/1234567890",
+        project="project-alpha",
+        ts=NOW.isoformat(),
+        source="discord-channel",
+        kind="message",
+        summary="hello",
+        refs=json.dumps({"channel_id": "123"}),
+        hash="m1",
+    )])
+
+    result = collect_connector(
+        "discord",
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        ConnectorSettings("discord", True, {}),
+        NOW,
+        connector=_WarningConnector(),
+        conn=conn,
+        emit=False,
+    )
+
+    assert result.fetched == 1
+    assert result.inserted == 0
+    assert conn.execute(
+        "SELECT person, source, hash FROM events"
+    ).fetchall() == [("alex", "discord-channel", "m1")]
+
+
 def test_render_push_warning_keeps_sanitized_final_git_stderr_line(
     tmp_path, monkeypatch, capsys
 ):

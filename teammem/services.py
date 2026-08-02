@@ -23,7 +23,7 @@ from .queries import week_label, week_monday
 from .reclaim import reclaim, reclaim_channel_projects
 from .render import render_vault
 from .slices import active_person_days
-from .store import insert_events, open_db
+from .store import insert_events, open_db, reconcile_gitlab_events
 from .summarize import (
     claude_cli_llm,
     daily_person_journal,
@@ -122,7 +122,11 @@ def collect_connector(
         inserted = 0
     else:
         connection = conn or open_db(cfg.db_path)
-        inserted = insert_events(connection, events)
+        reclaim(connection, ids)
+        if name == "gitlab":
+            inserted = reconcile_gitlab_events(connection, events, ids)
+        else:
+            inserted = insert_events(connection, events)
         if emit:
             print(f"ingested: {inserted} new / {len(events)} fetched -> {cfg.db_path}")
             unmapped = sorted({

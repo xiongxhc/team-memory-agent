@@ -16,24 +16,24 @@ attributed facts.
 - **Two new kinds, provider-native names:** `issue` and `repo`, both
   `source="gitlab"`. Branch pushes stay excluded — branch work surfaces at merge
   via MRs, the deliberate boundary carried since the first GitLab collector.
-- **Issues follow the MR state-transition identity exactly:**
-  `hash = event_hash("issue", project_id, iid, state)` with no timestamp, so each
-  state transition (`opened` → `closed`) is exactly one event and re-collections
-  of the same state deduplicate on `UNIQUE(person, source, hash)`. A reopened
-  issue re-produces the `opened` identity and is deduplicated; a later close is a
-  new fact.
-- **Issue attribution names the worker, not just the reporter:** an `opened`
-  issue is attributed to its author; a `closed` issue to its assignee, falling
-  back to the author when unassigned. This is a deliberate deviation from the
-  MR mapping (author for all states) because closing an issue is the assignee's
-  work. Ghost authors/assignees resolve to `_unmapped/(none)` — never dropped.
+- **Issues produce stable lifecycle observations:** polling emits one initial
+  creation fact with `hash = event_hash("issue", project_id, iid, "opened")`
+  when `created_at` is inside the lookback, and one provider-reported closure
+  fact with the existing `"closed"` hash when `closed_at` is inside the
+  lookback. A current issue record cannot reconstruct repeated reopen/reclose
+  history; that requires a GitLab state-events or webhook source.
+- **Issue attribution uses provider-reported actors:** the initial creation fact
+  belongs to the author and the closure fact belongs to `closed_by`. Assignment
+  is not evidence of who closed an issue. A missing actor resolves to
+  `_unmapped/(none)` rather than being silently dropped.
 - **`repo` records repository creation from data already fetched:** the group
   projects listing carries `created_at`, so projects created inside the lookback
   emit one `repo` event with `hash = event_hash("repo", project_id, "created")`.
   The state field leaves room for later lifecycle states (e.g. `archived`) as
   new hashes. One extra call per *new* repository (`/users/{creator_id}`)
-  resolves the creator's username for attribution; if that lookup fails the
-  event still lands, attributed `_unmapped/(none)`.
+  resolves the creator's username for attribution. If that lookup fails or
+  returns no usable username, that repository fact is deferred and a warning
+  names only the public project path; the normal lookback retries it later.
 - **Rendering treats both kinds as work items:** the three render kind filters
   widen to `("commit", "pr", "mr", "issue", "repo", "journal-highlight")`.
   Synthesis needs no change — slices pass the kind string to the LLM verbatim.
@@ -45,11 +45,11 @@ attributed facts.
 | Field | `issue` | `repo` |
 |---|---|---|
 | endpoint | `/projects/{id}/issues?updated_after=<since>` | group projects listing (no extra listing call) + `/users/{creator_id}` per new repo |
-| person | `opened`: author username; `closed`: assignee username, fallback author | creator username via user lookup |
-| ts | `closed_at` or `updated_at` | `created_at` |
-| summary | `[<state>] <title>` | `[created] <path_with_namespace>` |
+| person | initial creation: author username; closure: `closed_by` username | creator username via user lookup |
+| ts | initial creation: `created_at`; closure: `closed_at` | `created_at` |
+| summary | `[opened] <title>` or `[closed] <title>` | `[created] <path_with_namespace>` |
 | refs | `{"iid": iid, "url": web_url}` | `{"id": project_id, "url": web_url}` |
-| hash | `event_hash("issue", project_id, iid, state)` | `event_hash("repo", project_id, "created")` |
+| hash | existing `event_hash("issue", project_id, iid, "opened" | "closed")` identities | `event_hash("repo", project_id, "created")` |
 
 ## Flag interaction
 
@@ -64,6 +64,9 @@ not scoring; no ranking views" constraint.
   if wanted, same pattern.
 - Project `archived` transitions — the listing has no archived-at timestamp to
   place the event in the lookback window.
+- Repeated issue reopen/reclose history — polling the current issue record
+  captures one initial-creation fact and one provider-reported closure fact per
+  issue; complete cycles require a state-events or webhook source.
 - Confidential-issue filtering beyond what the token identity can see — the API
   boundary is the token's, as everywhere else in the adapter.
 - GitHub parity (`issue` for GitHub, repo lifecycle) — separate change, same
@@ -71,8 +74,9 @@ not scoring; no ranking views" constraint.
 
 ## Success criteria
 
-1. A closed issue with an assignee produces one event attributed to the
-   assignee with a pinned, stable hash; re-collection inserts zero rows.
+1. An issue produces its initial-creation and provider-reported closure facts
+   when their provider timestamps are inside the lookback; closure attribution
+   uses `closed_by`, and re-collection inserts zero rows for the pinned hashes.
 2. A repository created inside the lookback produces one attributed `repo`
    event; repositories older than the lookback produce none, and all existing
    event identities (commit, mr) are byte-identical to before.

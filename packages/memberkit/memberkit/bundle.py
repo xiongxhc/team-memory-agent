@@ -54,13 +54,11 @@ def validate_bundle(data: object, member: str, date: str) -> dict:
         if not isinstance(event["ts"], str):
             raise ValueError(f"{prefix} timestamp must be a string")
         try:
-            event_date = datetime.fromisoformat(
+            datetime.fromisoformat(
                 event["ts"].replace("Z", "+00:00")
-            ).date().isoformat()
+            )
         except ValueError as exc:
             raise ValueError(f"{prefix} timestamp is invalid") from exc
-        if event_date != date:
-            raise ValueError(f"{prefix} timestamp is outside bundle date")
         if event["kind"] != "journal-highlight":
             raise ValueError(f"{prefix} kind must be journal-highlight")
         if not isinstance(event["summary"], str) or not event["summary"].strip():

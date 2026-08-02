@@ -60,7 +60,9 @@ After a member deletes unwanted objects from the JSON `events` array,
 
 1. parses and fully validates the local v1 bundle;
 2. verifies the configured member, requested date, event fields, non-empty
-   summaries, allowed `kind` and `refs`, and same-day timestamps;
+   summaries, allowed `kind` and `refs`, and parseable evidence timestamps.
+   The bundle `date` is the member-selected review day; preserved `ts` evidence
+   may show a neighbouring calendar date after timezone conversion;
 3. reconciles pending fingerprints with the edited event list, recording absent
    pending events as excluded;
 4. regenerates `journal_md` from the remaining events;

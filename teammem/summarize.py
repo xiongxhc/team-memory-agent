@@ -3,6 +3,7 @@ LLM callable. All caching is content-hash keyed (see store.get_or_make);
 PROMPT_VERSION is folded into every hash so prompt edits regenerate entries."""
 
 import json
+import re
 import sqlite3
 from collections.abc import Callable
 
@@ -73,6 +74,16 @@ def http_llm(model: str, api_key: str, max_tokens: int) -> LLM:
     return llm
 
 
+def _claude_cli_failure_detail(stderr: str, stdout: str) -> str:
+    """Return a compact, deterministic diagnostic from Claude CLI output."""
+    excerpts = []
+    for label, stream in (("stderr", stderr), ("stdout", stdout)):
+        text = re.sub(r"[\s\x00-\x1f\x7f]+", " ", stream).strip()
+        if text:
+            excerpts.append(f"{label}: {text[:140]}")
+    return " | ".join(excerpts) or "(no output)"
+
+
 def claude_cli_llm(model: str, claude_bin: str = "claude") -> LLM:
     """Headless `claude -p` on the operator's subscription — no API key.
     --system-prompt replaces the default; --strict-mcp-config/--setting-sources=
@@ -86,8 +97,7 @@ def claude_cli_llm(model: str, claude_bin: str = "claude") -> LLM:
              "--strict-mcp-config", "--setting-sources="],
             input=user, capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
-            # The CLI reports errors (bad model, usage limits) on stdout.
-            detail = (proc.stderr.strip() or proc.stdout.strip())[:300]
+            detail = _claude_cli_failure_detail(proc.stderr, proc.stdout)
             raise ValueError(f"claude cli failed ({proc.returncode}): {detail}")
         text = proc.stdout.strip()
         if not text:

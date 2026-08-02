@@ -91,13 +91,11 @@ def load_bundle(path: Path, inbox: Path) -> Bundle:
         if not isinstance(event["ts"], str):
             raise _error(f"{prefix} ts must be a string")
         try:
-            event_day = datetime.fromisoformat(
+            datetime.fromisoformat(
                 event["ts"].replace("Z", "+00:00")
-            ).date().isoformat()
+            )
         except ValueError as exc:
             raise _error(f"{prefix} ts is invalid") from exc
-        if event_day != data["date"]:
-            raise _error(f"{prefix} ts is outside bundle date")
         if event["kind"] != "journal-highlight":
             raise _error(f"{prefix} kind is invalid")
         if not isinstance(event["summary"], str) or not event["summary"].strip():

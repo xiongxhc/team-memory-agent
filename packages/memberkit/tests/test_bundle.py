@@ -78,7 +78,6 @@ def valid_bundle():
         "project",
         "refs",
         "timestamp",
-        "wrong-day",
     ],
 )
 def test_validate_bundle_rejects_non_frozen_v1_data(case):
@@ -114,11 +113,18 @@ def test_validate_bundle_rejects_non_frozen_v1_data(case):
         data["events"][0]["refs"] = ["private"]
     elif case == "timestamp":
         data["events"][0]["ts"] = "not-a-timestamp"
-    else:
-        data["events"][0]["ts"] = "2026-07-28T00:00:00"
 
     with pytest.raises(ValueError):
         bundle.validate_bundle(data, "alex", expected_date)
+
+
+def test_validate_bundle_accepts_neighbouring_utc_calendar_dates_for_review_day():
+    for timestamp in ("2026-07-27T20:30:00Z", "2026-07-27T23:30:00"):
+        data = valid_bundle()
+        data["date"] = "2026-07-28"
+        data["events"][0]["ts"] = timestamp
+
+        assert bundle.validate_bundle(data, "alex", "2026-07-28") == data
 
 
 def test_prepare_bundle_writes_empty_events_journal(tmp_path):

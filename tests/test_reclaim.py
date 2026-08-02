@@ -69,6 +69,52 @@ def test_reclaim_resolves_github_identity(tmp_path):
     assert stats(conn)["by_person"]["alex"] == 1
 
 
+def test_reclaim_collapses_existing_unmapped_and_mapped_event_pair(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        _ev("alex", "same"),
+        _ev("_unmapped/alexdev", "same"),
+        _ev("_unmapped/alexdev", "claimable"),
+        Event(
+            person="alex",
+            ts="2026-07-14T09:00:00Z",
+            source="feishu-channel",
+            kind="message",
+            summary="same hash, different source",
+            hash="claimable",
+        ),
+    ])
+
+    got = reclaim(conn, IdentityMaps.load(CONFIG_DIR))
+
+    assert got == [("alexdev", "alex", 2)]
+    assert conn.execute(
+        "SELECT person, source, hash FROM events ORDER BY source, hash"
+    ).fetchall() == [
+        ("alex", "feishu-channel", "claimable"),
+        ("alex", "gitlab", "claimable"),
+        ("alex", "gitlab", "same"),
+    ]
+
+
+def test_reclaim_dry_run_counts_duplicate_collapse_without_writing(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        _ev("alex", "same"),
+        _ev("_unmapped/alexdev", "same"),
+    ])
+
+    got = reclaim(conn, IdentityMaps.load(CONFIG_DIR), dry_run=True)
+
+    assert got == [("alexdev", "alex", 1)]
+    assert conn.execute(
+        "SELECT person, source, hash FROM events ORDER BY person"
+    ).fetchall() == [
+        ("_unmapped/alexdev", "gitlab", "same"),
+        ("alex", "gitlab", "same"),
+    ]
+
+
 def test_reclaim_channel_projects_updates_only_unmapped_rows(tmp_path):
     import json as _json
     from teammem.reclaim import reclaim_channel_projects

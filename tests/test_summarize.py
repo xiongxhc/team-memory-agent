@@ -171,3 +171,25 @@ def test_claude_cli_failure_surfaces_stdout_detail(monkeypatch):
         returncode=1, stdout="There's an issue with the selected model\n", stderr=""))
     with pytest.raises(ValueError, match="issue with the selected model"):
         claude_cli_llm("some-model")("system", "user")
+
+
+def test_claude_cli_failure_includes_bounded_excerpts_from_both_streams(monkeypatch):
+    """Diagnostics retain both streams without allowing terminal output to sprawl."""
+    import subprocess
+    import types
+
+    from teammem.summarize import claude_cli_llm
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: types.SimpleNamespace(
+        returncode=1,
+        stderr="warning:\n" + ("unrelated diagnostic " * 40),
+        stdout="selected model is unavailable\tfor this subscription\n",
+    ))
+    with pytest.raises(ValueError) as exc_info:
+        claude_cli_llm("some-model")("system", "user")
+
+    detail = str(exc_info.value).split(": ", 1)[1]
+    assert detail.startswith("stderr: warning: unrelated diagnostic")
+    assert "stdout: selected model is unavailable for this subscription" in detail
+    assert "\n" not in detail and "\t" not in detail
+    assert len(detail) <= 300

@@ -62,6 +62,17 @@ _LOCAL_STAGES = (
     "push",
     "snapshot",
 )
+_FATAL_STAGES = frozenset({"ledger", "reclaim", "render", "snapshot"})
+
+
+def _daily_result(steps: list[StepResult]) -> DailyResult:
+    exit_code = int(
+        any(
+            step.name in _FATAL_STAGES and step.status == "failed"
+            for step in steps
+        )
+    )
+    return DailyResult(tuple(steps), exit_code)
 
 
 def _call_service(function, *args, **kwargs) -> tuple[int, str]:
@@ -159,7 +170,7 @@ def run_daily(
             StepResult(name, "skipped", "ledger unavailable")
             for name in _LOCAL_STAGES
         )
-        return DailyResult(tuple(steps), 1)
+        return _daily_result(steps)
 
     steps.append(StepResult("ledger", "ok", str(cfg.db_path)))
 
@@ -340,5 +351,4 @@ def run_daily(
                 StepResult("snapshot", "failed", redact_secrets(error, cfg))
             )
 
-    exit_code = 1 if any(step.status == "failed" for step in steps) else 0
-    return DailyResult(tuple(steps), exit_code)
+    return _daily_result(steps)
