@@ -22,6 +22,22 @@ NOW = datetime(2026, 7, 15, tzinfo=timezone.utc)
 # deterministic regardless of the operator's real config/roster.yaml.
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
 
+# Captured at import time, before the autouse isolation fixture patches it, for
+# the tests that exercise the genuine default-env-file resolution.
+_REAL_DEFAULT_ENV_FILE = config_module.default_env_file
+
+
+@pytest.fixture(autouse=True)
+def _isolate_operator_env_file(monkeypatch, tmp_path):
+    """CLI tests must never read the operator's real hub.env: guard tests
+    sanitize the process environment only, and a real default env file would
+    re-supply credentials/paths underneath them (and let a "guarded" command
+    proceed against live provider APIs). Point both call sites — Config.load's
+    fallback and the argparse --env-file default — at a nonexistent file."""
+    absent = tmp_path / "absent-hub.env"
+    monkeypatch.setattr(config_module, "default_env_file", lambda **_: absent)
+    monkeypatch.setattr(cli_module, "default_env_file", lambda **_: absent)
+
 PROJECTS = [{"id": 1, "path_with_namespace": "team/project-alpha"}]
 COMMIT = {"id": "sha-abc", "author_email": "alex@example.com", "author_name": "Alex",
           "committed_date": "2026-07-14T09:00:00Z", "title": "fix: JWT refresh race",
@@ -1009,6 +1025,7 @@ if (first, second) != (0, 0):
 
 
 def test_parser_uses_windows_appdata_default_at_parse_time(monkeypatch):
+    monkeypatch.setattr(cli_module, "default_env_file", _REAL_DEFAULT_ENV_FILE)
     monkeypatch.setattr(cli_module.sys, "platform", "win32")
     monkeypatch.setenv("APPDATA", r"C:\\Users\\Alex\\AppData\\Roaming")
     args = cli_module._parser().parse_args(["stats"])
