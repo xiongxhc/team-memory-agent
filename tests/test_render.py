@@ -35,8 +35,9 @@ def test_render_writes_expected_tree(tmp_path):
     vault = tmp_path / "vault"
     out = render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
     assert out["week_label"] == "Week 2026-07-13-17"
-    assert (vault / "Person" / "Alex Rivera.md").exists()
-    assert (vault / "Person" / "Sam Lee.md").exists()
+    assert (vault / "Person" / "Alex Rivera" / "README.md").exists()
+    assert (vault / "Person" / "Alex Rivera" / "Week 2026-07-13-17.md").exists()
+    assert (vault / "Person" / "Sam Lee" / "README.md").exists()
     assert not (vault / "Person" / "_unmapped").exists()          # no unmapped person pages
     assert (vault / "Projects" / "project-alpha.md").exists()
     assert (vault / "Work Journal" / "Week 2026-07-13-17.md").exists()
@@ -48,10 +49,10 @@ def test_week_report_content(tmp_path):
     vault = tmp_path / "vault"
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
     report = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text()
-    assert "[Alex Rivera](../Person/Alex%20Rivera.md)" in report   # person link
+    assert "[Alex Rivera](../Person/Alex%20Rivera/README.md)" in report   # person link
     assert "2 events" in report                                   # per-person count
     assert "(https://x/a1)" in report                             # every line carries a ref
-    assert "[Sam Lee](../Person/Sam%20Lee.md)" in report and "no activity this week" in report  # gap flag
+    assert "[Sam Lee](../Person/Sam%20Lee/README.md)" in report and "no activity this week" in report  # gap flag
     assert "_unmapped/x@y.z" in report                            # unmapped surfaces
 
 
@@ -59,9 +60,9 @@ def test_person_page_content(tmp_path):
     conn = _seed(tmp_path)
     vault = tmp_path / "vault"
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
-    page = (vault / "Person" / "Alex Rivera.md").read_text()
+    page = (vault / "Person" / "Alex Rivera" / "README.md").read_text()
     assert "slug: alex" in page
-    assert "[Week 2026-07-13-17](../Work%20Journal/Week%202026-07-13-17.md)" in page
+    assert "[Week 2026-07-13-17](../../Work%20Journal/Week%202026-07-13-17.md)" in page
     assert "fix: JWT refresh race" in page
 
 
@@ -72,11 +73,11 @@ def test_render_is_idempotent_and_removes_stale(tmp_path):
     stale = vault / "Person" / "Old Name.md"
     stale.write_text("stale")
     keep = vault / "Meeting Notes"; keep.mkdir(); (keep / "note.md").write_text("mine")
-    first = (vault / "Person" / "Alex Rivera.md").read_bytes()
+    first = (vault / "Person" / "Alex Rivera" / "README.md").read_bytes()
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
     assert not stale.exists()                                     # managed dirs regenerated
     assert (keep / "note.md").read_text() == "mine"               # unmanaged untouched
-    assert (vault / "Person" / "Alex Rivera.md").read_bytes() == first  # deterministic
+    assert (vault / "Person" / "Alex Rivera" / "README.md").read_bytes() == first  # deterministic
 
 
 def test_messages_render_as_channel_count(tmp_path):
@@ -139,7 +140,7 @@ def test_person_page_shows_day_entries_with_detail_demoted(tmp_path):
     _seed_summaries(conn)
     vault = tmp_path / "vault"
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
-    page = (vault / "Person" / "Alex Rivera.md").read_text()
+    page = (vault / "Person" / "Alex Rivera" / "README.md").read_text()
     assert "### 2026-07-14" in page
     assert "Alex fixed the JWT refresh race" in page
     assert "**Activity detail**" in page
@@ -238,7 +239,7 @@ def test_message_line_names_channels_when_cache_present(tmp_path):
     vault = tmp_path / "vault"
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY,
                  channel_names={"oc_pm": "PM. Share"})
-    page = (vault / "Person" / "Alex Rivera.md").read_text()
+    page = (vault / "Person" / "Alex Rivera" / "README.md").read_text()
     assert "💬 1 messages across 1 channels (PM. Share)" in page
 
 
@@ -259,7 +260,7 @@ def test_github_pull_requests_render_as_work_items(tmp_path):
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
 
     assert "[open] Add provider-neutral runner" in (
-        vault / "Person" / "Alex Rivera.md"
+        vault / "Person" / "Alex Rivera" / "README.md"
     ).read_text()
 
 
@@ -279,7 +280,7 @@ def test_gitlab_issues_and_repos_render_as_work_items(tmp_path):
     vault = tmp_path / "vault"
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
 
-    person = (vault / "Person" / "Alex Rivera.md").read_text()
+    person = (vault / "Person" / "Alex Rivera" / "README.md").read_text()
     assert "[closed] Login rate limit" in person
     assert "[created] team/project-alpha" in person
     project = (vault / "Projects" / "project-alpha.md").read_text()
@@ -318,5 +319,47 @@ def test_channel_id_refs_are_counted_with_legacy_chat_id_refs(tmp_path):
         channel_names={"C1": "Slack", "oc_1": "Feishu"},
     )
 
-    page = (vault / "Person" / "Alex Rivera.md").read_text()
+    page = (vault / "Person" / "Alex Rivera" / "README.md").read_text()
     assert "💬 2 messages across 2 channels (Feishu, Slack)" in page
+
+
+def test_person_week_files_and_index(tmp_path):
+    """Removing the per-week person files or the README week index breaks this."""
+    conn = _seed(tmp_path)
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    readme = (vault / "Person" / "Alex Rivera" / "README.md").read_text()
+    assert "## Weeks" in readme
+    assert "- [Week 2026-07-13-17](Week%202026-07-13-17.md) — 2 events" in readme
+    week = (vault / "Person" / "Alex Rivera" / "Week 2026-07-13-17.md").read_text()
+    assert "# Alex Rivera — Week 2026-07-13-17" in week
+    assert "[Alex Rivera](README.md)" in week
+    assert "(../../Work%20Journal/Week%202026-07-13-17.md)" in week
+    assert "fix: JWT refresh race" in week
+
+
+def test_person_history_renders_beyond_window(tmp_path):
+    """Week files older than the render window must survive the managed wipe."""
+    conn = _seed(tmp_path)
+    insert_events(conn, [Event(
+        person="alex", ts="2026-05-05T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="ancient work", hash="old1",
+        project="project-alpha", refs='{"url": "https://x/old1"}')])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    old_week = vault / "Person" / "Alex Rivera" / "Week 2026-05-04-08.md"
+    assert old_week.exists() and "ancient work" in old_week.read_text()
+    assert not (vault / "Work Journal" / "Week 2026-05-04-08.md").exists()
+
+
+def test_person_week_activity_detail_capped(tmp_path):
+    conn = _seed(tmp_path)
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T10:00:00+04:00", source="gitlab",
+        kind="commit", summary=f"bulk {i}", hash=f"bulk{i}",
+        project="project-alpha") for i in range(13)])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    week = (vault / "Person" / "Alex Rivera" / "Week 2026-07-13-17.md").read_text()
+    assert week.count("- commit —") + week.count("- mr —") == 12
+    assert "…and 3 more work items" in week

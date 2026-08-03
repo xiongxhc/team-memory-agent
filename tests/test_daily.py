@@ -467,7 +467,7 @@ def test_daily_journal_failure_skips_friday_report_but_keeps_local_projections(
     assert result.status("docs-sync") == "ok"
     assert result.status("render") == "ok"
     assert "Cached journal remains available." in (
-        cfg.vault_dir / "Person" / "Alex Rivera.md"
+        cfg.vault_dir / "Person" / "Alex Rivera" / "README.md"
     ).read_text()
 
 

@@ -18,7 +18,8 @@ from .queries import (by_key, events_between, flags, ref_url,
                       week_label, week_monday, week_range)
 
 MANAGED = ("Person", "Projects", "Work Journal", "README.md")
-MAX_WORK_LINES = 12   # per person per week on project pages
+MAX_WORK_LINES = 12   # work bullets per person per week (project pages, person week files)
+WORK_KINDS = ("commit", "pr", "mr", "issue", "repo", "journal-highlight")
 
 
 def _fname(name: str) -> str:
@@ -26,16 +27,15 @@ def _fname(name: str) -> str:
 
 
 def _person_link(name: str) -> str:
-    return f"[{name}](../Person/{quote(name)}.md)"
+    return f"[{name}](../Person/{quote(name)}/README.md)"
 
 
 def _project_link(proj: str) -> str:
     return f"[{proj}](../Projects/{quote(_fname(proj))}.md)"
 
 
-def _week_link(label: str) -> str:
-    return f"[{label}](../Work Journal/{quote(label)}.md)".replace(
-        "(../Work Journal/", "(../Work%20Journal/")
+def _week_link(label: str, up: int = 1) -> str:
+    return f"[{label}]({'../' * up}Work%20Journal/{quote(label)}.md)"
 
 
 def _line(r: dict) -> str:
@@ -135,10 +135,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             detail = ", ".join(f"{len(v)} {k}" for k, v in sorted(kinds.items()))
             tally.append(f"\n### {_person_link(_fname(ids.display_name(person)))} — "
                       f"{len(rs)} events ({detail})\n")
-            work = [
-                r for r in rs
-                if r["kind"] in ("commit", "pr", "mr", "issue", "repo", "journal-highlight")
-            ]
+            work = [r for r in rs if r["kind"] in WORK_KINDS]
             msgs = [r for r in rs if r["kind"] == "message"]
             tally += [_line(r) for r in work[:5]]
             if msgs:
@@ -184,36 +181,75 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         _write(vault_dir / "Work Journal" / f"{label}.md", "".join(md))
         files += 1
 
-    # ---- Person pages (roster members with any event in window) -------------
+    # ---- Person pages: one folder per person, one file per week -------------
+    # Full ledger history, not the render window: managed dirs are wiped every
+    # render, so window-scoped week files would silently delete older weeks
+    # from the vault. README.md is the per-person index — the forge web UI
+    # auto-renders it when the folder is opened.
     all_rows = [r for rows in week_of.values() for r in rows]
-    for person, rs in sorted(by_key(all_rows, "person").items()):
-        if person.startswith("_unmapped/") or person == "(no project)":
+    min_ts = conn.execute("SELECT min(ts) FROM events").fetchone()[0]
+    hist_mondays = list(mondays)
+    if min_ts:
+        first = week_monday(date.fromisoformat(min_ts[:10]))
+        span = (week_monday(today) - first).days // 7 + 1
+        hist_mondays = [week_monday(today) - timedelta(weeks=i)
+                        for i in range(max(span, weeks))]
+    hist_week_of = {m: week_of[m] if m in week_of
+                    else events_between(conn, *week_range(m))
+                    for m in hist_mondays}
+
+    def _person_week_body(person: str, mine: list[dict]) -> list[str]:
+        body = []
+        days = sorted({r["ts"][:10] for r in mine})
+        entries = [(d, _summary("daily-person", f"{person}|{d}")) for d in days]
+        entries = [(d, t) for d, t in entries if t]
+        for d, t in entries:
+            body.append(f"\n### {d}\n{t.rstrip()}\n")
+        if entries:
+            body.append("\n**Activity detail**\n")
+        work = [r for r in mine if r["kind"] in WORK_KINDS]
+        msgs = [r for r in mine if r["kind"] == "message"]
+        body += [_line(r) for r in work[:MAX_WORK_LINES]]
+        if len(work) > MAX_WORK_LINES:
+            body.append(f"- …and {len(work) - MAX_WORK_LINES} more work items\n")
+        if msgs:
+            body.append(_msg_line(msgs))
+        return body
+
+    hist_rows = [r for rows in hist_week_of.values() for r in rows]
+    for person, rs in sorted(by_key(hist_rows, "person").items()):
+        if person.startswith("_unmapped/"):
             continue
         name = _fname(ids.display_name(person))
+        pdir = vault_dir / "Person" / name
+        if pdir.exists():
+            raise ValueError(f"filename collision in vault render: {pdir}")
+        pdir.mkdir()
+        weeks_mine = [(m, [r for r in hist_week_of[m] if r["person"] == person])
+                      for m in hist_mondays]
+        weeks_mine = [(m, mine) for m, mine in weeks_mine if mine]
+
+        latest_m, latest_mine = weeks_mine[0]
         md = [f"---\nslug: {person}\ngenerated: {today.isoformat()}\n---\n",
-              f"# {name}\n"]
-        for m in mondays:
-            mine = [r for r in week_of[m] if r["person"] == person]
-            if not mine:
-                continue
-            md.append(f"\n## {_week_link(week_label(m))}\n")
-            days = sorted({r["ts"][:10] for r in mine})
-            entries = [(d, _summary("daily-person", f"{person}|{d}")) for d in days]
-            entries = [(d, t) for d, t in entries if t]
-            for d, t in entries:
-                md.append(f"\n### {d}\n{t.rstrip()}\n")
-            if entries:
-                md.append("\n**Activity detail**\n")
-            work = [
-                r for r in mine
-                if r["kind"] in ("commit", "pr", "mr", "issue", "repo", "journal-highlight")
-            ]
-            msgs = [r for r in mine if r["kind"] == "message"]
-            md += [_line(r) for r in work]
-            if msgs:
-                md.append(_msg_line(msgs))
-        _write(vault_dir / "Person" / f"{name}.md", "".join(md))
+              f"# {name}\n",
+              f"\n## {_week_link(week_label(latest_m), up=2)}\n"]
+        md += _person_week_body(person, latest_mine)
+        md.append("\n## Weeks\n")
+        for m, mine in weeks_mine:
+            lbl = week_label(m)
+            md.append(f"- [{lbl}]({quote(lbl)}.md) — {len(mine)} events\n")
+        _write(pdir / "README.md", "".join(md))
         files += 1
+
+        for m, mine in weeks_mine:
+            lbl = week_label(m)
+            wmd = [f"---\nslug: {person}\nweek: {m.isoformat()}\n"
+                   f"generated: {today.isoformat()}\n---\n",
+                   f"# {name} — {lbl}\n",
+                   f"\n[{name}](README.md) · {_week_link(lbl, up=2)}\n"]
+            wmd += _person_week_body(person, mine)
+            _write(pdir / f"{lbl}.md", "".join(wmd))
+            files += 1
 
     # ---- Project pages -------------------------------------------------------
     for proj, rs in sorted(by_key(all_rows, "project").items()):
@@ -237,10 +273,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                 nm = _fname(ids.display_name(person))
                 link = (_person_link(nm) if not person.startswith("_unmapped/")
                         else f"`{person}`")
-                work = [
-                    r for r in prs
-                    if r["kind"] in ("commit", "pr", "mr", "issue", "repo", "journal-highlight")
-                ]
+                work = [r for r in prs if r["kind"] in WORK_KINDS]
                 msgs = [r for r in prs if r["kind"] == "message"]
                 md.append(f"\n### {link} — {len(prs)} events\n")
                 md += [_line(r) for r in work[:MAX_WORK_LINES]]
