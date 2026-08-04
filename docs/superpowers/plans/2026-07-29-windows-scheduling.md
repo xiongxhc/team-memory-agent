@@ -755,8 +755,6 @@ After the branch is pushed only with explicit user authorization, require the
 `windows-schedule` job to pass and confirm the real create/query/replace/delete
 cleanup. Before any push, verify every new commit has:
 
-```text
-Chris Xiong <xionghx713@gmail.com>
-```
+Expected: the repository-configured author and committer identity.
 
 No push is part of this plan.

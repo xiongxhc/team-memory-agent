@@ -18,7 +18,7 @@
 - Review finishes validation, exclusion reconciliation, journal regeneration, and atomic local persistence before displaying.
 - Push finishes validation, journal regeneration, and atomic local persistence before Git, then reconciles review state only after successful delivery or a verified no-op.
 - macOS, Linux, and Windows scheduler implementation files are outside this change.
-- Commits use `Chris Xiong <xionghx713@gmail.com>` as author and committer, contain no `Co-Authored-By`, and are not pushed.
+- Commits use the repository-configured author and committer identity, contain no `Co-Authored-By`, and are not pushed.
 
 ## File map and interfaces
 
@@ -114,15 +114,15 @@ all 211 currently stored `team-memory-agent` events (the earlier cutoff had
 
 - [ ] **Step 5: Commit**
 
+Use the repository-configured author and committer identity.
+
 ```bash
 git add packages/memberkit/memberkit/bundle.py \
   packages/memberkit/memberkit/cli.py \
   packages/memberkit/tests/test_bundle.py \
   packages/memberkit/tests/test_cli.py \
   packages/memberkit/tests/test_schedule.py
-GIT_AUTHOR_NAME='Chris Xiong' GIT_AUTHOR_EMAIL='xionghx713@gmail.com' \
-GIT_COMMITTER_NAME='Chris Xiong' GIT_COMMITTER_EMAIL='xionghx713@gmail.com' \
-  git commit -m 'fix: preserve all MemberKit evidence'
+git commit -m 'fix: preserve all MemberKit evidence'
 ```
 
 ### Task 2: Make Review Persist the Authoritative Journal
@@ -221,9 +221,7 @@ git add packages/memberkit/memberkit/bundle.py \
   packages/memberkit/tests/test_bundle.py \
   packages/memberkit/tests/test_cli.py \
   packages/memberkit/tests/test_state.py
-GIT_AUTHOR_NAME='Chris Xiong' GIT_AUTHOR_EMAIL='xionghx713@gmail.com' \
-GIT_COMMITTER_NAME='Chris Xiong' GIT_COMMITTER_EMAIL='xionghx713@gmail.com' \
-  git commit -m 'fix: synchronize reviewed MemberKit journals'
+git commit -m 'fix: synchronize reviewed MemberKit journals'
 ```
 
 ### Task 3: Preflight Push Before Git Without Mutating Review State
@@ -298,9 +296,7 @@ Run:
 ```bash
 git add packages/memberkit/memberkit/push.py \
   packages/memberkit/tests/test_push.py
-GIT_AUTHOR_NAME='Chris Xiong' GIT_AUTHOR_EMAIL='xionghx713@gmail.com' \
-GIT_COMMITTER_NAME='Chris Xiong' GIT_COMMITTER_EMAIL='xionghx713@gmail.com' \
-  git commit -m 'fix: preflight MemberKit bundles before push'
+git commit -m 'fix: preflight MemberKit bundles before push'
 ```
 
 ### Task 4: Align Documentation and Verify the Full Branch
@@ -354,8 +350,8 @@ git status --short
 git log --format='%h %an <%ae> | %cn <%ce> | %s' d0160d7..HEAD
 ```
 
-Expected: only planned files changed and every commit uses
-`Chris Xiong <xionghx713@gmail.com>`.
+Expected: only planned files changed and every commit uses the
+repository-configured author and committer identity.
 
 - [ ] **Step 5: Commit documentation and integration coverage**
 
@@ -364,6 +360,4 @@ git add README.md packages/memberkit/README.md docs/member-guide.md \
   docs/privacy.md tests/test_memberkit_integration.py \
   docs/superpowers/specs/2026-07-29-memberkit-evidence-first-drafts-design.md \
   docs/superpowers/plans/2026-07-29-memberkit-evidence-first-drafts.md
-GIT_AUTHOR_NAME='Chris Xiong' GIT_AUTHOR_EMAIL='xionghx713@gmail.com' \
-GIT_COMMITTER_NAME='Chris Xiong' GIT_COMMITTER_EMAIL='xionghx713@gmail.com' \
-  git commit -m 'docs: explain evidence-first MemberKit review'
+git commit -m 'docs: explain evidence-first MemberKit review'

@@ -39,6 +39,20 @@ no S4U
 no shell wrapper
 """
 
+CANONICAL_PUBLIC_FILES = (
+    "README.md",
+    "docs/deployment.md",
+    "docs/architecture.md",
+    "docs/privacy.md",
+    "teammem/render.py",
+)
+
+PRIVATE_DEPLOYMENT_PHRASES = (
+    "existing " + "private deployment",
+    "private internal " + "deployment",
+    "company " + "vault",
+)
+
 
 def _tracked_repo(tmp_path, name, content):
     subprocess.run(
@@ -310,6 +324,102 @@ def test_public_scan_allows_negative_windows_claim_outside_deployment(tmp_path):
 
     result = subprocess.run(
         [str(SCANNER)], cwd=tmp_path, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("canonical_file", CANONICAL_PUBLIC_FILES)
+@pytest.mark.parametrize("phrase", PRIVATE_DEPLOYMENT_PHRASES)
+def test_public_scan_rejects_private_wording_in_canonical_content(
+    tmp_path, canonical_file, phrase
+):
+    _tracked_repo(tmp_path, canonical_file, phrase + "\n")
+
+    result = subprocess.run(
+        [str(SCANNER)], cwd=tmp_path, capture_output=True, text=True
+    )
+
+    assert result.returncode == 1
+    assert "private deployment wording found" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "historical_file",
+    (
+        "docs/superpowers/plans/historical.md",
+        "docs/superpowers/specs/historical.md",
+    ),
+)
+@pytest.mark.parametrize("phrase", PRIVATE_DEPLOYMENT_PHRASES[:2])
+def test_public_scan_allows_private_deployment_provenance_in_history(
+    tmp_path, historical_file, phrase
+):
+    _tracked_repo(tmp_path, historical_file, phrase + "\n")
+
+    result = subprocess.run(
+        [str(SCANNER)], cwd=tmp_path, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        "GIT_AUTHOR_NAME='Named Maintainer'",
+        "GIT_AUTHOR_EMAIL='maintainer@example.test'",
+        "GIT_COMMITTER_NAME='Named Maintainer'",
+        "GIT_COMMITTER_EMAIL='maintainer@example.test'",
+    ),
+)
+def test_public_scan_rejects_git_identity_assignment_in_historical_plan(
+    tmp_path, assignment
+):
+    _tracked_repo(
+        tmp_path,
+        "docs/superpowers/plans/historical.md",
+        "```bash\n" + assignment + " git commit -m test\n```\n",
+    )
+
+    result = subprocess.run(
+        [str(SCANNER)], cwd=tmp_path, capture_output=True, text=True
+    )
+
+    assert result.returncode == 1
+    assert "hard-coded Git author identity found" in result.stdout
+
+
+def test_public_scan_allows_fictional_git_identity_in_test_fixture(tmp_path):
+    _tracked_repo(
+        tmp_path,
+        "tests/test_identity_example.py",
+        "GIT_AUTHOR_NAME = 'Fictional Test User'\n",
+    )
+
+    result = subprocess.run(
+        [str(SCANNER)], cwd=tmp_path, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_public_scan_does_not_depend_on_xargs_child_exit_normalization(tmp_path):
+    _tracked_repo(tmp_path, "README.md", "Public documentation.\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    xargs = bin_dir / "xargs"
+    xargs.write_text("#!/bin/sh\nexit 123\n", encoding="utf-8")
+    xargs.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+
+    result = subprocess.run(
+        [str(SCANNER)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
     )
 
     assert result.returncode == 0, result.stdout + result.stderr

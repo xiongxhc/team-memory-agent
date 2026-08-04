@@ -43,10 +43,9 @@ empty result is not proof that the channel is empty: missing
 `READ_MESSAGE_HISTORY` can return no history, and missing `MESSAGE_CONTENT` can
 hide user-authored content. The daily result surfaces that diagnostic.
 
-Feishu is an official option, not a legacy path. The existing private deployment
-remains Feishu-based and unchanged; enabling Slack in a separate public
-deployment does not migrate, replace, or reconfigure it. Public Slack remains
-optional and collects only human top-level messages in its allowlisted channels.
+Feishu is an official option, not a legacy path. Enabling Slack does not migrate,
+replace, or reconfigure Feishu; both remain opt-in and limited to explicitly
+allowlisted channels.
 
 GitLab merged-MR backfill is default-on because a commit can predate the daily
 lookback but become team-relevant when its MR lands. Operators may set

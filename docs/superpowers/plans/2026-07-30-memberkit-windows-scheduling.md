@@ -58,7 +58,7 @@ pytest, GitHub Actions
 - Scheduled runs never import push code, approve, commit, push, or transmit.
 - Existing member-edited and malformed draft preservation remains unchanged.
 - Unit tests never touch a production scheduler.
-- All commits use `Chris Xiong <xionghx713@gmail.com>`.
+- All commits use the repository-configured author and committer identity.
 - Do not push.
 
 ---

@@ -162,10 +162,9 @@ Discord's messages endpoint returns no history without
 `READ_MESSAGE_HISTORY`, while missing `MESSAGE_CONTENT` can empty content fields.
 An empty channel result therefore produces a diagnostic warning to verify both.
 
-Feishu is a first-class official provider. The private deployment remains
-Feishu-based and unchanged. Public Slack is an optional,
-top-level-message-only connector; the GitHub + Slack quick start neither
-reconfigures nor replaces the private deployment.
+Feishu is a first-class official provider. The GitHub and Slack quick start is
+only an example; enabling Slack neither reconfigures nor replaces another
+connector.
 
 ### Example GitHub + Slack mapping
 

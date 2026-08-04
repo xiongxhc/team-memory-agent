@@ -341,9 +341,9 @@ portable deployments and honors `Retry-After` when Slack returns it. Discord may
 return empty content or history when `READ_MESSAGE_HISTORY` or
 `MESSAGE_CONTENT` access is missing.
 
-Feishu remains a first-class official connector. The existing private deployment
-continues to use Feishu unchanged. Public Slack is an optional,
-top-level-message-only connector, not a migration or replacement.
+Feishu remains a first-class official connector. Slack is optional and
+top-level-message-only; enabling it neither disables nor reconfigures any other
+connector.
 
 GitLab merged-MR commit backfill is enabled by default. Set
 `collect_mr_commits: false` under `gitlab` in `connectors.yaml` to opt out of

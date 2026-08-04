@@ -1,4 +1,5 @@
-"""Regenerate the company vault from the ledger. The vault is a projection:
+"""Regenerate the team vault from the ledger.
+The vault is a projection:
 managed dirs (Person/, Projects/, Work Journal/, README.md) are deleted and
 rewritten on every render; anything else in the vault is never touched.
 Deterministic for a fixed (ledger, today): no wall-clock, no randomness.

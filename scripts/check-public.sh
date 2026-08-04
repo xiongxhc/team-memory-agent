@@ -27,6 +27,47 @@ if [ -n "$matches" ]; then
   exit 1
 fi
 
+private_wording_matches=
+for candidate in \
+  README.md docs/deployment.md docs/architecture.md docs/privacy.md teammem/render.py; do
+  if [ -f "$candidate" ]; then
+    private_wording_status=0
+    candidate_matches=$(git grep -niI -E \
+      -e 'existing private deployment' \
+      -e 'private internal deployment' \
+      -e 'company vault' \
+      -- "$candidate") || private_wording_status=$?
+    case "$private_wording_status" in
+      0|1) ;;
+      *) exit "$private_wording_status" ;;
+    esac
+    if [ -n "$candidate_matches" ]; then
+      private_wording_matches="${private_wording_matches}${private_wording_matches:+
+}${candidate_matches}"
+    fi
+  fi
+done
+
+if [ -n "$private_wording_matches" ]; then
+  printf '%s\n' "$private_wording_matches"
+  echo "private deployment wording found"
+  exit 1
+fi
+
+git_identity_status=0
+git_identity_matches=$(git grep -nI -E \
+  -e '(^|[[:space:]])GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)[[:space:]]*=' \
+  -- 'docs/superpowers/plans/*.md') || git_identity_status=$?
+case "$git_identity_status" in
+  0|1) ;;
+  *) exit "$git_identity_status" ;;
+esac
+if [ -n "$git_identity_matches" ]; then
+  printf '%s\n' "$git_identity_matches"
+  echo "hard-coded Git author identity found"
+  exit 1
+fi
+
 obsolete_schedule_claims=$(git grep -niI -E \
   -e '(teammem|team memory agent|hub|package|command)[^.]*(has no|lacks)[^.]*(built-in[[:space:]]+)?(hub[[:space:]]+)?schedul(e|ing)' \
   -e '(teammem|team memory agent|hub|package|command)[^.]*does not( yet)?[[:space:]]+(provide|include|support)[^.]*(built-in[[:space:]]+)?(hub[[:space:]]+)?schedul(e|ing)' \

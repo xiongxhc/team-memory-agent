@@ -66,10 +66,9 @@ DM/group-DM channels are rejected. Discord also skips bot and webhook messages;
 empty history carries a warning because it can mean missing
 `READ_MESSAGE_HISTORY` or `MESSAGE_CONTENT` access.
 
-Feishu remains a first-class official adapter. The existing private deployment
-continues to use Feishu and is not reconfigured, migrated, or replaced by the
-GitHub + Slack public quick start. Public Slack remains an optional,
-top-level-message-only adapter.
+Feishu remains a first-class official adapter. GitHub and Slack form only the
+public quick-start example; operators may enable any supported adapters
+independently.
 
 GitLab branch activity is collected directly with the bounded repository commit
 query. `collect_mr_commits` defaults to `true` and supplements that result with
