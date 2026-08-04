@@ -1,6 +1,6 @@
 [project]
 name = "teammem"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local-first team activity ledger, member-bundle importer, and Markdown renderer"
 readme = "README.md"
 license = "Apache-2.0"

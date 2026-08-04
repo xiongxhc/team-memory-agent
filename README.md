@@ -30,7 +30,7 @@ Ask the hub operator for:
 - your roster slug, such as `alex`;
 - the Git URL of the team-memory inbox, plus permission to push to it.
 
-MemberKit v0.3 reads local observations from
+MemberKit v0.4 reads local observations from
 [`claude-mem`](https://github.com/thedotmack/claude-mem). Its default database is
 `~/.claude-mem/claude-mem.db`. You also need Python 3.11 or newer, `pipx`, and Git.
 
@@ -184,7 +184,7 @@ default; package installation makes no provider request and creates no schedule.
 
 ### 1. Install the connector-capable hub
 
-The five-connector hub is version 0.3.0. The following source-checkout path keeps
+The five-connector hub is version 0.4.0. The following source-checkout path keeps
 the example configuration files beside the installation:
 
 ```bash
