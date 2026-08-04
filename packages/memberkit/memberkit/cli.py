@@ -4,7 +4,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
-from . import bundle, config
+from . import bundle, config, exclusions
 from .schedule import (
     DEFAULT_TIME,
     UnsupportedSchedulingPlatformError,
@@ -55,6 +55,23 @@ def main(argv: list[str] | None = None) -> int:
     schedule_sub.add_parser("status")
     schedule_sub.add_parser("remove")
     sub.add_parser("scheduled-run", help="prepare local drafts for the scheduler")
+    p_exclusions = sub.add_parser(
+        "exclusions",
+        help="inspect local project exclusion rules without changing drafts",
+    )
+    exclusions_sub = p_exclusions.add_subparsers(
+        dest="exclusions_cmd",
+        required=True,
+    )
+    exclusions_sub.add_parser("list", help="list configured exclusion rules")
+    p_preview = exclusions_sub.add_parser(
+        "preview",
+        help="show exclusion counts for a projected date",
+    )
+    p_preview.add_argument(
+        "--date",
+        help="YYYY-MM-DD (default: today in the member timezone)",
+    )
     args = parser.parse_args(argv)
 
     if args.cmd == "setup":
@@ -112,6 +129,34 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     cfg = config.load()
+    if args.cmd == "exclusions":
+        path = exclusions.rules_path(cfg.workdir)
+        rules = exclusions.load_rules(path)
+        print(f"rules {path}")
+        if args.exclusions_cmd == "list":
+            print(f"{len(rules)} rules")
+            for ordinal, rule in enumerate(rules, start=1):
+                print(f"{ordinal}  {rule.normalized()}")
+            return 0
+
+        timezone = cfg.timezone or bundle._local_timezone()
+        date_text = (
+            args.date
+            if args.date
+            else datetime.now(timezone).date().isoformat()
+        )
+        if not cfg.db.exists():
+            raise SystemExit(f"no claude-mem db at {cfg.db} — is claude-mem installed?")
+        data = bundle.draft(cfg.db, cfg.member, date_text, timezone=timezone)
+        bundle.validate_bundle(data, cfg.member, date_text)
+        result = exclusions.apply_rules(data["events"], rules)
+        print(f"eligible {len(data['events'])}")
+        for ordinal, count in enumerate(result.rule_counts, start=1):
+            print(f"rule {ordinal} excluded {count}")
+        print(f"excluded {result.excluded_count}")
+        print(f"remaining {len(result.included)}")
+        return 0
+
     timezone = cfg.timezone or bundle._local_timezone()
     date_text = (
         args.date
@@ -140,10 +185,11 @@ def main(argv: list[str] | None = None) -> int:
         DraftState(cfg.workdir / "state.json").dismiss(date_text)
         print(f"dismissed {date_text}; pending events excluded")
     elif args.cmd == "draft":
-        if not cfg.db.exists():
-            raise SystemExit(f"no claude-mem db at {cfg.db} — is claude-mem installed?")
         if out.exists() and not args.force:
             raise SystemExit(f"{out} exists (possibly member-edited) — use --force to overwrite")
+        rules = exclusions.load_rules(exclusions.rules_path(cfg.workdir))
+        if not cfg.db.exists():
+            raise SystemExit(f"no claude-mem db at {cfg.db} — is claude-mem installed?")
         data = bundle.draft(
             cfg.db,
             cfg.member,
@@ -152,13 +198,15 @@ def main(argv: list[str] | None = None) -> int:
             timezone=timezone,
         )
         bundle.validate_bundle(data, cfg.member, date_text)
+        result = exclusions.apply_rules(data["events"], rules)
         data["events"] = DraftState(cfg.workdir / "state.json").refresh(
-            date_text, data["events"], current=None
+            date_text, result.included, current=None
         )
         data["journal_md"] = bundle.render_journal(data["events"], date_text)
         bundle.validate_bundle(data, cfg.member, date_text)
         out.parent.mkdir(parents=True, exist_ok=True)
         bundle.write_bundle(out, data)
+        print(f"excluded {result.excluded_count} events")
         print(f"drafted {len(data['events'])} events -> {out}")
         print("review before pushing: memberkit review")
     elif args.cmd == "review":

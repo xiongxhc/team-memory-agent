@@ -14,7 +14,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from . import bundle
+from . import bundle, exclusions
 from .config import Config
 from .state import DraftState
 
@@ -31,6 +31,12 @@ class ScheduleStatus:
     installed: bool
     path: Path
     time: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingPreparation:
+    pending_dates: list[str]
+    excluded_counts: tuple[tuple[str, int], ...]
 
 
 def _backend(platform: str | None) -> Literal["macos", "windows"]:
@@ -255,10 +261,12 @@ def _prepare_pending(
     config: Config,
     now: datetime,
     timezone: Any,
-) -> list[str]:
+    rules: tuple[exclusions.ExclusionRule, ...],
+) -> PendingPreparation:
     state = DraftState(config.workdir / "state.json")
     output_dir = config.workdir / "out"
     pending_dates: list[str] = []
+    excluded_counts: list[tuple[str, int]] = []
 
     for day in ((now.date() - timedelta(days=1)), now.date()):
         date_text = day.isoformat()
@@ -282,7 +290,9 @@ def _prepare_pending(
             timezone=timezone,
         )
         bundle.validate_bundle(discovered, config.member, date_text)
-        events = state.refresh(date_text, discovered["events"], current=None)
+        result = exclusions.apply_rules(discovered["events"], rules)
+        excluded_counts.append((date_text, result.excluded_count))
+        events = state.refresh(date_text, result.included, current=None)
         if not events:
             continue
         data = {
@@ -297,7 +307,10 @@ def _prepare_pending(
         bundle.write_bundle(path, data)
         pending_dates.append(date_text)
 
-    return sorted(set(pending_dates) | set(state.pending_dates()))
+    return PendingPreparation(
+        sorted(set(pending_dates) | set(state.pending_dates())),
+        tuple(excluded_counts),
+    )
 
 
 def scheduled_run(
@@ -315,9 +328,11 @@ def scheduled_run(
     normalized_now, timezone = _normalize_run_time(config, now, timezone)
     invoked = normalized_now.isoformat(timespec="seconds")
     try:
+        rules = exclusions.load_rules(exclusions.rules_path(config.workdir))
+        prepared = _prepare_pending(config, normalized_now, timezone, rules)
         pending_dates = [
             date
-            for date in _prepare_pending(config, normalized_now, timezone)
+            for date in prepared.pending_dates
             if _is_strict_iso_date(date)
         ]
     except Exception as exc:
@@ -330,10 +345,17 @@ def scheduled_run(
 
     if selected == "win32":
         rendered_dates = ",".join(pending_dates) if pending_dates else "none"
+        excluded = ",".join(
+            f"{date_text}:{count}"
+            for date_text, count in prepared.excluded_counts
+        ) or "none"
         _safe_append_log(
             config.workdir / "schedule.log",
-            f"invoked={invoked} dates={rendered_dates}",
+            f"invoked={invoked} dates={rendered_dates} excluded={excluded}",
         )
+    else:
+        for date_text, count in prepared.excluded_counts:
+            print(f"{date_text}: excluded {count} events")
     if notify:
         reminder_failure = _notify_pending(
             pending_dates,

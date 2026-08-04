@@ -272,7 +272,7 @@ def test_draft_uses_only_frozen_v1_fields_from_rich_observation_rows(tmp_path):
     iso = "2026-07-24T09:00:00+04:00"
     row = (
         "sdk", "SESSION_SENTINEL", "Visible title", "SUBTITLE_SENTINEL",
-        "NARRATIVE_SENTINEL", "FACTS_SENTINEL", "TYPE_SENTINEL",
+        "REGEX_ONLY_SENTINEL", "FACTS_SENTINEL", "TYPE_SENTINEL",
         iso, epoch(iso),
     )
 
@@ -289,7 +289,7 @@ def test_draft_uses_only_frozen_v1_fields_from_rich_observation_rows(tmp_path):
         "refs": None,
     }]
     assert set(out["events"][0]) == {"ts", "kind", "summary", "project", "refs"}
-    assert "SENTINEL" not in repr(out)
+    assert "REGEX_ONLY_SENTINEL" not in repr(out)
 
 
 def test_draft_uses_member_timezone_for_day_bounds_and_event_timestamps(tmp_path):

@@ -3,15 +3,224 @@ import json
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from memberkit import cli, schedule
+from memberkit import cli, exclusions, schedule
 from memberkit.config import Config
 from memberkit.state import DraftState, event_fingerprint
+
+
+def _exclusion_cfg(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cfg = _setup_cfg(tmp_path)
+    con = sqlite3.connect(cfg.db)
+    con.execute(
+        "CREATE TABLE observations (project TEXT, title TEXT, subtitle TEXT,"
+        " narrative TEXT, type TEXT, created_at TEXT, created_at_epoch INTEGER)"
+    )
+    rows = [
+        ("exact", "Exact match", None, None, "change", "2026-07-27T08:00:00",
+         int(datetime.fromisoformat("2026-07-27T08:00:00").astimezone().timestamp() * 1000)),
+        ("prefix-child", "Prefix match", None, None, "change", "2026-07-27T09:00:00",
+         int(datetime.fromisoformat("2026-07-27T09:00:00").astimezone().timestamp() * 1000)),
+        ("regex", "Filter me", None, None, "change", "2026-07-27T10:00:00",
+         int(datetime.fromisoformat("2026-07-27T10:00:00").astimezone().timestamp() * 1000)),
+        (None, "Regex project null", None, None, "change", "2026-07-27T11:00:00",
+         int(datetime.fromisoformat("2026-07-27T11:00:00").astimezone().timestamp() * 1000)),
+        ("kept", "Keep", None, None, "change", "2026-07-27T12:00:00",
+         int(datetime.fromisoformat("2026-07-27T12:00:00").astimezone().timestamp() * 1000)),
+        ("narrative", None, None, "Narrative sentinel", "change", "2026-07-27T13:00:00",
+         int(datetime.fromisoformat("2026-07-27T13:00:00").astimezone().timestamp() * 1000)),
+    ]
+    con.executemany("INSERT INTO observations VALUES (?,?,?,?,?,?,?)", rows)
+    con.commit()
+    con.close()
+    return cfg
+
+
+def _write_exclusion_rules(cfg, text):
+    cfg.workdir.mkdir(parents=True, exist_ok=True)
+    (cfg.workdir / "exclude-projects.txt").write_text(text, encoding="utf-8")
+
+
+def test_direct_draft_filters_rules_before_state_for_normal_all_and_force(
+    tmp_path, monkeypatch, capsys,
+):
+    cfg = _exclusion_cfg(tmp_path)
+    _write_exclusion_rules(
+        cfg,
+        "exact\nprefix*\nregex ~ filter me\nnarrative ~ narrative sentinel\n",
+    )
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+
+    assert cli.main(["draft", "--date", "2026-07-27"]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    state = DraftState(cfg.workdir / "state.json").snapshot()
+    assert [item["summary"] for item in payload["events"]] == [
+        "Regex project null", "Keep",
+    ]
+    assert payload["journal_md"] == (
+        "## 2026-07-27\n\n### general\n- Regex project null\n\n### kept\n- Keep"
+    )
+    excluded_events = [
+        item for item in cli.bundle.draft(cfg.db, cfg.member, "2026-07-27")["events"]
+        if item["summary"] in {
+            "Exact match", "Prefix match", "Filter me", "Narrative sentinel",
+        }
+    ]
+    assert all(
+        event_fingerprint(item, "2026-07-27") not in state["pending"]["2026-07-27"]
+        for item in excluded_events
+    )
+    assert "excluded 4 events" in capsys.readouterr().out
+
+    assert cli.main(["draft", "--date", "2026-07-27", "--all", "--force"]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert [item["summary"] for item in payload["events"]] == [
+        "Regex project null", "Keep",
+    ]
+    assert "excluded 4 events" in capsys.readouterr().out
+
+    assert cli.main(["draft", "--date", "2026-07-27", "--force"]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert [item["summary"] for item in payload["events"]] == [
+        "Regex project null", "Keep",
+    ]
+    assert "excluded 4 events" in capsys.readouterr().out
+
+
+def test_force_draft_restores_source_event_after_rule_removal(tmp_path, monkeypatch):
+    cfg = _exclusion_cfg(tmp_path)
+    _write_exclusion_rules(cfg, "exact\n")
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+
+    assert cli.main(["draft", "--date", "2026-07-27"]) == 0
+    assert "Exact match" not in [
+        item["summary"] for item in json.loads(out.read_text(encoding="utf-8"))["events"]
+    ]
+
+    (cfg.workdir / "exclude-projects.txt").unlink()
+    assert cli.main(["draft", "--date", "2026-07-27", "--force"]) == 0
+    assert "Exact match" in [
+        item["summary"] for item in json.loads(out.read_text(encoding="utf-8"))["events"]
+    ]
+
+
+def test_direct_draft_writes_empty_bundle_when_all_events_are_excluded(
+    tmp_path, monkeypatch, capsys,
+):
+    cfg = _setup_cfg(tmp_path, timezone=ZoneInfo("UTC"))
+    con = sqlite3.connect(cfg.db)
+    con.execute(
+        "CREATE TABLE observations (project TEXT, title TEXT, subtitle TEXT,"
+        " narrative TEXT, type TEXT, created_at TEXT, created_at_epoch INTEGER)"
+    )
+    con.executemany(
+        "INSERT INTO observations VALUES (?,?,?,?,?,?,?)",
+        [
+            (
+                "exact", "Exact match", None, None, "change",
+                "2026-07-27T08:00:00",
+                int(
+                    datetime(2026, 7, 27, 8, tzinfo=timezone.utc).timestamp()
+                    * 1000
+                ),
+            ),
+            (
+                "prefix-child", "Prefix match", None, None, "change",
+                "2026-07-27T09:00:00",
+                int(
+                    datetime(2026, 7, 27, 9, tzinfo=timezone.utc).timestamp()
+                    * 1000
+                ),
+            ),
+        ],
+    )
+    con.commit()
+    con.close()
+    _write_exclusion_rules(cfg, "exact\nprefix*\n")
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+
+    assert cli.main(["draft", "--date", "2026-07-27"]) == 0
+
+    out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["events"] == []
+    assert payload["journal_md"] == "## 2026-07-27"
+    assert "excluded 2 events" in capsys.readouterr().out
+
+
+def test_invalid_rule_file_preserves_state_and_bundle_and_creates_no_new_files(
+    tmp_path, monkeypatch,
+):
+    cfg = _exclusion_cfg(tmp_path)
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    _write_exclusion_rules(cfg, "exact\nregex ~ [\n")
+    out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    out.parent.mkdir(parents=True)
+    original_bundle = b'{"events": [member edit in progress'
+    out.write_bytes(original_bundle)
+    state_path = cfg.workdir / "state.json"
+    original_state = b'{"approved":["keep"]}\n'
+    state_path.write_bytes(original_state)
+
+    with pytest.raises(exclusions.RuleFileError, match="invalid regular expression"):
+        cli.main(["draft", "--date", "2026-07-27", "--force"])
+
+    assert out.read_bytes() == original_bundle
+    assert state_path.read_bytes() == original_state
+
+    clean_cfg = _exclusion_cfg(tmp_path / "clean")
+    _write_exclusion_rules(clean_cfg, "exact\nregex ~ [\n")
+    monkeypatch.setattr(cli.config, "load", lambda: clean_cfg)
+    with pytest.raises(exclusions.RuleFileError, match="invalid regular expression"):
+        cli.main(["draft", "--date", "2026-07-27"])
+    assert not (clean_cfg.workdir / "out").exists()
+    assert not (clean_cfg.workdir / "state.json").exists()
+
+
+def test_invalid_rules_precede_missing_database_without_a_destination(
+    tmp_path, monkeypatch,
+):
+    cfg = _setup_cfg(tmp_path)
+    _write_exclusion_rules(cfg, "project ~ [\n")
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+
+    with pytest.raises(exclusions.RuleFileError, match="invalid regular expression"):
+        cli.main(["draft", "--date", "2026-07-27"])
+
+    assert not (cfg.workdir / "out").exists()
+    assert not (cfg.workdir / "state.json").exists()
+
+
+def test_invalid_regex_cli_traceback_is_sanitized(tmp_path, monkeypatch):
+    secret = "private_cli_regex_secret_47a9"
+    cfg = _setup_cfg(tmp_path)
+    _write_exclusion_rules(cfg, f"private-project ~ [{secret}\n")
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+
+    with pytest.raises(exclusions.RuleFileError) as raised:
+        cli.main(["exclusions", "list"])
+
+    error = raised.value
+    formatted = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert type(error) is exclusions.RuleFileError
+    assert error.path == cfg.workdir / "exclude-projects.txt"
+    assert error.line == 1
+    assert error.category == "invalid regular expression"
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert secret not in formatted
+    assert "unterminated character set" not in formatted
 
 
 def test_draft_command_records_pending_review_state(tmp_path, monkeypatch):
@@ -138,8 +347,8 @@ def test_draft_preserves_existing_bytes_unless_force_is_explicit(
     tmp_path, monkeypatch,
 ):
     cfg = _setup_cfg(tmp_path)
-    cfg.db.touch()
     monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    _write_exclusion_rules(cfg, "project ~ [\n")
     out = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
     out.parent.mkdir(parents=True)
     original = b'{"events": [member edit in progress'
@@ -165,6 +374,8 @@ def test_draft_preserves_existing_bytes_unless_force_is_explicit(
         "draft",
         lambda *args, **kwargs: replacement,
     )
+    (cfg.workdir / "exclude-projects.txt").unlink()
+    cfg.db.touch()
 
     assert cli.main(["draft", "--date", "2026-07-27", "--force"]) == 0
     assert json.loads(out.read_text(encoding="utf-8")) == replacement
@@ -619,3 +830,198 @@ def test_importing_cli_does_not_import_push_module():
     )
 
     assert result.stdout.strip() == "False"
+
+
+def test_exclusions_list_reports_missing_rules_without_creating_workdir_or_opening_db(
+    tmp_path, monkeypatch, capsys,
+):
+    cfg = _setup_cfg(tmp_path)
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+
+    assert cli.main(["exclusions", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert str(cfg.workdir / "exclude-projects.txt") in output
+    assert "0 rules" in output
+    assert not cfg.workdir.exists()
+    assert not cfg.db.exists()
+
+
+def test_exclusions_list_prints_normalized_rules_in_source_order(
+    tmp_path, monkeypatch, capsys,
+):
+    cfg = _setup_cfg(tmp_path)
+    _write_exclusion_rules(
+        cfg,
+        "  exact-project\nproject-prefix*\nregex-project ~ keep only these words\n",
+    )
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+
+    assert cli.main(["exclusions", "list"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        f"rules {cfg.workdir / 'exclude-projects.txt'}",
+        "3 rules",
+        "1  exact-project",
+        "2  project-prefix*",
+        "3  regex-project ~ keep only these words",
+    ]
+
+
+def _preview_bundle(member, date):
+    return {
+        "schema": cli.bundle.SCHEMA,
+        "member": member,
+        "date": date,
+        "events": [
+            {
+                **_review_event("private observation summary"),
+                "project": "private-project",
+            },
+            {
+                **_review_event("prefix private observation summary"),
+                "project": "private-child",
+            },
+            {
+                **_review_event("sensitive detail"),
+                "project": "regex-project",
+            },
+            {
+                **_review_event("remaining observation"),
+                "project": "included-project",
+            },
+        ],
+        "journal_md": "stale but valid type",
+    }
+
+
+def test_exclusions_preview_reports_only_counts_without_side_effects(
+    tmp_path, monkeypatch, capsys,
+):
+    from memberkit import push as push_mod
+
+    cfg = _setup_cfg(tmp_path)
+    cfg.db.touch()
+    _write_exclusion_rules(
+        cfg,
+        "private-project\nprivate*\nregex-project ~ sensitive\n",
+    )
+    state_path = cfg.workdir / "state.json"
+    state_path.write_bytes(b'{"pending": {}}\n')
+    out_path = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
+    out_path.parent.mkdir(exist_ok=True)
+    out_path.write_bytes(b'{"member edit": true}\n')
+    original_state = state_path.read_bytes()
+    original_bundle = out_path.read_bytes()
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    monkeypatch.setattr(
+        cli.bundle,
+        "draft",
+        lambda *_args, **_kwargs: _preview_bundle(cfg.member, "2026-07-27"),
+    )
+    monkeypatch.setattr(
+        cli.bundle,
+        "write_bundle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preview must not write a bundle")
+        ),
+    )
+    monkeypatch.setattr(
+        DraftState,
+        "refresh",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preview must not update draft state")
+        ),
+    )
+    monkeypatch.setattr(
+        schedule,
+        "_notify_pending",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preview must not notify")
+        ),
+    )
+    monkeypatch.setattr(
+        push_mod,
+        "push",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preview must not push")
+        ),
+    )
+
+    assert cli.main(["exclusions", "preview", "--date", "2026-07-27"]) == 0
+
+    captured = capsys.readouterr().out
+    assert str(cfg.workdir / "exclude-projects.txt") in captured
+    assert "eligible 4" in captured
+    assert "rule 1 excluded 1" in captured
+    assert "rule 2 excluded 1" in captured
+    assert "rule 3 excluded 1" in captured
+    assert "excluded 3" in captured
+    assert "remaining 1" in captured
+    assert "private observation summary" not in captured
+    assert "sensitive detail" not in captured
+    assert state_path.read_bytes() == original_state
+    assert out_path.read_bytes() == original_bundle
+
+
+def test_exclusions_preview_validates_frozen_v1_before_matching(tmp_path, monkeypatch):
+    cfg = _setup_cfg(tmp_path)
+    cfg.db.touch()
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    monkeypatch.setattr(
+        cli.bundle,
+        "draft",
+        lambda *_args, **_kwargs: {"events": []},
+    )
+    monkeypatch.setattr(
+        exclusions,
+        "apply_rules",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preview must validate before matching")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exact frozen-v1 fields"):
+        cli.main(["exclusions", "preview", "--date", "2026-07-27"])
+
+
+def test_exclusions_preview_uses_member_timezone_for_default_date(tmp_path, monkeypatch):
+    cfg = _setup_cfg(tmp_path, timezone=ZoneInfo("America/Los_Angeles"))
+    cfg.db.touch()
+    dates = []
+
+    class FrozenDatetime:
+        @classmethod
+        def now(cls, timezone):
+            assert timezone == cfg.timezone
+            return datetime(2026, 7, 28, 0, 30, tzinfo=timezone)
+
+    def draft(_db, member, date, *, timezone):
+        dates.append((member, date, timezone))
+        return _preview_bundle(member, date)
+
+    monkeypatch.setattr(cli.config, "load", lambda: cfg)
+    monkeypatch.setattr(cli, "datetime", FrozenDatetime)
+    monkeypatch.setattr(cli.bundle, "draft", draft)
+
+    assert cli.main(["exclusions", "preview"]) == 0
+
+    assert dates == [(cfg.member, "2026-07-28", cfg.timezone)]
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32", "linux"])
+def test_exclusions_help_does_not_load_platform_backend(platform, monkeypatch, capsys):
+    monkeypatch.setattr(schedule.sys, "platform", platform)
+    monkeypatch.setattr(
+        schedule,
+        "_load_backend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exclusions help must not load a platform backend")
+        ),
+    )
+
+    with pytest.raises(SystemExit) as error:
+        cli.main(["exclusions", "--help"])
+
+    assert error.value.code == 0
+    assert "preview" in capsys.readouterr().out

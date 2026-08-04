@@ -174,6 +174,45 @@ memberkit dismiss --date YYYY-MM-DD
 
 Removed and dismissed events remain excluded from later catch-up drafts.
 
+## Project exclusions
+
+Create `MEMBERKIT_WORKDIR/exclude-projects.txt` with one exact project,
+trailing-star project prefix, or `project ~ regular-expression` per line. Exact
+and prefix projects are case-sensitive. Regex project matching is case-sensitive;
+its search against the final frozen-v1 summary is case-insensitive. Inspect the
+resolved file and preview the count-only result before relying on an unattended
+schedule:
+
+```bash
+memberkit exclusions list
+memberkit exclusions preview --date YYYY-MM-DD
+```
+
+MemberKit parses the complete file once per invocation. An unreadable file,
+invalid UTF-8, malformed syntax, C0/DEL control character, or invalid regular
+expression fails closed before any bundle or review-state write. A scheduled run
+with one of these errors sends no success notification.
+
+Rules affect newly generated drafts and explicit forced regenerations only.
+`memberkit draft --all` also applies them. A direct draft where every event is
+filtered remains a valid empty bundle file, but a scheduled all-filtered date does
+not create a pending draft. Changing the rule file never re-filters an existing
+draft, including a member-edited draft; `memberkit review` and `memberkit push`
+keep the already-created event list authoritative.
+
+Rule-filtered observations never enter approved, excluded, or pending
+fingerprints. Removing or narrowing a rule and running `memberkit draft --force`
+can restore an otherwise eligible observation, unless it was independently
+approved, dismissed, manually excluded, deleted, or is no longer eligible.
+
+Native schedules invoke `memberkit scheduled-run` directly, without a wrapper or
+rule-file argument, so ordinary rule edits require no schedule reinstall. Only a
+released-package verification may replace a wrapper or reinstall an existing
+wrapper-based schedule; that migration is separate from local rule updates. After
+a released package is available, test the rules against a disposable or new-date
+draft and obtain authorization before replacing an existing wrapper-based
+schedule.
+
 ## Timing and catch-up
 
 The default launchd or Task Scheduler trigger is 17:30 in the host's local

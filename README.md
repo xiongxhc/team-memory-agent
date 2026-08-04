@@ -18,6 +18,8 @@ member reviews it, and nothing is transmitted until that member explicitly runs
 
 MemberKit is a standalone command-line package, not a skill. Members install only
 `teammem-memberkit`; they do not clone this repository or install the hub.
+It can locally exclude configured projects or summary patterns from newly
+generated drafts; see the [MemberKit guide](docs/member-guide.md#project-exclusions).
 
 ## Member quick start
 

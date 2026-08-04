@@ -64,10 +64,10 @@ def runtime_config(tmp_path, rows=()):
     )
 
 
-def runtime_row(title, iso):
+def runtime_row(title, iso, project="project-alpha"):
     instant = datetime.fromisoformat(iso).replace(tzinfo=ZoneInfo("UTC"))
     return (
-        "project-alpha",
+        project,
         title,
         None,
         None,
@@ -370,6 +370,60 @@ def test_windows_scheduled_run_keeps_positional_contract_and_logs_safe_success(
     assert "secret event summary" not in log
     assert "journal" not in log
     assert "memberkit.push" not in sys.modules
+
+
+def test_windows_scheduled_run_logs_exclusion_counts_without_private_content(
+    tmp_path,
+):
+    """Catches Windows operational output exposing excluded event content."""
+    cfg = runtime_config(
+        tmp_path,
+        [runtime_row("private summary", "2026-07-27T12:00:00", "private")],
+    )
+    cfg.workdir.mkdir(parents=True)
+    (cfg.workdir / "exclude-projects.txt").write_text(
+        "private\n",
+        encoding="utf-8",
+    )
+
+    pending = schedule.scheduled_run(
+        cfg,
+        datetime(2026, 7, 28, 18, 0),
+        notify=False,
+        timezone=ZoneInfo("UTC"),
+        platform="win32",
+    )
+
+    assert pending == []
+    log = (cfg.workdir / "schedule.log").read_text(encoding="utf-8")
+    assert "excluded=2026-07-27:1,2026-07-28:0" in log
+    assert "private summary" not in log
+    assert "private" not in log
+    assert not (cfg.workdir / "schedule.err").exists()
+
+
+def test_windows_scheduled_run_logs_invalid_rules_by_class_only(tmp_path):
+    """Catches Windows error output exposing invalid exclusion-rule contents."""
+    cfg = runtime_config(tmp_path)
+    cfg.workdir.mkdir(parents=True)
+    (cfg.workdir / "exclude-projects.txt").write_text(
+        "private*summary*\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid project pattern"):
+        schedule.scheduled_run(
+            cfg,
+            datetime(2026, 7, 28, 18, 0),
+            notify=False,
+            timezone=ZoneInfo("UTC"),
+            platform="win32",
+        )
+
+    error = (cfg.workdir / "schedule.err").read_text(encoding="utf-8")
+    assert "phase=draft error=RuleFileError" in error
+    assert "private" not in error
+    assert "summary" not in error
 
 
 def test_windows_scheduled_run_logs_fixed_reminder_failure_and_returns_dates(

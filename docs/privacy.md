@@ -90,6 +90,21 @@ MemberKit work directory (`~/.memberkit` by default). Private configuration is
 stored separately at `~/.config/teammem/memberkit.env` with user-only
 permissions. Uninstalling the package does not delete these member-owned files.
 
+### Local project exclusion rules
+
+`MEMBERKIT_WORKDIR/exclude-projects.txt` is a local trusted-rule file. It can
+exclude exact projects, project prefixes, or regular-expression matches against
+the final frozen-v1 summary only; it does not inspect raw rows or full narratives.
+`memberkit exclusions list` prints the resolved rule path, total count, and
+member-authored normalized rules. `memberkit exclusions preview` and scheduled
+diagnostics are count-only; neither prints matched observation or event content.
+Rules never cause an automatic push.
+
+Regular expressions are trusted local input, not a sandbox. A member who can edit
+the rule file can intentionally configure a pathological expression that consumes
+local processing time; protect the work directory accordingly and review rules
+before relying on an unattended schedule.
+
 ## Manual fallback for unsupported sources
 
 For WhatsApp, Telegram, LINE, email, a meeting, or another unsupported source, a

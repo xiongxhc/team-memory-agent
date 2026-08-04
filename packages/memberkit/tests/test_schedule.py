@@ -40,9 +40,9 @@ def _cfg(tmp_path, rows=()):
     )
 
 
-def _row(title, iso):
+def _row(title, iso, project="project-alpha"):
     return (
-        "project-alpha", title, None, None, "feature", iso,
+        project, title, None, None, "feature", iso,
         int(datetime.fromisoformat(iso).astimezone().timestamp() * 1000),
     )
 
@@ -52,6 +52,14 @@ def _local_ts(iso):
         _row("", iso)[-1] / 1000,
         tz=bundle._local_timezone(),
     ).isoformat(timespec="milliseconds")
+
+
+def _write_matching_exclusion_rule(cfg, project="project-alpha"):
+    cfg.workdir.mkdir(parents=True, exist_ok=True)
+    (cfg.workdir / "exclude-projects.txt").write_text(
+        f"{project}\n",
+        encoding="utf-8",
+    )
 
 
 @pytest.mark.parametrize(
@@ -386,6 +394,112 @@ def test_scheduled_run_writes_every_eligible_observation(tmp_path):
     ]
 
 
+def test_scheduled_run_filters_missing_drafts_and_skips_all_excluded_dates(
+    tmp_path,
+):
+    """Catches missing scheduled drafts ignoring local project exclusions."""
+    cfg = _cfg(
+        tmp_path,
+        [
+            _row("private scheduled event", "2026-07-27T10:00:00", "private"),
+            _row("included scheduled event", "2026-07-27T11:00:00"),
+            _row("private today", "2026-07-28T10:00:00", "private"),
+        ],
+    )
+    rules = cfg.workdir / "exclude-projects.txt"
+    rules.parent.mkdir(parents=True)
+    rules.write_text("private\n", encoding="utf-8")
+
+    pending = scheduled_run(
+        cfg, datetime(2026, 7, 28, 17, 30), notify=False
+    )
+
+    assert pending == ["2026-07-27"]
+    yesterday = json.loads(
+        (cfg.workdir / "out" / "bundle-alex-2026-07-27.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [event["summary"] for event in yesterday["events"]] == [
+        "included scheduled event"
+    ]
+    assert not (
+        cfg.workdir / "out" / "bundle-alex-2026-07-28.json"
+    ).exists()
+    assert "2026-07-28" not in DraftState(
+        cfg.workdir / "state.json"
+    ).snapshot()["pending"]
+
+
+def test_scheduled_run_prints_exclusion_counts_for_missing_draft_dates(
+    tmp_path,
+    capsys,
+):
+    """Catches local scheduled output omitting generated-date exclusion counts."""
+    cfg = _cfg(
+        tmp_path,
+        [_row("private scheduled event", "2026-07-27T10:00:00", "private")],
+    )
+    cfg.workdir.mkdir(parents=True)
+    (cfg.workdir / "exclude-projects.txt").write_text(
+        "private\n",
+        encoding="utf-8",
+    )
+
+    scheduled_run(cfg, datetime(2026, 7, 28, 17, 30), notify=False)
+
+    assert capsys.readouterr().out.splitlines() == [
+        "2026-07-27: excluded 1 events",
+        "2026-07-28: excluded 0 events",
+    ]
+
+
+def test_scheduled_run_validates_rules_before_changing_state_or_drafts(
+    tmp_path,
+    monkeypatch,
+):
+    """Catches malformed rules reaching draft or state handling first."""
+    cfg = _cfg(tmp_path, [_row("Discovered", "2026-07-27T10:00:00")])
+    state = DraftState(cfg.workdir / "state.json")
+    previous = {
+        "ts": "2026-07-20T10:00:00",
+        "kind": "journal-highlight",
+        "summary": "Earlier pending",
+        "project": "project-alpha",
+        "refs": None,
+    }
+    state.refresh("2026-07-20", [previous], current=None)
+    state_before = (cfg.workdir / "state.json").read_bytes()
+    output_dir = cfg.workdir / "out"
+    output_dir.mkdir(parents=True)
+    yesterday = output_dir / "bundle-alex-2026-07-27.json"
+    today = output_dir / "bundle-alex-2026-07-28.json"
+    yesterday_before = b'{"member edit":"yesterday"}\n'
+    today_before = b'{"member edit":"today"}\n'
+    yesterday.write_bytes(yesterday_before)
+    today.write_bytes(today_before)
+    (cfg.workdir / "exclude-projects.txt").write_text(
+        "bad*pattern*\n",
+        encoding="utf-8",
+    )
+    notified = []
+    monkeypatch.setattr(
+        schedule,
+        "_notify_pending",
+        lambda dates, **kwargs: notified.append((dates, kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="invalid project pattern"):
+        scheduled_run(
+            cfg, datetime(2026, 7, 28, 17, 30), notify=True
+        )
+
+    assert (cfg.workdir / "state.json").read_bytes() == state_before
+    assert yesterday.read_bytes() == yesterday_before
+    assert today.read_bytes() == today_before
+    assert notified == []
+
+
 def test_scheduled_run_preserves_exact_duplicate_observations(tmp_path):
     row = _row("Same observation", "2026-07-27T10:00:00")
     cfg = _cfg(tmp_path, [row, row])
@@ -463,8 +577,9 @@ def test_scheduled_run_never_overwrites_invalid_member_edited_draft(tmp_path):
     )
     path = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
     path.parent.mkdir(parents=True)
-    edited = b'{"events": [member edit in progress'
+    edited = b'{"events": [{"project":"project-alpha"}'
     path.write_bytes(edited)
+    _write_matching_exclusion_rule(cfg)
 
     pending = scheduled_run(
         cfg,
@@ -475,6 +590,11 @@ def test_scheduled_run_never_overwrites_invalid_member_edited_draft(tmp_path):
 
     assert "2026-07-27" in pending
     assert path.read_bytes() == edited
+    assert DraftState(cfg.workdir / "state.json").snapshot() == {
+        "approved": [],
+        "excluded": [],
+        "pending": {},
+    }
 
 
 def test_scheduled_run_preserves_non_utf8_draft_and_processes_other_date(
@@ -482,12 +602,19 @@ def test_scheduled_run_preserves_non_utf8_draft_and_processes_other_date(
 ):
     cfg = _cfg(
         tmp_path,
-        [_row("Tuesday eligible", "2026-07-28T09:00:00")],
+        [
+            _row(
+                "Tuesday eligible",
+                "2026-07-28T09:00:00",
+                "included-project",
+            )
+        ],
     )
     malformed = cfg.workdir / "out" / "bundle-alex-2026-07-27.json"
     malformed.parent.mkdir(parents=True)
-    original = b"\xff\xfe\x00member edit in progress"
+    original = b'\xff{"project":"project-alpha"} member edit in progress'
     malformed.write_bytes(original)
+    _write_matching_exclusion_rule(cfg)
 
     pending = scheduled_run(
         cfg,
@@ -498,6 +625,9 @@ def test_scheduled_run_preserves_non_utf8_draft_and_processes_other_date(
 
     assert pending == ["2026-07-27", "2026-07-28"]
     assert malformed.read_bytes() == original
+    assert DraftState(cfg.workdir / "state.json").pending_dates() == [
+        "2026-07-28"
+    ]
     created = (
         cfg.workdir / "out" / "bundle-alex-2026-07-28.json"
     ).read_text(encoding="utf-8")
@@ -518,6 +648,7 @@ def test_scheduled_run_never_overwrites_valid_member_edited_draft(tmp_path):
         b'"project":"project-alpha","refs":null}],"journal_md":"manual"}\n'
     )
     path.write_bytes(edited)
+    _write_matching_exclusion_rule(cfg)
 
     pending = scheduled_run(
         cfg,
@@ -528,6 +659,9 @@ def test_scheduled_run_never_overwrites_valid_member_edited_draft(tmp_path):
 
     assert "2026-07-27" in pending
     assert path.read_bytes() == edited
+    assert DraftState(cfg.workdir / "state.json").pending_dates() == [
+        "2026-07-27"
+    ]
 
 
 @pytest.mark.parametrize("invalid_event", ["extra-key", "wrong-kind"])
@@ -556,6 +690,7 @@ def test_scheduled_run_preserves_and_reports_non_frozen_existing_draft(
         "journal_md": "manual",
     }, separators=(",", ":")) + "\n").encode()
     path.write_bytes(edited)
+    _write_matching_exclusion_rule(cfg)
 
     pending = scheduled_run(
         cfg, datetime.fromisoformat("2026-07-28T17:30:00"), notify=False
@@ -563,6 +698,11 @@ def test_scheduled_run_preserves_and_reports_non_frozen_existing_draft(
 
     assert "2026-07-27" in pending
     assert path.read_bytes() == edited
+    assert DraftState(cfg.workdir / "state.json").snapshot() == {
+        "approved": [],
+        "excluded": [],
+        "pending": {},
+    }
     assert DraftState(cfg.workdir / "state.json").snapshot() == {
         "approved": [],
         "excluded": [],

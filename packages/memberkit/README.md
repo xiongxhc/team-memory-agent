@@ -84,6 +84,34 @@ memberkit dismiss --date YYYY-MM-DD
 Removed events stay excluded from catch-up drafts. Invalid member-edited drafts are
 left untouched, and MemberKit never pushes automatically.
 
+## Project exclusions
+
+Create `MEMBERKIT_WORKDIR/exclude-projects.txt` with one exact project,
+trailing-star project prefix, or `project ~ regular-expression` per line. Exact
+and prefix projects are case-sensitive. Regex project matching is case-sensitive;
+its search against the final frozen-v1 summary is case-insensitive. Preview rules
+before relying on an unattended schedule:
+
+```bash
+memberkit exclusions list
+memberkit exclusions preview --date YYYY-MM-DD
+```
+
+MemberKit parses the complete file once per invocation. An unreadable file,
+invalid UTF-8, malformed syntax, C0/DEL control character, or invalid regular
+expression fails closed before any bundle or review-state write. A scheduled run
+with one of these errors sends no success notification.
+
+Rules affect only newly generated or forced drafts; they do not rewrite an
+existing draft. `memberkit draft --all` also filters. A direct draft whose events
+are all filtered is a valid empty file, while a scheduled all-filtered date creates
+no pending draft. `memberkit review` and `memberkit push` do not retroactively
+filter a draft that already exists.
+
+Ordinary rule edits require no schedule reinstall. Only released-package
+verification may replace a wrapper or reinstall an existing wrapper-based
+schedule; that migration is separate from changing local rules.
+
 ## Schedule
 
 ```bash
