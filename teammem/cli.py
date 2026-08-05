@@ -4,6 +4,7 @@ import argparse
 import sqlite3
 import subprocess
 import sys
+import uuid
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from .services import (
     run_report,
 )
 from .store import open_db, stats as store_stats
+from .telemetry import stream_reporter
 
 
 _SCHEDULE_FAILURES = (
@@ -60,7 +62,15 @@ def _parser() -> argparse.ArgumentParser:
     p_collect.add_argument("--since-days", type=int, default=None)
     p_collect.add_argument("--dry-run", action="store_true")
 
-    sub.add_parser("run-daily", help="run configured hub stages once")
+    p_daily = sub.add_parser("run-daily", help="run configured hub stages once")
+    p_daily.add_argument(
+        "--capture-only",
+        action="store_true",
+        help=(
+            "capture, import, reclaim, and snapshot without synthesis or "
+            "publication"
+        ),
+    )
     sub.add_parser("stats", help="ledger row counts")
 
     p_reclaim = sub.add_parser(
@@ -418,7 +428,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "run-daily":
         ids = IdentityMaps.load(cfg.config_dir)
         settings = load_connector_settings(cfg.config_dir)
-        result = run_daily(cfg, ids, settings, datetime.now().astimezone())
+        reporter = stream_reporter(uuid.uuid4().hex, sys.stderr)
+        result = run_daily(
+            cfg,
+            ids,
+            settings,
+            datetime.now().astimezone(),
+            capture_only=args.capture_only,
+            reporter=reporter,
+        )
         _print_daily(result)
         return result.exit_code
 

@@ -1,14 +1,16 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from teammem.config import Config
 from teammem.connectors.base import CollectionResult
 from teammem.connectors.config import ConnectorSettings
-from teammem.daily import run_daily
+from teammem.daily import StepResult, run_daily
 from teammem.events import Event
 from teammem.identity import IdentityMaps
 from teammem.store import insert_events, open_db, stats
@@ -112,7 +114,7 @@ def _run_with_failed_stage(tmp_path, monkeypatch, stage):
             "teammem.daily.resolve_llm_backend", lambda *args: object()
         )
         monkeypatch.setattr(
-            "teammem.daily.run_journal",
+            "teammem.daily.execute_journal",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 RuntimeError("journal failure")
             ),
@@ -122,10 +124,11 @@ def _run_with_failed_stage(tmp_path, monkeypatch, stage):
             "teammem.daily.resolve_llm_backend", lambda *args: object()
         )
         monkeypatch.setattr(
-            "teammem.daily.run_journal", lambda *args, **kwargs: 0
+            "teammem.daily.execute_journal",
+            lambda *args, **kwargs: SimpleNamespace(failed_person_days=()),
         )
         monkeypatch.setattr(
-            "teammem.daily.run_report",
+            "teammem.daily.execute_report",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 RuntimeError("report failure")
             ),
@@ -283,20 +286,321 @@ def test_daily_ledger_open_failure_skips_dependent_stages(tmp_path, monkeypatch)
         assert result.status(name) == "skipped"
 
 
-def test_daily_runs_weekly_report_only_on_friday(tmp_path, monkeypatch):
+def test_capture_only_holds_lock_closes_ledger_and_skips_publication(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path, TEAMMEM_SNAPSHOTS=str(tmp_path / "snapshots"))
+    events = []
+    real_open_db = open_db
+
+    class TrackingConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def __enter__(self):
+            self.connection.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.connection.__exit__(*args)
+
+        def close(self):
+            events.append("close")
+            self.connection.close()
+
+    @contextmanager
+    def lock_factory(path, *, wait_seconds, on_wait, monotonic):
+        events.append(("lock", path, wait_seconds))
+        yield
+        events.append("release")
+
+    def tracked_open(path):
+        events.append("open")
+        return TrackingConnection(real_open_db(path))
+
+    monkeypatch.setattr("teammem.daily.open_db", tracked_open)
+    monkeypatch.setattr(
+        "teammem.daily.resolve_llm_backend",
+        lambda *args: pytest.fail("capture-only must not resolve an LLM"),
+    )
+    monkeypatch.setattr(
+        "teammem.daily.run_render",
+        lambda *args, **kwargs: pytest.fail("capture-only must not render"),
+    )
+    monkeypatch.setattr(
+        "teammem.daily.run_docs_sync",
+        lambda *args, **kwargs: pytest.fail("capture-only must not sync docs"),
+    )
+    monkeypatch.setattr(
+        "teammem.daily.push",
+        lambda *args, **kwargs: pytest.fail("capture-only must not push"),
+    )
+
+    result = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings("feishu"),
+        NOW,
+        connectors={
+            "feishu": FixtureConnector(
+                "feishu", CollectionResult(events=(EVENT,))
+            )
+        },
+        capture_only=True,
+        lock_factory=lock_factory,
+    )
+
+    assert result.exit_code == 0
+    assert events[:2] == [("lock", cfg.db_path, 0), "open"]
+    assert events[-2:] == ["close", "release"]
+    assert stats(real_open_db(cfg.db_path))["total"] == 1
+    assert (tmp_path / "snapshots" / "ledger-2026-07-17.db").exists()
+    for name in ("journal", "report", "docs-sync", "render", "push"):
+        assert result.step(name) == StepResult(name, "skipped", "capture-only")
+
+
+def test_reporter_failure_after_open_closes_ledger_before_lock_release(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    events = []
+    failure = OSError("stderr closed")
+    connection = open_db(cfg.db_path)
+
+    class TrackingConnection:
+        def close(self):
+            events.append("close")
+            connection.close()
+
+    @contextmanager
+    def lock_factory(*args, **kwargs):
+        events.append("acquire")
+        try:
+            yield
+        finally:
+            events.append("release")
+
+    def tracked_open(path):
+        events.append("open")
+        return TrackingConnection()
+
+    def reporter(event):
+        if event.event == "stage-end" and event.stage == "ledger":
+            events.append("ledger stage-end")
+            raise failure
+
+    monkeypatch.setattr("teammem.daily.open_db", tracked_open)
+
+    with pytest.raises(OSError) as raised:
+        run_daily(
+            cfg,
+            IdentityMaps.load(CONFIG_DIR),
+            _settings(),
+            NOW,
+            connectors={},
+            lock_factory=lock_factory,
+            reporter=reporter,
+        )
+
+    assert raised.value is failure
+    assert events == [
+        "acquire",
+        "open",
+        "ledger stage-end",
+        "close",
+        "release",
+    ]
+
+
+def test_capture_only_source_failure_is_fatal_but_snapshot_still_runs(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path, TEAMMEM_SNAPSHOTS=str(tmp_path / "snapshots"))
+
+    result = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings("github"),
+        NOW,
+        connectors={
+            "github": FixtureConnector("github", error=RuntimeError("offline"))
+        },
+        capture_only=True,
+    )
+
+    assert result.exit_code == 1
+    assert result.status("github") == "failed"
+    assert result.status("snapshot") == "ok"
+    assert (tmp_path / "snapshots" / "ledger-2026-07-17.db").exists()
+
+
+def test_capture_only_import_failure_is_fatal_but_full_import_failure_is_not(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(
+        tmp_path,
+        TEAMMEM_INBOX=str(tmp_path / "inbox"),
+        TEAMMEM_ARCHIVE=str(tmp_path / "archive"),
+        TEAMMEM_QUARANTINE=str(tmp_path / "quarantine"),
+        TEAMMEM_SNAPSHOTS=str(tmp_path / "snapshots"),
+    )
+    monkeypatch.setattr(
+        "teammem.daily.import_inbox",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("bad bundle")),
+    )
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
+
+    capture = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings(),
+        NOW,
+        connectors={},
+        capture_only=True,
+    )
+    full = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings(),
+        NOW,
+        connectors={},
+    )
+
+    assert capture.exit_code == 1
+    assert full.exit_code == 0
+    assert capture.status("snapshot") == full.status("snapshot") == "ok"
+
+
+def test_lock_collision_fails_before_opening_the_ledger(tmp_path, monkeypatch):
+    from teammem.run_lock import RunLockedError
+
+    cfg = _cfg(tmp_path)
+
+    @contextmanager
+    def busy_lock(*args, **kwargs):
+        raise RunLockedError("another run is active")
+        yield
+
+    monkeypatch.setattr(
+        "teammem.daily.open_db",
+        lambda path: pytest.fail("ledger must not open before lock acquisition"),
+    )
+
+    result = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings(),
+        NOW,
+        lock_factory=busy_lock,
+    )
+
+    assert result.exit_code == 1
+    assert result.step("lock") == StepResult(
+        "lock", "failed", "another run is active"
+    )
+    assert result.status("ledger") == "skipped"
+
+
+def test_full_run_requests_thirty_minute_lock_wait(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    seen = {}
+
+    @contextmanager
+    def lock_factory(path, *, wait_seconds, on_wait, monotonic):
+        seen["wait_seconds"] = wait_seconds
+        yield
+
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
+
+    result = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings(),
+        NOW,
+        connectors={},
+        lock_factory=lock_factory,
+    )
+
+    assert result.exit_code == 0
+    assert seen["wait_seconds"] == 1800
+
+
+def test_monday_full_run_reconciles_previous_then_current_across_year_boundary(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    journal_calls = []
+    report_calls = []
+    backends = [object(), object()]
+    monkeypatch.setattr(
+        "teammem.daily.resolve_llm_backend", lambda *args: backends.pop(0)
+    )
+    monkeypatch.setattr(
+        "teammem.daily.execute_journal",
+        lambda *args, **kwargs: journal_calls.append(kwargs)
+        or SimpleNamespace(failed_person_days=()),
+    )
+    def report(*args, **kwargs):
+        report_calls.append(kwargs)
+        return SimpleNamespace(
+            target_monday=kwargs["target_week"],
+            status="generated",
+            detail="2 dailies",
+            elapsed_seconds=0.25,
+        )
+
+    monkeypatch.setattr("teammem.daily.execute_report", report)
+
+    local_monday = datetime(
+        2027, 1, 4, 1, 30, tzinfo=timezone(timedelta(hours=14))
+    )
+    result = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings(),
+        local_monday,
+        connectors={},
+    )
+
+    assert journal_calls[0]["start_day"] == "2026-12-28"
+    assert journal_calls[0]["end_day"] == "2027-01-04"
+    assert [call["target_week"].isoformat() for call in report_calls] == [
+        "2026-12-28",
+        "2027-01-04",
+    ]
+    report_step = result.step("report")
+    assert report_step.status == "ok"
+    assert [(item.name, item.status) for item in report_step.subresults] == [
+        ("previous", "generated"),
+        ("current", "generated"),
+    ]
+
+
+def test_failed_person_day_blocks_only_its_report_week(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     calls = []
     monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: object())
-    monkeypatch.setattr("teammem.daily.run_journal", lambda *args, **kwargs: 0)
     monkeypatch.setattr(
-        "teammem.daily.run_report",
-        lambda *args, **kwargs: calls.append(kwargs["base"]) or 0,
+        "teammem.daily.execute_journal",
+        lambda *args, **kwargs: SimpleNamespace(
+            failed_person_days=(("alex", "2026-07-14"),)
+        ),
+    )
+    monkeypatch.setattr(
+        "teammem.daily.execute_report",
+        lambda *args, **kwargs: calls.append(kwargs["target_week"])
+        or SimpleNamespace(
+            target_monday=kwargs["target_week"],
+            status="cached",
+            detail="cached",
+            elapsed_seconds=0.0,
+        ),
     )
 
-    friday = run_daily(
-        cfg, IdentityMaps.load(CONFIG_DIR), _settings(), NOW, connectors={}
-    )
-    monday = run_daily(
+    result = run_daily(
         cfg,
         IdentityMaps.load(CONFIG_DIR),
         _settings(),
@@ -304,9 +608,58 @@ def test_daily_runs_weekly_report_only_on_friday(tmp_path, monkeypatch):
         connectors={},
     )
 
-    assert friday.status("report") == "ok"
-    assert monday.status("report") == "skipped"
-    assert calls == [NOW.date()]
+    report = result.step("report")
+    assert calls == [datetime(2026, 7, 20).date()]
+    assert report.subresults[0] == StepResult(
+        "previous",
+        "skipped",
+        "2026-07-13: journal failed for target week",
+    )
+    assert report.subresults[1].status == "cached"
+
+
+def test_report_week_exceptions_are_redacted_and_attempts_are_independent(
+    tmp_path, monkeypatch
+):
+    secret = "sk-do-not-print"
+    cfg = _cfg(tmp_path, ANTHROPIC_API_KEY=secret)
+    calls = []
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: object())
+    monkeypatch.setattr(
+        "teammem.daily.execute_journal",
+        lambda *args, **kwargs: SimpleNamespace(failed_person_days=()),
+    )
+
+    def report(*args, **kwargs):
+        calls.append(kwargs["target_week"])
+        if len(calls) == 1:
+            raise RuntimeError(f"provider rejected {secret}")
+        return SimpleNamespace(
+            target_monday=kwargs["target_week"],
+            status="generated",
+            detail="1 daily",
+            elapsed_seconds=0.1,
+        )
+
+    monkeypatch.setattr("teammem.daily.execute_report", report)
+
+    result = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings(),
+        datetime(2026, 7, 20, 18, 20, tzinfo=timezone.utc),
+        connectors={},
+    )
+
+    assert len(calls) == 2
+    report_step = result.step("report")
+    assert report_step.status == "failed"
+    assert report_step.subresults[0].status == "failed"
+    assert report_step.subresults[0].detail == (
+        "2026-07-13: provider rejected [REDACTED]"
+    )
+    assert report_step.subresults[1].status == "generated"
+    assert result.exit_code == 0
 
 
 def test_daily_uses_operator_friday_but_collects_with_utc_clock(
@@ -320,12 +673,20 @@ def test_daily_uses_operator_friday_but_collects_with_utc_clock(
     seen = {}
     monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: object())
     monkeypatch.setattr(
-        "teammem.daily.run_journal",
-        lambda *args, **kwargs: seen.setdefault("journal_day", kwargs["today"]) and 0,
+        "teammem.daily.execute_journal",
+        lambda *args, **kwargs: seen.setdefault(
+            "journal_day", kwargs["end_day"]
+        )
+        and SimpleNamespace(failed_person_days=()),
     )
     monkeypatch.setattr(
-        "teammem.daily.run_report",
-        lambda *args, **kwargs: seen.setdefault("report_day", kwargs["base"]) and 0,
+        "teammem.daily.execute_report",
+        lambda *args, **kwargs: seen.setdefault(
+            "report_days", []
+        ).append(kwargs["target_week"])
+        or SimpleNamespace(
+            status="generated", detail="generated", elapsed_seconds=0.0
+        ),
     )
 
     result = run_daily(
@@ -339,8 +700,11 @@ def test_daily_uses_operator_friday_but_collects_with_utc_clock(
     assert result.status("report") == "ok"
     assert seen["connector_now"].tzinfo == timezone.utc
     assert seen["connector_now"] == datetime(2026, 7, 18, 1, 20, tzinfo=timezone.utc)
-    assert seen["journal_day"].isoformat() == "2026-07-17"
-    assert seen["report_day"].isoformat() == "2026-07-17"
+    assert seen["journal_day"] == "2026-07-17"
+    assert [day.isoformat() for day in seen["report_days"]] == [
+        "2026-07-06",
+        "2026-07-13",
+    ]
     assert "generated: 2026-07-17" in (cfg.vault_dir / "README.md").read_text()
     assert (snapshots / "ledger-2026-07-17.db").exists()
 
@@ -354,6 +718,10 @@ def test_daily_marks_unconfigured_optional_stages_skipped(tmp_path, monkeypatch)
 
     for name in ("import", "journal", "report", "docs-sync", "snapshot"):
         assert result.status(name) == "skipped"
+    assert [item.status for item in result.step("report").subresults] == [
+        "skipped",
+        "skipped",
+    ]
     assert result.status("render") == "ok"
 
 
@@ -443,12 +811,12 @@ def test_daily_journal_failure_skips_friday_report_but_keeps_local_projections(
     calls = []
     monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: object())
     monkeypatch.setattr(
-        "teammem.daily.run_journal",
+        "teammem.daily.execute_journal",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("llm offline")),
     )
     monkeypatch.setattr(
-        "teammem.daily.run_report",
-        lambda *args, **kwargs: calls.append("report") or 0,
+        "teammem.daily.execute_report",
+        lambda *args, **kwargs: calls.append("report"),
     )
     monkeypatch.setattr(
         "teammem.daily.run_docs_sync",
@@ -462,7 +830,6 @@ def test_daily_journal_failure_skips_friday_report_but_keeps_local_projections(
     assert result.exit_code == 0
     assert result.status("journal") == "failed"
     assert result.status("report") == "skipped"
-    assert result.step("report").detail == "journal failed"
     assert calls == ["docs-sync"]
     assert result.status("docs-sync") == "ok"
     assert result.status("render") == "ok"

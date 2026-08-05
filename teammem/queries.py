@@ -8,9 +8,26 @@ adjacent week. Acceptable for weekly rollups (documented tradeoff).
 
 import json
 import sqlite3
-from datetime import date, timedelta
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 
 from .identity import IdentityMaps
+
+
+@dataclass(frozen=True)
+class ReportState:
+    target_monday: date
+    coverage_state: str
+    evidence_cutoff: str | None
+    cutoff_precision: str
+    cutoff_note: str | None
+
+
+@dataclass(frozen=True)
+class ReportContext:
+    state: ReportState
+    effective_flags: dict
 
 
 def week_monday(d: date) -> date:
@@ -59,7 +76,7 @@ def flags(conn: sqlite3.Connection, monday: date, ids: IdentityMaps) -> dict:
     gaps = sorted(s for s in ids.slugs() if s in active_prior and s not in active_now)
     unmapped = sorted(
         ((p, len(rs)) for p, rs in by_key(this_week, "person").items()
-         if p.startswith("_unmapped/")), key=lambda x: -x[1])
+         if p.startswith("_unmapped/")), key=lambda x: (-x[1], x[0]))
     channel_counts: dict[str, int] = {}
     for r in this_week:
         if (
@@ -90,3 +107,72 @@ def flags(conn: sqlite3.Connection, monday: date, ids: IdentityMaps) -> dict:
     return {"gaps": gaps, "unmapped": unmapped,
             "unmapped_channels": unmapped_channels,
             "concentration": sorted(concentration)}
+
+
+def report_context(
+    conn: sqlite3.Connection,
+    target_monday: date,
+    operator_date: date,
+    ids: IdentityMaps,
+    included_person_days: set[tuple[str, str]],
+) -> ReportContext:
+    current_week = target_monday == week_monday(operator_date)
+    coverage_state = (
+        "provisional"
+        if current_week and operator_date.weekday() < 4
+        else "friday-checkpoint"
+    )
+    effective_flags = deepcopy(flags(conn, target_monday, ids))
+    if coverage_state == "provisional":
+        effective_flags.pop("gaps", None)
+        effective_flags.pop("concentration", None)
+
+    evidence_cutoff, cutoff_precision, cutoff_note = _evidence_cutoff(
+        conn, included_person_days
+    )
+    return ReportContext(
+        state=ReportState(
+            target_monday=target_monday,
+            coverage_state=coverage_state,
+            evidence_cutoff=evidence_cutoff,
+            cutoff_precision=cutoff_precision,
+            cutoff_note=cutoff_note,
+        ),
+        effective_flags=effective_flags,
+    )
+
+
+def _evidence_cutoff(
+    conn: sqlite3.Connection,
+    included_person_days: set[tuple[str, str]],
+) -> tuple[str | None, str, str | None]:
+    if not included_person_days:
+        return None, "none", None
+
+    rows = [
+        (person, timestamp)
+        for person, timestamp in conn.execute("SELECT person, ts FROM events")
+        if (person, timestamp[:10]) in included_person_days
+    ]
+    if not rows:
+        return None, "none", None
+
+    latest_day = max(timestamp[:10] for _, timestamp in rows)
+    parsed = [
+        (timestamp, _parse_timestamp(timestamp))
+        for _, timestamp in rows
+    ]
+    if any(value.tzinfo is None for _, value in parsed):
+        return latest_day, "date", "some source timestamps omit offsets"
+
+    latest_timestamp, _ = max(
+        parsed,
+        key=lambda item: item[1].astimezone(timezone.utc),
+    )
+    return latest_timestamp, "instant", None
+
+
+def _parse_timestamp(timestamp: str) -> datetime:
+    if timestamp.endswith("Z"):
+        timestamp = f"{timestamp[:-1]}+00:00"
+    return datetime.fromisoformat(timestamp)

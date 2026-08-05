@@ -15,6 +15,7 @@ def test_defaults(empty_env_file):
     assert cfg.db_path == Path("ledger.db")
     assert cfg.since_days == 7
     assert cfg.gitlab_url == ""
+    assert cfg.llm_concurrency == 2
 
 
 def test_env_overrides(empty_env_file):
@@ -143,3 +144,24 @@ def test_windows_config_reads_env_through_injected_same_handle_api():
     )
     assert cfg.since_days == 13
     assert cfg.env_file == env_file
+
+
+@pytest.mark.parametrize("value", ["1", "8"])
+def test_llm_concurrency_accepts_the_inclusive_bounds(empty_env_file, value):
+    cfg = Config.load(
+        env={"TEAMMEM_LLM_CONCURRENCY": value}, env_file=empty_env_file
+    )
+    assert cfg.llm_concurrency == int(value)
+
+
+@pytest.mark.parametrize("value", ["0", "9", "two"])
+def test_llm_concurrency_rejects_out_of_range_or_non_integer_values(
+    empty_env_file, value
+):
+    with pytest.raises(
+        ValueError,
+        match="^TEAMMEM_LLM_CONCURRENCY must be an integer from 1 to 8$",
+    ):
+        Config.load(
+            env={"TEAMMEM_LLM_CONCURRENCY": value}, env_file=empty_env_file
+        )

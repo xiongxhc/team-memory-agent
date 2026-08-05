@@ -1,18 +1,52 @@
 """Synthesis engine: ledger slices -> third-person narrative, via an injected
-LLM callable. All caching is content-hash keyed (see store.get_or_make);
-PROMPT_VERSION is folded into every hash so prompt edits regenerate entries."""
+LLM callable. Daily and weekly cache versions evolve independently."""
 
 import json
 import re
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 
-from .slices import daily_person_slice, slice_hash, weekly_team_input
-from .store import get_or_make
+from .queries import ReportContext
+from .slices import (
+    daily_person_event_count,
+    daily_person_projects,
+    daily_person_slice,
+    slice_hash,
+)
+from .store import SummaryRecord, get_summary, put_summary
 
 LLM = Callable[[str, str], str]
 
-PROMPT_VERSION = "2"
+DAILY_PROMPT_VERSION = "2"
+DAILY_HASH_SCHEMA_VERSION = "local-projects-v1"
+LEGACY_DAILY_PROMPT_VERSION = "2"
+LEGACY_DAILY_MIGRATION_TARGET = (
+    LEGACY_DAILY_PROMPT_VERSION,
+    "local-projects-v1",
+)
+REPORT_PROMPT_VERSION = "3"
+
+
+@dataclass(frozen=True)
+class PreparedDailyJournal:
+    person: str
+    day: str
+    key: str
+    user_prompt: str
+    input_hash: str
+    legacy_input_hash: str
+    event_count: int
+    prompt_bytes: int
+
+
+@dataclass(frozen=True)
+class DailySummaryInput:
+    person: str
+    day: str
+    input_hash: str
+    text: str
+
 
 DAILY_SYSTEM = """\
 You write ONE person's daily work-journal entry for a company knowledge vault,
@@ -37,17 +71,23 @@ Format:
 
 REPORT_SYSTEM = """\
 You write a weekly team report for a manager who has 20 seconds. Input: the
-week's per-person daily journal entries plus deterministic flag facts (treat the
-flags as ground truth — report them, do not re-derive or second-guess them).
+week's per-person daily journal entries plus deterministic flag facts.
+Treat the supplied flags as ground truth: use only those flags and do not
+re-derive, add, or second-guess flag findings. Provisional inputs already withhold
+gap and concentration flags.
 Structure, exactly these three sections:
 ## Shipped
 ## Needs attention
 ## Coordination-heavy / low artifact
-Rules: top-down, most important first; name people and projects as plain
-**bold** text exactly matching the names used in the input — NEVER [[wikilinks]]
-or markdown links (navigation links live elsewhere on the page); fold
-gap/concentration/unmapped flags into "Needs attention"; be concrete and terse;
-never invent facts not in the input."""
+Rules:
+- Consolidate repeated commit/MR/chat evidence into team outcomes grouped by project.
+- Name contributors and distinguish shipped work from in-progress coordination.
+- Never rank impact by event count.
+- Keep Needs attention for blockers, security findings, unresolved incidents,
+  decisions requiring follow-up, and the deterministic flags supplied in the input.
+- Be concrete, terse, and grounded only in the input; never invent facts.
+- Present the most important outcomes first. Use plain **bold** people and project
+  names exactly matching the input; NEVER use [[wikilinks]] or markdown links."""
 
 
 def http_llm(model: str, api_key: str, max_tokens: int) -> LLM:
@@ -107,26 +147,220 @@ def claude_cli_llm(model: str, claude_bin: str = "claude") -> LLM:
     return llm
 
 
-def daily_person_journal(conn: sqlite3.Connection, person: str, display_name: str,
-                         day: str, project_slugs: list[str], llm: LLM, model: str,
-                         created_ts: str) -> str | None:
+def _daily_user_prompt(
+    person: str,
+    display_name: str,
+    day: str,
+    projects: list[str],
+    slice_text: str,
+) -> str:
+    return (
+        f"Person: {display_name} (slug: {person})\nDate: {day}\n"
+        f"Known project names: {', '.join(sorted(projects)) or '(none)'}\n\n"
+        f"Events:\n{slice_text}"
+    )
+
+
+def prepare_daily_journal(
+    conn: sqlite3.Connection,
+    person: str,
+    display_name: str,
+    day: str,
+    legacy_project_slugs: list[str],
+) -> PreparedDailyJournal | None:
     slice_text = daily_person_slice(conn, person, day)
     if not slice_text:
         return None
-    user = (f"Person: {display_name} (slug: {person})\nDate: {day}\n"
-            f"Known project names: {', '.join(sorted(project_slugs)) or '(none)'}\n\n"
-            f"Events:\n{slice_text}")
-    h = slice_hash(PROMPT_VERSION + "\n" + user)
-    return get_or_make(conn, "daily-person", f"{person}|{day}", h,
-                       lambda: (llm(DAILY_SYSTEM, user), model), created_ts)
+    local_projects = daily_person_projects(conn, person, day)
+    user_prompt = _daily_user_prompt(
+        person, display_name, day, local_projects, slice_text
+    )
+    canonical_input = json.dumps(
+        {
+            "daily_hash_schema_version": DAILY_HASH_SCHEMA_VERSION,
+            "daily_prompt_version": DAILY_PROMPT_VERSION,
+            "day": day,
+            "display_name": display_name,
+            "events": slice_text,
+            "person": person,
+            "projects": local_projects,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    legacy_user_prompt = _daily_user_prompt(
+        person, display_name, day, legacy_project_slugs, slice_text
+    )
+    return PreparedDailyJournal(
+        person=person,
+        day=day,
+        key=f"{person}|{day}",
+        user_prompt=user_prompt,
+        input_hash=slice_hash(canonical_input),
+        legacy_input_hash=slice_hash(
+            LEGACY_DAILY_PROMPT_VERSION + "\n" + legacy_user_prompt
+        ),
+        event_count=daily_person_event_count(conn, person, day),
+        prompt_bytes=len(user_prompt.encode("utf-8")),
+    )
 
 
-def weekly_team_report(conn: sqlite3.Connection, monday_iso: str,
-                       daily_texts: list[dict], flags: dict, llm: LLM,
-                       model: str, created_ts: str) -> str:
-    user = (f"Week of {monday_iso}.\n\nFlag facts (ground truth):\n"
-            f"{json.dumps(flags, sort_keys=True)}\n\nDaily journals:\n\n"
-            f"{weekly_team_input(daily_texts)}")
-    h = slice_hash(PROMPT_VERSION + "\n" + user)
-    return get_or_make(conn, "weekly-team", f"team|{monday_iso}", h,
-                       lambda: (llm(REPORT_SYSTEM, user), model), created_ts)
+def daily_cache_status(
+    conn: sqlite3.Connection, prepared: PreparedDailyJournal
+) -> tuple[str, str | None]:
+    existing = get_summary(conn, "daily-person", prepared.key)
+    if existing is None:
+        return "miss", None
+    if existing.input_hash == prepared.input_hash:
+        return "cached", existing.text
+    migration_target_is_current = (
+        DAILY_PROMPT_VERSION,
+        DAILY_HASH_SCHEMA_VERSION,
+    ) == LEGACY_DAILY_MIGRATION_TARGET
+    if (
+        migration_target_is_current
+        and existing.input_hash == prepared.legacy_input_hash
+    ):
+        put_summary(conn, replace(existing, input_hash=prepared.input_hash))
+        return "migrated", existing.text
+    return "miss", None
+
+
+def put_daily_journal(
+    conn: sqlite3.Connection,
+    prepared: PreparedDailyJournal,
+    text: str,
+    model: str,
+    created_ts: str,
+) -> None:
+    put_summary(
+        conn,
+        SummaryRecord(
+            kind="daily-person",
+            key=prepared.key,
+            input_hash=prepared.input_hash,
+            text=text,
+            model=model,
+            created_ts=created_ts,
+        ),
+    )
+
+
+def daily_person_journal(conn: sqlite3.Connection, person: str, display_name: str,
+                         day: str, project_slugs: list[str], llm: LLM, model: str,
+                         created_ts: str) -> str | None:
+    prepared = prepare_daily_journal(
+        conn, person, display_name, day, project_slugs
+    )
+    if prepared is None:
+        return None
+    status, cached_text = daily_cache_status(conn, prepared)
+    if status != "miss":
+        return cached_text
+    text = llm(DAILY_SYSTEM, prepared.user_prompt)
+    put_daily_journal(conn, prepared, text, model, created_ts)
+    return text
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _daily_summary_sort_key(
+    daily: DailySummaryInput,
+) -> tuple[str, str, str, str]:
+    return daily.person, daily.day, daily.input_hash, daily.text
+
+
+def _weekly_input(dailies: Sequence[DailySummaryInput]) -> str:
+    return "\n\n".join(
+        f"## {daily.person} — {daily.day}\n{daily.text}"
+        for daily in sorted(dailies, key=_daily_summary_sort_key)
+    )
+
+
+def _coverage_line(context: ReportContext) -> str:
+    state = context.state
+    if state.cutoff_precision == "instant":
+        coverage = f"event timestamps through {state.evidence_cutoff}"
+    elif state.cutoff_precision == "date":
+        coverage = f"event dates through {state.evidence_cutoff}"
+    else:
+        coverage = "exact event cutoff unavailable"
+    if state.cutoff_note:
+        coverage += f"; {state.cutoff_note}"
+    if state.coverage_state == "provisional":
+        return f"> Provisional — {coverage}."
+    return (
+        f"> Friday checkpoint — {coverage}; "
+        "later evidence reconciles on the next full run."
+    )
+
+
+def weekly_team_report(
+    conn: sqlite3.Connection,
+    *,
+    monday_iso: str,
+    dailies: Sequence[DailySummaryInput],
+    context: ReportContext,
+    llm: LLM,
+    model: str,
+    created_ts: str,
+) -> SummaryRecord:
+    effective_flags_json = _canonical_json(context.effective_flags)
+    ordered_dailies = sorted(dailies, key=_daily_summary_sort_key)
+    source_input_hash = slice_hash(_canonical_json({
+        "dailies": [
+            [daily.person, daily.day, daily.input_hash, daily.text]
+            for daily in ordered_dailies
+        ],
+        "effective_flags": context.effective_flags,
+    }))
+    state = context.state
+    input_hash = slice_hash(_canonical_json({
+        "coverage_state": state.coverage_state,
+        "cutoff_note": state.cutoff_note,
+        "cutoff_precision": state.cutoff_precision,
+        "evidence_cutoff": state.evidence_cutoff,
+        "report_prompt_version": REPORT_PROMPT_VERSION,
+        "source_input_hash": source_input_hash,
+        "target_monday": state.target_monday.isoformat(),
+    }))
+    key = f"team|{monday_iso}"
+    existing = get_summary(conn, "weekly-team", key)
+    if existing is not None and existing.input_hash == input_hash:
+        return existing
+
+    user = (
+        f"Week of {monday_iso}.\n"
+        f"Report state: {state.coverage_state}\n"
+        f"Evidence cutoff: {state.evidence_cutoff or '(none)'}\n"
+        f"Cutoff precision: {state.cutoff_precision}\n"
+        f"Cutoff note: {state.cutoff_note or '(none)'}\n\n"
+        "Effective flag facts (ground truth):\n"
+        f"{effective_flags_json}\n\n"
+        "Daily journals:\n\n"
+        f"{_weekly_input(ordered_dailies)}"
+    )
+    narrative = llm(REPORT_SYSTEM, user)
+    record = SummaryRecord(
+        kind="weekly-team",
+        key=key,
+        input_hash=input_hash,
+        text=f"{_coverage_line(context)}\n\n{narrative}",
+        model=model,
+        created_ts=created_ts,
+        evidence_cutoff=state.evidence_cutoff,
+        cutoff_precision=state.cutoff_precision,
+        coverage_state=state.coverage_state,
+        source_input_hash=source_input_hash,
+        effective_flags_json=effective_flags_json,
+    )
+    put_summary(conn, record)
+    return record

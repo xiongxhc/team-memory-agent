@@ -4,6 +4,7 @@ UNIQUE(person, source, hash) key makes every ingest path idempotent."""
 import json
 import sqlite3
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from .events import Event
@@ -33,15 +34,93 @@ CREATE TABLE IF NOT EXISTS summaries (
   text       TEXT NOT NULL,
   model      TEXT NOT NULL,
   created_ts TEXT NOT NULL,
+  evidence_cutoff      TEXT,
+  cutoff_precision     TEXT,
+  coverage_state       TEXT,
+  source_input_hash    TEXT,
+  effective_flags_json TEXT,
   UNIQUE(kind, key)
 );
 """
 
 
+_SUMMARY_PROVENANCE_COLUMNS = {
+    "evidence_cutoff": "TEXT",
+    "cutoff_precision": "TEXT",
+    "coverage_state": "TEXT",
+    "source_input_hash": "TEXT",
+    "effective_flags_json": "TEXT",
+}
+
+
+@dataclass(frozen=True)
+class SummaryRecord:
+    kind: str
+    key: str
+    input_hash: str
+    text: str
+    model: str
+    created_ts: str
+    evidence_cutoff: str | None = None
+    cutoff_precision: str | None = None
+    coverage_state: str | None = None
+    source_input_hash: str | None = None
+    effective_flags_json: str | None = None
+
+
 def open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.executescript(_SCHEMA)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(summaries)")}
+        for name, type_ in _SUMMARY_PROVENANCE_COLUMNS.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE summaries ADD COLUMN {name} {type_}")
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
     return conn
+
+
+def get_summary(conn: sqlite3.Connection, kind: str, key: str) -> SummaryRecord | None:
+    row = conn.execute(
+        "SELECT kind, key, input_hash, text, model, created_ts, evidence_cutoff, "
+        "cutoff_precision, coverage_state, source_input_hash, effective_flags_json "
+        "FROM summaries WHERE kind = ? AND key = ?",
+        (kind, key),
+    ).fetchone()
+    return SummaryRecord(*row) if row else None
+
+
+def put_summary(conn: sqlite3.Connection, record: SummaryRecord) -> None:
+    with conn:
+        conn.execute(
+            "INSERT INTO summaries (kind, key, input_hash, text, model, created_ts, "
+            "evidence_cutoff, cutoff_precision, coverage_state, source_input_hash, "
+            "effective_flags_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(kind, key) DO UPDATE SET "
+            "input_hash = excluded.input_hash, text = excluded.text, model = excluded.model, "
+            "created_ts = excluded.created_ts, evidence_cutoff = excluded.evidence_cutoff, "
+            "cutoff_precision = excluded.cutoff_precision, coverage_state = excluded.coverage_state, "
+            "source_input_hash = excluded.source_input_hash, "
+            "effective_flags_json = excluded.effective_flags_json",
+            (
+                record.kind,
+                record.key,
+                record.input_hash,
+                record.text,
+                record.model,
+                record.created_ts,
+                record.evidence_cutoff,
+                record.cutoff_precision,
+                record.coverage_state,
+                record.source_input_hash,
+                record.effective_flags_json,
+            ),
+        )
 
 
 def insert_events(conn: sqlite3.Connection, events: Iterable[Event]) -> int:
@@ -173,16 +252,9 @@ def stats(conn: sqlite3.Connection) -> dict:
 
 def get_or_make(conn: sqlite3.Connection, kind: str, key: str, input_hash: str,
                 make: Callable[[], tuple[str, str]], created_ts: str) -> str:
-    row = conn.execute("SELECT input_hash, text FROM summaries WHERE kind = ? AND key = ?",
-                       (kind, key)).fetchone()
-    if row and row[0] == input_hash:
-        return row[1]
+    existing = get_summary(conn, kind, key)
+    if existing and existing.input_hash == input_hash:
+        return existing.text
     text, model = make()
-    with conn:
-        conn.execute(
-            "INSERT INTO summaries (kind, key, input_hash, text, model, created_ts)"
-            " VALUES (?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT(kind, key) DO UPDATE SET input_hash = excluded.input_hash,"
-            " text = excluded.text, model = excluded.model, created_ts = excluded.created_ts",
-            (kind, key, input_hash, text, model, created_ts))
+    put_summary(conn, SummaryRecord(kind, key, input_hash, text, model, created_ts))
     return text

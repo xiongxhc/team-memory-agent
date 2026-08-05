@@ -127,6 +127,26 @@ def _integer(values: dict, key: str, default: int) -> int:
         raise ValueError(f"{key} must be an integer") from None
 
 
+def _bounded_integer(
+    values: Mapping[str, Any],
+    key: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(values.get(key, default))
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{key} must be an integer from {minimum} to {maximum}"
+        ) from None
+    if value < minimum or value > maximum:
+        raise ValueError(
+            f"{key} must be an integer from {minimum} to {maximum}"
+        )
+    return value
+
+
 @dataclass
 class Config:
     db_path: Path = Path("ledger.db")
@@ -143,6 +163,7 @@ class Config:
     anthropic_api_key: str = ""    # ANTHROPIC_API_KEY — synthesis only, never committed
     llm_daily_model: str = "daily-summary-model"
     llm_report_model: str = "weekly-summary-model"
+    llm_concurrency: int = 2
     env_file: Path = field(default_factory=default_env_file)
     github_token: str = ""       # GitHub fine-grained token — never committed
     slack_bot_token: str = ""    # Slack bot token — never committed
@@ -191,6 +212,13 @@ class Config:
             anthropic_api_key=values.get("ANTHROPIC_API_KEY", cls.anthropic_api_key),
             llm_daily_model=values.get("TEAMMEM_LLM_DAILY_MODEL", cls.llm_daily_model),
             llm_report_model=values.get("TEAMMEM_LLM_REPORT_MODEL", cls.llm_report_model),
+            llm_concurrency=_bounded_integer(
+                values,
+                "TEAMMEM_LLM_CONCURRENCY",
+                cls.llm_concurrency,
+                1,
+                8,
+            ),
             env_file=env_file,
             github_token=values.get("TEAMMEM_GITHUB_TOKEN", cls.github_token),
             slack_bot_token=values.get("TEAMMEM_SLACK_BOT_TOKEN", cls.slack_bot_token),

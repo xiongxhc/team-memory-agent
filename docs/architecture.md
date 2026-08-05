@@ -1,7 +1,7 @@
 # Architecture
 
 ```text
-operator-controlled Mac mini / Linux server / VPS
+operator-controlled Mac mini / Linux server / VPS / Windows machine
 
 GitHub ─┐
 GitLab ─┤
@@ -14,8 +14,8 @@ MemberKit -> reviewed v1 bundle -> inbox importer
 
 The hub and MemberKit solve different parts of the data boundary:
 
-- `teammem` runs on an always-on, operator-controlled Mac mini, Linux server, or
-  VPS. It polls
+- `teammem` runs on an always-on, operator-controlled Mac mini, Linux server,
+  VPS, or Windows machine. It polls
   explicitly enabled central providers, imports reviewed bundles, owns the
   ledger, and regenerates shared views.
 - `teammem-memberkit` runs on each participating member's workstation. It drafts
@@ -90,15 +90,15 @@ directory; it does not pull Git or create the export.
 
 ## Daily run
 
-`teammem run-daily` executes enabled connectors independently, then runs the
-configured local stages:
+`teammem run-daily` is the full mode. It executes enabled connectors
+independently, then runs the configured local stages:
 
 1. collect each enabled provider;
 2. import reviewed MemberKit bundles when inbox, archive, and quarantine paths
    are all configured;
 3. reclaim newly mapped identities and projects;
-4. create daily journals and the Friday weekly report when an LLM backend is
-   available;
+4. create daily journals and reconcile the previous and current weekly reports
+   when an LLM backend is available;
 5. optionally synchronize project documents;
 6. deterministically render the Markdown vault;
 7. optionally commit and push that vault through the existing Git boundary;
@@ -106,10 +106,46 @@ configured local stages:
 
 A failed connector does not discard events already collected by another
 connector and does not prevent independent local work. Required local-state
-failures skip dependent stages. Synthesis failures remain visible and non-zero,
-but deterministic rendering may continue from ledger evidence and cached
-summaries. The command prints one result per stage and exits non-zero when a
-configured connector or required stage fails.
+failures skip dependent stages. Synthesis failures remain visible as failed
+stage results, but deterministic rendering may continue from ledger evidence and
+cached summaries. In full mode, connector, import, synthesis,
+documentation-sync, and
+push failures remain warning-level for the aggregate exit status; lock, ledger,
+reclaim, render, and snapshot failures return non-zero.
+
+`teammem run-daily --capture-only` follows the same ledger boundary through
+collection, bundle import, identity/project reclaim, and the configured atomic
+SQLite snapshot, then stops. Journal, report, documentation-sync, render, and
+push stages are explicitly skipped with `capture-only`. Capture mode never calls
+an LLM and never publishes a partially regenerated vault. An enabled connector
+or import failure is fatal to the capture-mode exit status, while successfully
+captured evidence is retained and snapshotted.
+
+Both modes acquire one lock adjacent to the canonical real ledger path. The file
+descriptor remains held for the entire run. Capture mode fails fast with
+`another run is active`; full mode streams lock-wait progress and waits at most
+30 minutes before returning non-zero. Unix uses `fcntl`; Windows imports
+`msvcrt` only on that platform.
+
+Daily cache identity is local to one person-day: identity, local date, project
+names in that slice, and the complete ordered event text. A compatibility check
+migrates verifiable old cache rows without an LLM call; an unverifiable row is
+regenerated safely. Only genuine misses enter a bounded worker pool, and worker
+threads call the LLM only. SQLite preparation, migration, and persistence remain
+serial on the main thread. `TEAMMEM_LLM_CONCURRENCY` defaults to `2` and accepts
+`1..8`. This changes execution and cache isolation only: it adds no ranking,
+caps, truncation, cross-person batching, retries, compaction, or model change.
+
+Each successful full synthesis run reconciles the previous and current report
+weeks. Monday through Thursday current-week reports are provisional; Friday is
+a checkpoint; Saturday and Sunday may reconcile the same established seven-day
+window. A report stores its exact coverage state, evidence cutoff precision,
+source-input identity, and deterministic flags atomically with its narrative.
+The renderer uses that stored provenance, so newly ingested but unsynthesized
+evidence cannot make an older report appear current. The Work Journal presents
+team outcomes under `Shipped`, `Needs attention`, and
+`Coordination-heavy / low artifact`, while retaining deterministic evidence and
+reference appendices below the synthesis.
 
 Hub scheduling is a separate, explicit lifecycle around the one-shot command.
 The portable `teammem.schedule` facade selects a macOS user LaunchAgent, Linux
@@ -117,6 +153,10 @@ systemd user service/timer, or Windows Task Scheduler backend. `teammem schedule
 install --time 18:20` writes and enables the selected definition; `schedule
 status` inspects it and `schedule remove` disables and removes it. Package
 installation and every other CLI command leave scheduler state unchanged.
+
+The public scheduler installs exactly one full daily run. Operators may add
+separate intraday jobs that invoke `teammem run-daily --capture-only`, but the
+package never creates those triggers implicitly.
 
 The scheduled process is exactly the resolved executable plus `--env-file`, the
 private environment-file path, and `run-daily`. Credential values are not copied

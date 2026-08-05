@@ -6,6 +6,7 @@ Links are relative markdown links (GitLab web UI renders [[wikilinks]] as
 empty repo-wiki pages; Obsidian handles relative links fine)."""
 
 import json
+import math
 import re
 import shutil
 import sqlite3
@@ -16,10 +17,13 @@ from urllib.parse import quote
 from .identity import IdentityMaps
 from .queries import (by_key, events_between, flags, ref_url,
                       week_label, week_monday, week_range)
+from .store import get_summary
 
 MANAGED = ("Person", "Projects", "Work Journal", "README.md")
 MAX_WORK_LINES = 12   # work bullets per person per week (project pages, person week files)
 WORK_KINDS = ("commit", "pr", "mr", "issue", "repo", "journal-highlight")
+_FLAG_KEYS = frozenset({"gaps", "unmapped", "unmapped_channels", "concentration"})
+_INVALID_FLAGS_MESSAGE = "invalid weekly report effective flags provenance"
 
 
 def _fname(name: str) -> str:
@@ -68,11 +72,69 @@ def _msg_channel_ids(rows: list[dict]) -> set:
     return chans
 
 
+def _stored_effective_flags(summary) -> dict | None:
+    """Parse a non-legacy weekly record before vault cleanup.
+
+    Missing flags are incomplete provenance, not permission to mix an older report
+    with mutable ledger flags. Legacy records retain the prior compatibility path.
+    """
+    if summary is None or summary.coverage_state is None:
+        return None
+    payload = summary.effective_flags_json
+    if payload is None or payload == "" or (isinstance(payload, str) and not payload.strip()):
+        return None
+    if not isinstance(payload, str):
+        raise ValueError(_INVALID_FLAGS_MESSAGE)
+    try:
+        parsed = json.loads(payload)
+    except (TypeError, ValueError):
+        raise ValueError(_INVALID_FLAGS_MESSAGE) from None
+    if not isinstance(parsed, dict) or set(parsed) - _FLAG_KEYS:
+        raise ValueError(_INVALID_FLAGS_MESSAGE)
+    _validate_flag_entries(parsed, "gaps", 1, (str,))
+    _validate_flag_entries(parsed, "unmapped", 2, (str, int))
+    _validate_flag_entries(parsed, "unmapped_channels", 2, (str, int))
+    _validate_flag_entries(parsed, "concentration", 3, (str, str, (int, float)))
+    for _, _, share in parsed.get("concentration", []):
+        if isinstance(share, bool) or not math.isfinite(share) or not 0 <= share <= 1:
+            raise ValueError(_INVALID_FLAGS_MESSAGE)
+    return parsed
+
+
+def _validate_flag_entries(
+    flags: dict, key: str, length: int, types: tuple[type | tuple[type, ...], ...]
+) -> None:
+    entries = flags.get(key, [])
+    if not isinstance(entries, list):
+        raise ValueError(_INVALID_FLAGS_MESSAGE)
+    for entry in entries:
+        if length == 1:
+            values = (entry,)
+        else:
+            if not isinstance(entry, list) or len(entry) != length:
+                raise ValueError(_INVALID_FLAGS_MESSAGE)
+            values = entry
+        if any(
+            isinstance(value, bool) or not isinstance(value, expected)
+            for value, expected in zip(values, types)
+        ):
+            raise ValueError(_INVALID_FLAGS_MESSAGE)
+
+
 def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                  today: date, weeks: int = 4,
                  channel_names: dict | None = None) -> dict:
     weeks = max(1, weeks)
     channel_names = channel_names or {}
+    mondays = [week_monday(today) - timedelta(weeks=i) for i in range(weeks)]
+    weekly_summaries = {
+        m: get_summary(conn, "weekly-team", f"team|{m.isoformat()}")
+        for m in mondays
+    }
+    stored_flags = {
+        m: _stored_effective_flags(summary)
+        for m, summary in weekly_summaries.items()
+    }
     vault_dir.mkdir(parents=True, exist_ok=True)
     for m in MANAGED:
         p = vault_dir / m
@@ -89,15 +151,12 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         written.add(path)
         path.write_text(content)
 
-    mondays = [week_monday(today) - timedelta(weeks=i) for i in range(weeks)]
     week_of = {m: events_between(conn, *week_range(m)) for m in mondays}
     files = 0
 
     def _summary(kind: str, key: str) -> str | None:
-        row = conn.execute(
-            "SELECT text FROM summaries WHERE kind = ? AND key = ?",
-            (kind, key)).fetchone()
-        return row[0] if row else None
+        summary = get_summary(conn, kind, key)
+        return summary.text if summary else None
 
     def _msg_line(msgs: list[dict]) -> str:
         cids = _msg_channel_ids(msgs)
@@ -119,11 +178,25 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     # ---- Work Journal: one report per rendered week -------------------------
     for m in mondays:
         rows, label = week_of[m], week_label(m)
-        f = flags(conn, m, ids)
-        report = _summary("weekly-team", f"team|{m.isoformat()}")
+        weekly_summary = weekly_summaries[m]
+        report = weekly_summary.text if weekly_summary else None
+        coverage_state = weekly_summary.coverage_state if weekly_summary else None
+        provenance_incomplete = weekly_summary is not None and (
+            coverage_state is not None and stored_flags[m] is None
+        )
+        if weekly_summary and coverage_state is not None:
+            f = stored_flags[m] or {}
+        else:
+            f = flags(conn, m, ids)
         md = [f"---\ntitle: {label} Team\ngenerated: {today.isoformat()}\n---\n",
               f"# {label} — Team\n"]
         if report:
+            if coverage_state is None:
+                md.append("\n> Legacy report — exact event cutoff unknown.\n")
+            elif provenance_incomplete:
+                md.append(
+                    "\n> Report provenance incomplete — stored effective flags unavailable.\n"
+                )
             md.append("\n" + report.rstrip() + "\n")
 
         tally = ["\n## Appendix — activity by person\n" if report else "\n## People\n"]
@@ -157,21 +230,34 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                       f"(prev {prev} {arrow})\n")
 
         flags_md = ["\n## Flags\n"]
-        for slug in f["gaps"]:
+        for slug in ([] if coverage_state == "provisional" else f.get("gaps", [])):
             flags_md.append(f"- **Gap**: {_person_link(_fname(ids.display_name(slug)))} — active in "
                       f"prior 4 weeks, no activity this week\n")
-        for person, n in f["unmapped"]:
+        for person, n in f.get("unmapped", []):
             flags_md.append(f"- **Unmapped**: `{person}` ({n} events) — add to "
                       f"roster.yaml, then `teammem reclaim`\n")
-        for chat_id, n in f["unmapped_channels"]:
+        for chat_id, n in f.get("unmapped_channels", []):
             cname = channel_names.get(chat_id)
             shown = f"**{cname}** (`{chat_id}`)" if cname else f"`{chat_id}`"
             flags_md.append(f"- **Unmapped channel**: {shown} ({n} messages) — map it "
                       f"in the matching projects.yaml provider channel list\n")
-        for proj, slug, share in f["concentration"]:
+        for proj, slug, share in (
+            [] if coverage_state == "provisional" else f.get("concentration", [])
+        ):
             flags_md.append(f"- **Concentration**: {_project_link(proj)} — {int(share * 100)}% by "
                       f"{_person_link(_fname(ids.display_name(slug)))}\n")
-        if not (f["gaps"] or f["unmapped"] or f["unmapped_channels"] or f["concentration"]):
+        if provenance_incomplete:
+            flags_md.append(
+                "- Stored effective flags unavailable; no current-ledger flags are shown.\n"
+            )
+        if coverage_state == "provisional":
+            flags_md.append(
+                "Gap and concentration checks are deferred until the Friday checkpoint.\n"
+            )
+        elif not provenance_incomplete and not (
+            f.get("gaps", []) or f.get("unmapped", [])
+            or f.get("unmapped_channels", []) or f.get("concentration", [])
+        ):
             flags_md.append("- none\n")
 
         if report:

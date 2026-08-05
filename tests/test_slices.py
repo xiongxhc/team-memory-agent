@@ -1,8 +1,8 @@
 import json
 
 from teammem.events import Event
-from teammem.slices import (active_person_days, daily_person_slice,
-                            slice_hash, weekly_team_input)
+from teammem.slices import (active_person_days, daily_person_projects,
+                            daily_person_slice, slice_hash, weekly_team_input)
 from teammem.store import insert_events, open_db
 
 
@@ -56,6 +56,25 @@ def test_active_person_days_and_weekly_input(tmp_path):
     ])
     assert text.index("alex") < text.index("sam")   # deterministic order
     assert "## alex — 2026-07-14\nA" in text
+
+
+def test_daily_person_projects_are_local_distinct_and_sorted(tmp_path):
+    conn = _db(tmp_path)
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T11:00:00+04:00", source="gitlab",
+              kind="commit", project="project-beta", summary="beta work", hash="h5"),
+        Event(person="sam", ts="2026-07-14T11:00:00+04:00", source="gitlab",
+              kind="commit", project="project-other", summary="other work", hash="h6"),
+        Event(person="alex", ts="2026-07-15T11:00:00+04:00", source="gitlab",
+              kind="commit", project="project-next", summary="next work", hash="h7"),
+        Event(person="alex", ts="2026-07-14T12:00:00+04:00", source="gitlab",
+              kind="commit", summary="no project", hash="h8"),
+    ])
+
+    assert daily_person_projects(conn, "alex", "2026-07-14") == [
+        "project-alpha",
+        "project-beta",
+    ]
 
 
 def test_message_text_handles_non_dict_json_content(tmp_path):

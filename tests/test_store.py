@@ -1,5 +1,15 @@
+import sqlite3
+
+import pytest
+
 from teammem.events import Event
-from teammem.store import open_db, insert_events, stats
+from teammem.store import insert_events, open_db, stats
+
+
+PROVENANCE = {
+    "evidence_cutoff", "cutoff_precision", "coverage_state",
+    "source_input_hash", "effective_flags_json",
+}
 
 
 def _ev(**kw):
@@ -26,6 +36,102 @@ def test_open_db_twice_is_safe(tmp_path):
     open_db(p).close()
     conn = open_db(p)                                  # migrate must be idempotent
     assert stats(conn)["total"] == 0
+
+
+def test_open_db_migrates_legacy_summaries_once(tmp_path):
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE summaries (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, "
+        "key TEXT NOT NULL, input_hash TEXT NOT NULL, text TEXT NOT NULL, "
+        "model TEXT NOT NULL, created_ts TEXT NOT NULL, UNIQUE(kind,key))"
+    )
+    conn.execute(
+        "INSERT INTO summaries(kind,key,input_hash,text,model,created_ts) "
+        "VALUES('weekly-team','team|2026-07-27','h','old','m','t')"
+    )
+    conn.commit()
+    conn.close()
+
+    from teammem.store import get_summary
+
+    upgraded = open_db(path)
+    columns = {row[1] for row in upgraded.execute("PRAGMA table_info(summaries)")}
+    assert PROVENANCE <= columns
+    record = get_summary(upgraded, "weekly-team", "team|2026-07-27")
+    assert record.text == "old"
+    assert record.evidence_cutoff is None
+    upgraded.close()
+    open_db(path).close()
+
+
+def test_open_db_rolls_back_every_column_when_legacy_migration_fails(tmp_path, monkeypatch):
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE summaries (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, "
+        "key TEXT NOT NULL, input_hash TEXT NOT NULL, text TEXT NOT NULL, "
+        "model TEXT NOT NULL, created_ts TEXT NOT NULL, UNIQUE(kind,key))"
+    )
+    conn.execute(
+        "INSERT INTO summaries(kind,key,input_hash,text,model,created_ts) "
+        "VALUES('weekly-team','team|2026-07-27','h','old','m','t')"
+    )
+    conn.commit()
+    conn.close()
+
+    from teammem import store
+
+    monkeypatch.setattr(
+        store,
+        "_SUMMARY_PROVENANCE_COLUMNS",
+        {**store._SUMMARY_PROVENANCE_COLUMNS, "must_fail": "TEXT NOT NULL"},
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        store.open_db(path)
+
+    inspected = sqlite3.connect(path)
+    columns = {row[1] for row in inspected.execute("PRAGMA table_info(summaries)")}
+    inspected.close()
+    assert not (PROVENANCE & columns)
+
+
+def test_put_summary_round_trips_every_record_field_atomically(tmp_path):
+    from teammem.store import SummaryRecord, get_summary, put_summary
+
+    conn = open_db(tmp_path / "ledger.db")
+    record = SummaryRecord(
+        kind="weekly-team",
+        key="team|2026-07-27",
+        input_hash="input-hash",
+        text="first narrative",
+        model="test-model",
+        created_ts="2026-08-05T10:00:00Z",
+        evidence_cutoff="2026-08-05T09:59:59Z",
+        cutoff_precision="second",
+        coverage_state="complete",
+        source_input_hash="source-hash",
+        effective_flags_json='{"include_prs":true}',
+    )
+    put_summary(conn, record)
+    assert get_summary(conn, record.kind, record.key) == record
+
+    replacement = SummaryRecord(
+        kind=record.kind,
+        key=record.key,
+        input_hash="replacement-hash",
+        text="replacement narrative",
+        model="replacement-model",
+        created_ts="2026-08-05T11:00:00Z",
+        evidence_cutoff="2026-08-05",
+        cutoff_precision="day",
+        coverage_state="partial",
+        source_input_hash="replacement-source-hash",
+        effective_flags_json='{"include_prs":false}',
+    )
+    put_summary(conn, replacement)
+    assert get_summary(conn, replacement.kind, replacement.key) == replacement
+    assert conn.execute("SELECT COUNT(*) FROM summaries").fetchone()[0] == 1
 
 
 def test_stats_groups_and_surfaces_unmapped(tmp_path):

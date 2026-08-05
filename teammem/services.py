@@ -6,7 +6,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -18,17 +20,29 @@ from .connectors.registry import get_connector
 from .docs_sync import sync_docs
 from .events import Event
 from .identity import IdentityMaps, _read
-from .queries import flags as week_flags
-from .queries import week_label, week_monday
+from .queries import report_context, week_label, week_monday
 from .reclaim import reclaim, reclaim_channel_projects
 from .render import render_vault
 from .slices import active_person_days
-from .store import insert_events, open_db, reconcile_gitlab_events
+from .store import get_summary, insert_events, open_db, reconcile_gitlab_events
 from .summarize import (
+    DAILY_SYSTEM,
+    LLM,
+    DailySummaryInput,
+    PreparedDailyJournal,
     claude_cli_llm,
-    daily_person_journal,
+    daily_cache_status,
     http_llm,
+    prepare_daily_journal,
+    put_daily_journal,
     weekly_team_report,
+)
+from .telemetry import (
+    Distribution,
+    ProgressEvent,
+    Reporter,
+    distribution,
+    noop_reporter,
 )
 from .vaultgit import commit_all, ensure_repo, push
 
@@ -39,6 +53,58 @@ class CollectionRun:
     inserted: int
     channel_names: dict[str, str]
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class JournalFailure:
+    person: str
+    day: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class JournalMetrics:
+    pairs: int
+    cached: int
+    migrated: int
+    llm_calls: int
+    concurrency: int
+    prompt_events: Distribution
+    prompt_bytes: Distribution
+    queue_wait_seconds: Distribution
+    backend_seconds: Distribution
+    elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class JournalRunResult:
+    metrics: JournalMetrics
+    failures: tuple[JournalFailure, ...]
+
+    @property
+    def failed_person_days(self) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted((failure.person, failure.day) for failure in self.failures))
+
+    @property
+    def exit_code(self) -> int:
+        return int(bool(self.failures))
+
+
+@dataclass(frozen=True)
+class ReportRunResult:
+    target_monday: date
+    status: str
+    detail: str
+    elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class _JournalCallResult:
+    prepared: PreparedDailyJournal
+    text: str | None
+    error: Exception | None
+    queue_wait_seconds: float
+    backend_seconds: float
 
 
 def redact_secrets(detail: object, cfg: Config) -> str:
@@ -247,6 +313,175 @@ def run_render(
     return 0
 
 
+def _invoke_daily_llm(
+    prepared: PreparedDailyJournal,
+    llm: LLM,
+    submitted_at: float,
+    monotonic: Callable[[], float],
+) -> _JournalCallResult:
+    started_at = monotonic()
+    text = None
+    error = None
+    try:
+        text = llm(DAILY_SYSTEM, prepared.user_prompt)
+    except Exception as failure:
+        error = failure
+    finished_at = monotonic()
+    return _JournalCallResult(
+        prepared=prepared,
+        text=text,
+        error=error,
+        queue_wait_seconds=started_at - submitted_at,
+        backend_seconds=finished_at - started_at,
+    )
+
+
+def _distribution_fields(name: str, value: Distribution) -> list[tuple[str, object]]:
+    fields: list[tuple[str, object]] = [(f"{name}_count", value.count)]
+    if value.count:
+        fields.extend((
+            (f"{name}_p50", value.p50),
+            (f"{name}_p95", value.p95),
+            (f"{name}_max", value.maximum),
+        ))
+    return fields
+
+
+def _journal_metric_fields(metrics: JournalMetrics) -> tuple[tuple[str, object], ...]:
+    fields: list[tuple[str, object]] = [
+        ("pairs", metrics.pairs),
+        ("cached", metrics.cached),
+        ("migrated", metrics.migrated),
+        ("llm_calls", metrics.llm_calls),
+        ("concurrency", metrics.concurrency),
+    ]
+    fields.extend(_distribution_fields("prompt_events", metrics.prompt_events))
+    fields.extend(_distribution_fields("prompt_bytes", metrics.prompt_bytes))
+    fields.extend(
+        _distribution_fields("queue_wait_seconds", metrics.queue_wait_seconds)
+    )
+    fields.extend(_distribution_fields("backend_seconds", metrics.backend_seconds))
+    fields.append(("elapsed_seconds", metrics.elapsed_seconds))
+    return tuple(fields)
+
+
+def execute_journal(
+    cfg: Config,
+    ids: IdentityMaps,
+    *,
+    start_day: str,
+    end_day: str,
+    created_ts: str,
+    conn: sqlite3.Connection,
+    llm: LLM,
+    reporter: Reporter = noop_reporter,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> JournalRunResult:
+    run_started_at = monotonic()
+    pairs = active_person_days(conn, start_day, end_day)
+    global_projects = [
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT project FROM events"
+            " WHERE project IS NOT NULL ORDER BY project"
+        )
+    ]
+    prepared_journals: list[PreparedDailyJournal] = []
+    misses: list[PreparedDailyJournal] = []
+    cached = migrated = 0
+    for person, day in pairs:
+        prepared = prepare_daily_journal(
+            conn,
+            person,
+            ids.display_name(person),
+            day,
+            global_projects,
+        )
+        if prepared is None:
+            continue
+        prepared_journals.append(prepared)
+        status, _text = daily_cache_status(conn, prepared)
+        if status == "cached":
+            cached += 1
+        elif status == "migrated":
+            migrated += 1
+        else:
+            misses.append(prepared)
+
+    call_results: list[_JournalCallResult] = []
+    if misses:
+        with ThreadPoolExecutor(max_workers=cfg.llm_concurrency) as executor:
+            futures = {
+                executor.submit(
+                    _invoke_daily_llm,
+                    prepared,
+                    llm,
+                    monotonic(),
+                    monotonic,
+                ): prepared
+                for prepared in misses
+            }
+            for completed, future in enumerate(as_completed(futures), start=1):
+                call_results.append(future.result())
+                reporter(ProgressEvent(
+                    "journal-progress",
+                    stage="journal",
+                    fields=(("completed", completed), ("total", len(misses))),
+                ))
+
+    successful = sorted(
+        (result for result in call_results if result.error is None),
+        key=lambda result: (result.prepared.person, result.prepared.day),
+    )
+    for result in successful:
+        put_daily_journal(
+            conn,
+            result.prepared,
+            result.text,
+            cfg.llm_daily_model,
+            created_ts,
+        )
+
+    failures = tuple(sorted(
+        (
+            JournalFailure(
+                person=result.prepared.person,
+                day=result.prepared.day,
+                detail=redact_secrets(result.error, cfg),
+            )
+            for result in call_results
+            if result.error is not None
+        ),
+        key=lambda failure: (failure.person, failure.day),
+    ))
+    metrics = JournalMetrics(
+        pairs=len(prepared_journals),
+        cached=cached,
+        migrated=migrated,
+        llm_calls=len(misses),
+        concurrency=cfg.llm_concurrency,
+        prompt_events=distribution([
+            prepared.event_count for prepared in prepared_journals
+        ]),
+        prompt_bytes=distribution([
+            prepared.prompt_bytes for prepared in prepared_journals
+        ]),
+        queue_wait_seconds=distribution([
+            result.queue_wait_seconds for result in call_results
+        ]),
+        backend_seconds=distribution([
+            result.backend_seconds for result in call_results
+        ]),
+        elapsed_seconds=monotonic() - run_started_at,
+    )
+    reporter(ProgressEvent(
+        "journal-progress",
+        stage="journal",
+        fields=_journal_metric_fields(metrics),
+    ))
+    return JournalRunResult(metrics=metrics, failures=failures)
+
+
 def run_journal(
     cfg: Config,
     ids: IdentityMaps,
@@ -264,15 +499,8 @@ def run_journal(
     else:
         start_day = (today - timedelta(days=since_days - 1)).isoformat()
         end_day = today.isoformat()
-    pairs = active_person_days(connection, start_day, end_day)
-    projects = [
-        row[0]
-        for row in connection.execute(
-            "SELECT DISTINCT project FROM events "
-            "WHERE project IS NOT NULL ORDER BY project"
-        )
-    ]
     if dry_run:
+        pairs = active_person_days(connection, start_day, end_day)
         for person, pair_day in pairs:
             cached = connection.execute(
                 "SELECT input_hash FROM summaries "
@@ -295,45 +523,111 @@ def run_journal(
             file=sys.stderr,
         )
         return 2
-    generated = cached_n = 0
-    for person, pair_day in pairs:
-        before = connection.execute("SELECT COUNT(*) FROM summaries").fetchone()[0]
-        pre = connection.execute(
-            "SELECT input_hash FROM summaries "
-            "WHERE kind='daily-person' AND key=?",
-            (f"{person}|{pair_day}",),
-        ).fetchone()
-        text = daily_person_journal(
-            connection,
-            person,
-            ids.display_name(person),
-            pair_day,
-            projects,
-            backend,
-            cfg.llm_daily_model,
-            created_ts=f"{today.isoformat()}T00:00:00",
-        )
-        post = connection.execute(
-            "SELECT input_hash FROM summaries "
-            "WHERE kind='daily-person' AND key=?",
-            (f"{person}|{pair_day}",),
-        ).fetchone()
-        if text is None:
-            continue
-        if (
-            pre == post
-            and before
-            == connection.execute("SELECT COUNT(*) FROM summaries").fetchone()[0]
-            and pre is not None
-        ):
-            cached_n += 1
-        else:
-            generated += 1
-    print(
-        f"journals: {generated} generated, {cached_n} cached"
-        f" ({len(pairs)} pairs, model {cfg.llm_daily_model})"
+    result = execute_journal(
+        cfg,
+        ids,
+        start_day=start_day,
+        end_day=end_day,
+        created_ts=f"{today.isoformat()}T00:00:00",
+        conn=connection,
+        llm=backend,
     )
-    return 0
+    generated = result.metrics.llm_calls - len(result.failures)
+    migration_detail = (
+        f", {result.metrics.migrated} migrated"
+        if result.metrics.migrated
+        else ""
+    )
+    failure_detail = (
+        f", {len(result.failures)} failed" if result.failures else ""
+    )
+    print(
+        f"journals: {generated} generated, {result.metrics.cached} cached"
+        f"{migration_detail}{failure_detail}"
+        f" ({result.metrics.pairs} pairs, model {cfg.llm_daily_model})"
+    )
+    for failure in result.failures:
+        print(
+            f"WARN journal {failure.person} {failure.day}: {failure.detail}",
+            file=sys.stderr,
+        )
+    return result.exit_code
+
+
+def _report_dailies(
+    conn: sqlite3.Connection,
+    monday: date,
+) -> list[DailySummaryInput]:
+    days = {
+        (monday + timedelta(days=index)).isoformat()
+        for index in range(7)
+    }
+    dailies = []
+    for key, input_hash, text in conn.execute(
+        "SELECT key, input_hash, text FROM summaries "
+        "WHERE kind = 'daily-person' ORDER BY key"
+    ):
+        person, day = key.split("|", 1)
+        if day in days:
+            dailies.append(DailySummaryInput(person, day, input_hash, text))
+    return dailies
+
+
+def execute_report(
+    cfg: Config,
+    ids: IdentityMaps,
+    *,
+    target_week: date,
+    operator_date: date,
+    conn: sqlite3.Connection,
+    llm: LLM,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> ReportRunResult:
+    started_at = monotonic()
+    monday = week_monday(target_week)
+    dailies = _report_dailies(conn, monday)
+    if not dailies:
+        return ReportRunResult(
+            monday,
+            "skipped",
+            "no daily journals",
+            monotonic() - started_at,
+        )
+
+    try:
+        context = report_context(
+            conn,
+            monday,
+            operator_date,
+            ids,
+            {(daily.person, daily.day) for daily in dailies},
+        )
+        key = f"team|{monday.isoformat()}"
+        existing = get_summary(conn, "weekly-team", key)
+        record = weekly_team_report(
+            conn,
+            monday_iso=monday.isoformat(),
+            dailies=dailies,
+            context=context,
+            llm=llm,
+            model=cfg.llm_report_model,
+            created_ts=f"{operator_date.isoformat()}T00:00:00",
+        )
+        status = (
+            "cached"
+            if existing is not None and existing.input_hash == record.input_hash
+            else "generated"
+        )
+        detail = f"{len(dailies)} dailies"
+    except Exception as failure:
+        status = "failed"
+        detail = redact_secrets(failure, cfg)
+    return ReportRunResult(
+        monday,
+        status,
+        detail,
+        monotonic() - started_at,
+    )
 
 
 def run_report(
@@ -347,19 +641,7 @@ def run_report(
 ) -> int:
     connection = conn or open_db(cfg.db_path)
     monday = week_monday(base)
-    days = [(monday + timedelta(days=index)).isoformat() for index in range(7)]
-    rows = connection.execute(
-        "SELECT key, text FROM summaries WHERE kind = 'daily-person'"
-    ).fetchall()
-    dailies = [
-        {
-            "person": key.split("|", 1)[0],
-            "day": key.split("|", 1)[1],
-            "text": text,
-        }
-        for key, text in rows
-        if key.split("|", 1)[1] in days
-    ]
+    dailies = _report_dailies(connection, monday)
     if not dailies:
         print(
             f"no daily journals cached for {week_label(monday)};"
@@ -386,17 +668,22 @@ def run_report(
             file=sys.stderr,
         )
         return 2
-    weekly_team_report(
-        connection,
-        monday.isoformat(),
-        dailies,
-        week_flags(connection, monday, ids),
-        backend,
-        cfg.llm_report_model,
-        created_ts=f"{base.isoformat()}T00:00:00",
+    result = execute_report(
+        cfg,
+        ids,
+        target_week=base,
+        operator_date=date.today(),
+        conn=connection,
+        llm=backend,
     )
+    if result.status == "failed":
+        print(
+            f"report: failed {week_label(result.target_monday)} — {result.detail}",
+            file=sys.stderr,
+        )
+        return 1
     print(
-        f"report: generated {week_label(monday)}"
+        f"report: {result.status} {week_label(monday)}"
         f" from {len(dailies)} dailies (model {cfg.llm_report_model})"
     )
     return 0

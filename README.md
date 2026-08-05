@@ -276,6 +276,36 @@ exit status and retry on the next run. Ledger, identity-reclaim, render, and
 snapshot failures return non-zero so the scheduler reports failures that threaten
 the ledger or its durable local projection.
 
+With an available LLM backend, every full run synthesizes both the current and
+previous report weeks. The current Work Journal is marked **Provisional** from
+Monday through Thursday, becomes a **Friday checkpoint** on Friday, and can
+reconcile later evidence over the weekend. Rechecking the previous week lets
+late provider events or reviewed MemberKit bundles update a stale report.
+Reports consolidate evidence into `Shipped`, `Needs attention`, and
+`Coordination-heavy / low artifact`; they do not use raw event count as an impact
+score. Without an LLM backend, journal and report synthesis are skipped while
+deterministic rendering continues from ledger evidence and any cached summaries.
+
+For an operator-managed intraday trigger, use the capture mode:
+
+```bash
+teammem run-daily --capture-only
+```
+
+It collects enabled sources, imports reviewed bundles, reclaims mappings, writes
+the configured atomic ledger snapshot, and stops. Journal/report synthesis,
+documentation sync, rendering, and Git publication are skipped, so capture mode
+cannot partially publish a vault. An enabled connector or import failure makes
+capture mode return non-zero after preserving successfully captured evidence.
+The full and capture modes share one ledger lock: capture fails fast if another
+run owns it, while a full run waits for at most 30 minutes.
+
+Journal synthesis defaults to two concurrent LLM calls. Set
+`TEAMMEM_LLM_CONCURRENCY` to an integer from `1` through `8` (`1` restores serial
+calls). The runtime optimization preserves the complete ordered text of every
+person-day slice. It adds no ranking, event cap, truncation, cross-person
+batching, retry loop, compaction, or model change.
+
 Only after the observed run succeeds, explicitly install the daily job. The
 default and example below are 18:20 in the operator machine's local timezone:
 
@@ -285,7 +315,9 @@ teammem schedule status
 ```
 
 The built-in schedule invokes only `teammem run-daily`; it does not pull or
-export a private MemberKit inbox. On Windows it is a current-user, logged-in-only
+export a private MemberKit inbox and it does not install extra capture triggers.
+Any intraday `--capture-only` trigger is an explicit operator-managed scheduler
+choice. On Windows it is a current-user, logged-in-only
 Task Scheduler task: a screen lock is fine, but logout prevents runs. See the
 [deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md)
 for macOS/Linux/Windows paths, logs, missed-run behavior, safe inbox staging,

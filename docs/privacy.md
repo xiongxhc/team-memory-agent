@@ -140,6 +140,25 @@ operator's 18:20-local-time-by-default launchd, systemd user, or Windows Task
 Scheduler job; `teammem schedule status` inspects it and `teammem schedule
 remove` removes it.
 
+`teammem run-daily --capture-only` keeps the same consent and collection
+boundaries. It collects enabled sources and reviewed bundles, reclaims mappings,
+and writes the configured atomic ledger snapshot, but it performs no LLM work,
+documentation sync, Markdown rendering, commit, or push. It therefore cannot
+publish a partially updated vault. A failed enabled source or import is reported
+with a non-zero exit after successfully captured evidence has been preserved.
+
+Full and capture runs cannot overlap on one ledger. Capture fails fast if the
+canonical-ledger lock is held; a full run waits at most 30 minutes. Progress and
+timing telemetry contains stage names, counts, durations, dates, modes, and
+status only—never prompts, event text, credentials, or provider payloads.
+
+The built-in schedule remains one full daily run. Optional intraday capture jobs
+must be installed separately and explicitly by the operator. Journal concurrency
+defaults to `2` and may be configured from `1` through `8`; concurrency changes
+only how independent LLM calls are executed. It does not rank, cap, truncate,
+batch, retry, compact, or change the model, and worker threads never access the
+SQLite connection.
+
 The schedule definition contains no credential values. Its process invocation
 contains only the resolved executable, `--env-file`, the private environment
 file's path, and `run-daily`; secrets stay inside the separately protected

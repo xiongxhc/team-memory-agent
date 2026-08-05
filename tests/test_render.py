@@ -1,3 +1,4 @@
+import json
 from datetime import date
 from pathlib import Path
 
@@ -6,7 +7,7 @@ import pytest
 from teammem.events import Event
 from teammem.identity import IdentityMaps
 from teammem.render import render_vault
-from teammem.store import open_db, insert_events
+from teammem.store import SummaryRecord, insert_events, open_db, put_summary
 
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
 TODAY = date(2026, 7, 16)
@@ -135,6 +136,31 @@ def _seed_summaries(conn):
     conn.commit()
 
 
+def _store_weekly_summary(
+    conn,
+    *,
+    text: str,
+    coverage_state: str | None = None,
+    effective_flags: dict | None = None,
+) -> None:
+    put_summary(conn, SummaryRecord(
+        "weekly-team",
+        "team|2026-07-13",
+        "weekly-hash",
+        text,
+        "fake",
+        "t",
+        evidence_cutoff=("2026-07-14T10:00:00+04:00" if coverage_state else None),
+        cutoff_precision=("instant" if coverage_state else None),
+        coverage_state=coverage_state,
+        source_input_hash=("source-hash" if coverage_state else None),
+        effective_flags_json=(
+            json.dumps(effective_flags, sort_keys=True, separators=(",", ":"))
+            if effective_flags is not None else None
+        ),
+    ))
+
+
 def test_person_page_shows_day_entries_with_detail_demoted(tmp_path):
     conn = _seed(tmp_path)
     _seed_summaries(conn)
@@ -158,6 +184,186 @@ def test_weekly_page_synthesized_with_appendix_and_stable(tmp_path):
     assert page.index("## Shipped") < page.index("## Appendix — activity by person")
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)   # byte-stable
     assert (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text() == page
+
+
+def test_weekly_page_keeps_stored_coverage_and_flags_after_later_evidence(tmp_path):
+    """Replacing stored report facts with current-ledger facts would break this."""
+    conn = _seed(tmp_path)
+    _store_weekly_summary(
+        conn,
+        text=(
+            "> Provisional — event timestamps through 2026-07-14T10:00:00+04:00.\n\n"
+            "## Shipped\n- JWT race fixed"
+        ),
+        coverage_state="provisional",
+        effective_flags={
+            "unmapped": [["_unmapped/x@y.z", 1]],
+            "unmapped_channels": [],
+        },
+    )
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-16T20:00:00+04:00", source="gitlab",
+        kind="commit", summary="arrived after synthesis", hash="later",
+        project="project-alpha",
+    )])
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    page = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text()
+    assert "> Provisional — event timestamps through 2026-07-14T10:00:00+04:00." in page
+    assert "arrived after synthesis" in page
+    assert "**Gap**" not in page
+    assert "**Unmapped**: `_unmapped/x@y.z` (1 events)" in page
+    assert "Gap and concentration checks are deferred until the Friday checkpoint." in page
+
+
+def test_legacy_weekly_page_warns_when_exact_cutoff_is_not_stored(tmp_path):
+    """Removing the explicit legacy warning would overstate old report coverage."""
+    conn = _seed(tmp_path)
+    _store_weekly_summary(conn, text="## Shipped\n- historical report")
+    vault = tmp_path / "vault"
+
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    page = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text()
+    assert "> Legacy report — exact event cutoff unknown." in page
+    assert "event timestamps through" not in page
+
+
+def test_provisional_weekly_page_hides_stored_gap_and_concentration(tmp_path):
+    """Rendering partial-week absence claims before Friday would break this."""
+    conn = _seed(tmp_path)
+    _store_weekly_summary(
+        conn,
+        text="## Shipped\n- rolling report",
+        coverage_state="provisional",
+        effective_flags={
+            "gaps": ["sam"],
+            "unmapped": [["_unmapped/x@y.z", 1]],
+            "unmapped_channels": [["oc_orphan", 2]],
+            "concentration": [["project-alpha", "alex", 0.9]],
+        },
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    page = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text()
+    assert "**Gap**" not in page
+    assert "**Concentration**" not in page
+    assert "**Unmapped**: `_unmapped/x@y.z` (1 events)" in page
+    assert "**Unmapped channel**: `oc_orphan` (2 messages)" in page
+    assert "Gap and concentration checks are deferred until the Friday checkpoint." in page
+
+
+def test_friday_weekly_page_renders_stored_gap_and_concentration_stably(tmp_path):
+    """Dropping checkpoint flag facts or making output unstable would break this."""
+    conn = _seed(tmp_path)
+    _store_weekly_summary(
+        conn,
+        text=(
+            "> Friday checkpoint — event timestamps through 2026-07-17T18:30:00+04:00; "
+            "later evidence reconciles on the next full run.\n\n## Shipped\n- checkpoint report"
+        ),
+        coverage_state="friday-checkpoint",
+        effective_flags={
+            "gaps": ["sam"],
+            "unmapped": [],
+            "unmapped_channels": [],
+            "concentration": [["project-alpha", "alex", 0.9]],
+        },
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    first = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_bytes()
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    page = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text()
+
+    assert "**Gap**: [Sam Lee]" in page
+    assert "**Concentration**: [project-alpha]" in page
+    assert "Gap and concentration checks are deferred" not in page
+    assert (vault / "Work Journal" / "Week 2026-07-13-17.md").read_bytes() == first
+
+
+def _managed_vault_bytes(vault: Path) -> dict[str, bytes]:
+    contents = {
+        "Person/existing.md": b"person before render\n",
+        "Projects/existing.md": b"project before render\n",
+        "Work Journal/existing.md": b"journal before render\n",
+        "README.md": b"root before render\n",
+    }
+    for relative, content in contents.items():
+        path = vault / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    return {relative: (vault / relative).read_bytes() for relative in contents}
+
+
+@pytest.mark.parametrize(
+    "effective_flags",
+    [
+        pytest.param("not-json", id="malformed-json"),
+        pytest.param("[]", id="non-object"),
+        pytest.param('{"gaps":[1]}', id="malformed-entry"),
+        pytest.param('{"unexpected":[]}', id="unknown-key"),
+    ],
+)
+def test_invalid_nonlegacy_flags_preserve_existing_managed_vault(tmp_path, effective_flags):
+    """Parsing stored flags after cleanup would erase this vault on bad provenance."""
+    conn = _seed(tmp_path)
+    _store_weekly_summary(
+        conn,
+        text="## Shipped\n- stored report",
+        coverage_state="friday-checkpoint",
+        effective_flags={},
+    )
+    conn.execute(
+        "UPDATE summaries SET effective_flags_json = ? WHERE kind = 'weekly-team'",
+        (effective_flags,),
+    )
+    conn.commit()
+    vault = tmp_path / "vault"
+    before = _managed_vault_bytes(vault)
+
+    with pytest.raises(ValueError, match="invalid weekly report effective flags provenance"):
+        render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    assert {
+        relative: (vault / relative).read_bytes() for relative in before
+    } == before
+
+
+def test_partial_nonlegacy_provenance_never_uses_later_ledger_flags(tmp_path):
+    """Falling back to current flags beside an older report would break this."""
+    conn = _seed(tmp_path)
+    _store_weekly_summary(
+        conn,
+        text=(
+            "> Provisional — event timestamps through 2026-07-14T10:00:00+04:00.\n\n"
+            "## Shipped\n- stored report"
+        ),
+        coverage_state="provisional",
+        effective_flags=None,
+    )
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    insert_events(conn, [Event(
+        person="_unmapped/late@y.z", ts="2026-07-16T20:00:00+04:00",
+        source="gitlab", kind="commit", summary="late unmapped evidence",
+        hash="late-unmapped",
+    )])
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    page = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text()
+    assert "> Report provenance incomplete — stored effective flags unavailable." in page
+    assert "Stored effective flags unavailable; no current-ledger flags are shown." in page
+    assert "Gap and concentration checks are deferred until the Friday checkpoint." in page
+    assert "**Gap**" not in page
+    assert "**Unmapped**" not in page
+    assert "**Concentration**" not in page
+    assert "late@y.z" not in page
 
 
 def test_render_without_summaries_falls_back_to_m2_layout(tmp_path):

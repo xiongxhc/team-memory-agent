@@ -2,9 +2,10 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 
@@ -296,6 +297,39 @@ def test_report_generates_from_cached_dailies(tmp_path, monkeypatch, capsys):
     assert row and "Shipped" in row[0]
 
 
+def test_report_week_of_sets_target_while_local_today_sets_operator_state(
+    tmp_path, monkeypatch
+):
+    db = _journal_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    from teammem.store import open_db
+    conn = open_db(db)
+    conn.execute("INSERT INTO summaries (kind, key, input_hash, text, model, created_ts)"
+                 " VALUES ('daily-person', 'alex|2026-07-14', 'h', 'Alex fixed X.', 'f', 't')")
+    conn.commit()
+
+    import teammem.services as services_mod
+
+    class OperatorDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 7, 20)
+
+    monkeypatch.setattr(services_mod, "date", OperatorDate)
+    def fake_http_llm(_model, _key, max_tokens):
+        return lambda _system, _user: "## Shipped\n- X"
+
+    monkeypatch.setattr(services_mod, "http_llm", fake_http_llm)
+
+    assert main(["report", "--week-of", "2026-07-14"]) == 0
+
+    stored = open_db(db).execute(
+        "SELECT coverage_state, created_ts FROM summaries "
+        "WHERE kind='weekly-team' AND key='team|2026-07-13'"
+    ).fetchone()
+    assert stored == ("friday-checkpoint", "2026-07-20T00:00:00")
+
+
 def test_report_no_key_no_dailies_still_exits_zero(tmp_path, monkeypatch, capsys):
     _journal_db(tmp_path, monkeypatch)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -521,7 +555,7 @@ def test_run_daily_prints_step_warnings_and_returns_result_exit_code(
     monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
     monkeypatch.setattr(
         "teammem.cli.run_daily",
-        lambda cfg, ids, settings, now: DailyResult(
+        lambda cfg, ids, settings, now, **kwargs: DailyResult(
             steps=(
                 StepResult(
                     "discord",
@@ -565,13 +599,57 @@ def test_run_daily_passes_a_local_aware_clock(tmp_path, monkeypatch):
     monkeypatch.setattr("teammem.cli.datetime", FixedDateTime)
     monkeypatch.setattr(
         "teammem.cli.run_daily",
-        lambda cfg, ids, settings, now: seen.setdefault("now", now)
+        lambda cfg, ids, settings, now, **kwargs: seen.setdefault("now", now)
         and DailyResult(steps=(), exit_code=0),
     )
 
     assert main(["run-daily"]) == 0
     assert seen["now"].utcoffset() == timedelta(hours=-7)
     assert (seen["now"].date(), seen["now"].hour) == (local_now.date(), 18)
+
+
+def test_run_daily_capture_only_streams_progress_before_final_result(
+    tmp_path, monkeypatch, capsys
+):
+    from teammem.daily import DailyResult, StepResult
+    from teammem.telemetry import ProgressEvent
+
+    seen = {}
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+
+    def fake_run_daily(cfg, ids, settings, now, **kwargs):
+        seen.update(kwargs)
+        kwargs["reporter"](
+            ProgressEvent("stage-start", stage="ledger")
+        )
+        return DailyResult(
+            steps=(StepResult("ledger", "failed", "cannot open"),),
+            exit_code=1,
+        )
+
+    monkeypatch.setattr("teammem.cli.run_daily", fake_run_daily)
+
+    assert main(["run-daily", "--capture-only"]) == 1
+
+    captured = capsys.readouterr()
+    lines = captured.err.splitlines()
+    progress_index = next(
+        index for index, line in enumerate(lines) if '"event":"stage-start"' in line
+    )
+    progress = json.loads(lines[progress_index])
+    final_index = lines.index("ledger: failed — cannot open")
+    assert progress_index < final_index
+    assert UUID(progress["run_id"]).version == 4
+    assert seen["capture_only"] is True
+    assert seen["reporter"] is not None
+
+
+def test_run_daily_help_describes_capture_only(capsys):
+    with pytest.raises(SystemExit) as failure:
+        main(["run-daily", "--help"])
+
+    assert failure.value.code == 0
+    assert "capture, import, reclaim, and snapshot" in capsys.readouterr().out
 
 
 def test_cli_journal_uses_shared_llm_backend_resolver(
@@ -610,7 +688,7 @@ def test_global_env_file_is_loaded_before_run_daily_and_process_env_wins(
     monkeypatch.setattr(
         cli_module,
         "run_daily",
-        lambda cfg, ids, settings, now: (
+        lambda cfg, ids, settings, now, **kwargs: (
             seen.update(
                 env_file=cfg.env_file,
                 config_dir=cfg.config_dir,
@@ -755,7 +833,7 @@ def test_non_schedule_commands_never_install_a_schedule(
     monkeypatch.setattr(
         cli_module,
         "run_daily",
-        lambda cfg, ids, settings, now: DailyResult(steps=(), exit_code=0),
+        lambda cfg, ids, settings, now, **kwargs: DailyResult(steps=(), exit_code=0),
     )
 
     assert main(["--env-file", str(tmp_path / "missing.env"), *argv]) == 0

@@ -126,6 +126,7 @@ Process environment values override file values for one run.
 | `TEAMMEM_PUSH` | Optional | Best-effort Git push of the rendered vault when true |
 | `ANTHROPIC_API_KEY` | Optional | Enables journal and weekly-report synthesis |
 | `TEAMMEM_LLM_DAILY_MODEL`, `TEAMMEM_LLM_REPORT_MODEL` | Optional | Override synthesis model names |
+| `TEAMMEM_LLM_CONCURRENCY` | Optional | Concurrent journal LLM calls; default `2`, valid integers `1..8` |
 
 Without an LLM backend, synthesis stages are skipped and deterministic rendering
 still succeeds.
@@ -232,6 +233,39 @@ ledger or its durable local projection. Required ledger, reclaim, and render
 failures still skip dependent work; LLM failures may still permit deterministic
 rendering from ledger evidence and cached summaries.
 
+With an available LLM backend, the full run synthesizes or reuses daily person
+journals, then reconciles both the previous and current Work Journal weeks.
+Current-week reports are marked provisional Monday through Thursday, become a
+Friday checkpoint, and may reconcile late evidence during the weekend.
+Previous-week reconciliation catches late provider events and reviewed MemberKit
+bundles. Each rendered report states the cutoff and precision stored with the
+synthesis; it does not present newly captured but unsynthesized rows as covered.
+Without an LLM backend, journal and report synthesis are skipped while
+deterministic rendering continues from ledger evidence and cached summaries.
+
+Use capture-only for an operator-managed intraday evidence tick:
+
+```bash
+teammem run-daily --capture-only
+```
+
+This mode collects enabled connectors, imports reviewed bundles, reclaims
+identity and project mappings, writes the configured atomic snapshot, and skips
+journal, report, documentation-sync, render, and push. It performs no LLM call
+and no vault publication. If an enabled connector or the configured import fails,
+capture-only returns non-zero after preserving and snapshotting successful work.
+
+Full and capture runs share a canonical-ledger lock. Capture mode fails fast if
+another run is active. Full mode waits up to 30 minutes and prints content-free
+progress before failing. Keep the ledger and its adjacent lock file on a local
+filesystem with normal OS locking semantics.
+
+Journal calls default to concurrency `2`; set `TEAMMEM_LLM_CONCURRENCY=1` for a
+serial backend or another integer through `8` after observing provider capacity.
+Only genuine person-day cache misses are submitted concurrently. Every event and
+the full ordered person-day text remain in scope: there is no ranking, cap,
+truncation, cross-person batching, hidden retry, compaction, or model change.
+
 `run-daily` does not stay resident and does not install, change, or remove a
 schedule. After that observed run succeeds, explicitly install the 18:20 daily
 job and inspect it:
@@ -247,6 +281,11 @@ The schedule's invocation contains only the resolved `teammem` executable,
 `--env-file`, the environment-file path, and `run-daily`. Credential values
 remain in the separately protected environment file and are never copied into a
 launchd, systemd, or Windows Task Scheduler definition.
+
+The built-in definition always invokes the full `run-daily` command and installs
+only one daily job. Extra intraday capture triggers are optional, explicit
+operator-owned scheduler entries whose action includes `run-daily
+--capture-only`; rerunning `teammem schedule install` does not create them.
 
 Polling needs outbound provider HTTPS access and Git access when the operator
 performs inbox or vault transport. It opens no inbound public port.

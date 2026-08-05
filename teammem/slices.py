@@ -9,9 +9,9 @@ import sqlite3
 
 def _rows(conn: sqlite3.Connection, person: str, day: str) -> list[dict]:
     cur = conn.execute(
-        "SELECT project, ts, kind, summary, raw FROM events"
+        "SELECT project, ts, kind, summary, raw, source, hash FROM events"
         " WHERE person = ? AND substr(ts, 1, 10) = ?"
-        " ORDER BY ts, kind, summary", (person, day))
+        " ORDER BY ts, kind, summary, project, source, hash", (person, day))
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -32,6 +32,30 @@ def daily_person_slice(conn: sqlite3.Connection, person: str, day: str) -> str:
         text = _message_text(r) if r["kind"] == "message" else r["summary"]
         lines.append(f"{r['ts']}  {r['kind']}  {r['project'] or '-'}  {text}")
     return "\n".join(lines)
+
+
+def daily_person_projects(
+    conn: sqlite3.Connection, person: str, day: str
+) -> list[str]:
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT project FROM events"
+            " WHERE person = ? AND substr(ts, 1, 10) = ?"
+            " AND project IS NOT NULL ORDER BY project",
+            (person, day),
+        )
+    ]
+
+
+def daily_person_event_count(
+    conn: sqlite3.Connection, person: str, day: str
+) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM events"
+        " WHERE person = ? AND substr(ts, 1, 10) = ?",
+        (person, day),
+    ).fetchone()[0]
 
 
 def slice_hash(text: str) -> str:
