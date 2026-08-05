@@ -2,6 +2,7 @@
 __pycache__/
 *.egg-info/
 ledger.db
+ledger.db.lock
 config/roster.yaml
 config/projects.yaml
 config/sweep_exclude.yaml
