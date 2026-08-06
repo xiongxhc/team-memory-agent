@@ -169,7 +169,7 @@ def _reconcile_gitlab_commit(conn: sqlite3.Connection, event: Event) -> int:
         candidates = conn.execute(
             "SELECT id, refs FROM events "
             "WHERE source = 'gitlab' AND kind = 'commit' AND hash = ? "
-            "AND project IS ?",
+            "AND (project IS ? OR project IS NULL)",
             (legacy_sha, event.project),
         ).fetchall()
         candidates = [row for row in candidates if row[1] == event.refs]

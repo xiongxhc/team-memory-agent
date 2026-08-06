@@ -65,6 +65,36 @@ def test_gitlab_commit_reconciliation_upgrades_legacy_bare_sha_without_duplicate
     )]
 
 
+def test_gitlab_commit_reconciliation_maps_null_legacy_project_without_duplicate(
+    tmp_path,
+):
+    conn = open_db(tmp_path / "ledger.db")
+    refs = json.dumps({"sha": "shared-sha", "url": "https://gitlab.test/a/commit/shared-sha"})
+    legacy = _ev(project=None, hash="shared-sha", refs=refs)
+    current = _ev(
+        project="project-alpha",
+        summary="current commit title",
+        hash=event_hash("commit", "1", "shared-sha"),
+        refs=refs,
+    )
+    assert insert_events(conn, [legacy]) == 1
+
+    inserted = reconcile_gitlab_events(
+        conn,
+        [current],
+        IdentityMaps.load(CONFIG_DIR),
+    )
+
+    assert inserted == 0
+    assert conn.execute(
+        "SELECT project, summary, hash FROM events"
+    ).fetchall() == [(
+        "project-alpha",
+        "current commit title",
+        event_hash("commit", "1", "shared-sha"),
+    )]
+
+
 def test_gitlab_commit_reconciliation_preserves_same_sha_across_projects(
     tmp_path,
 ):
