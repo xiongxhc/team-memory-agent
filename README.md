@@ -1,5 +1,9 @@
 # Team Memory Agent
 
+> Operators deploy by pinning a reviewed revision; downstream systems
+> integrate by reading the rendered vault output, never the ledger or engine
+> internals.
+
 Team Memory Agent turns scattered team activity into a local, queryable event
 ledger and regenerated Markdown reports. It combines central signals such as forge
 commits and shared project-channel messages with member-reviewed local highlights.
