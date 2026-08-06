@@ -4,11 +4,11 @@
 > `v0.4.0` tag. Both manifests at that tag declare `0.4.0`; this documentation
 > change does not alter the current checkout's package versions or create a
 > release. The completed `0.4.0` work now belongs in its dated section, while
-> post-tag and pending-integration work remains under `Unreleased`.
+> post-tag work remains under `Unreleased`.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an accurate source-controlled version history for TeamMem and MemberKit, including every published release through `v0.4.0`, post-release work, and clearly labelled pending-integration changes.
+**Goal:** Add an accurate source-controlled version history for TeamMem and MemberKit, including every published release through `v0.4.0` and current post-release work.
 
 **Architecture:** Keep one root changelog because the release workflow versions and publishes both packages together. Organize every version by package and change type, then expose the file from the root README and both packages' project metadata.
 
@@ -31,7 +31,7 @@
 - Create: `CHANGELOG.md`
 
 **Interfaces:**
-- Consumes: Git tags `v0.1.0` through `v0.4.0`; their published GitHub release descriptions; commits in `v0.4.0..master`; and separately pending integration commits that are explicitly labelled as such
+- Consumes: Git tags `v0.1.0` through `v0.4.0`; their published GitHub release descriptions; and current commits after `v0.4.0`
 - Produces: the canonical human-readable version history used by repository readers and future GitHub releases
 
 - [ ] **Step 1: Create the changelog header and release ordering**
@@ -54,13 +54,15 @@ Notable changes to Team Memory Agent and MemberKit are documented here.
 ## 0.1.0 — 2026-07-27
 ```
 
-- [ ] **Step 2: Add post-`v0.4.0` and pending-integration TeamMem changes**
+- [ ] **Step 2: Add post-`v0.4.0` TeamMem changes**
 
 Under `Unreleased`, add a `### TeamMem` section. Document rolling synthesis and
-capture-only operation as post-release work. Label GitLab all-branch/merged-MR
-backfill, capitalized/lowercase docs-sync compatibility, and public-boundary
-cleanup as pending integration for the same release train; do not present them
-as shipped or as present on `master`.
+capture-only operation as post-release work, with snapshotting conditional on
+`TEAMMEM_SNAPSHOTS`. Document paginated GitLab branch collection, default-on
+collection of all unseen MR commits for MRs merged inside the lookback,
+project-scoped commit identities with legacy reconciliation,
+capitalized/lowercase docs-sync compatibility, and public-boundary cleanup in
+present tense.
 
 ```markdown
 The prior implementation text in this plan described the `v0.4.0` contents
@@ -76,7 +78,10 @@ runtime behavior.
 Move all changes through tag `v0.4.0` into that dated section: GitLab
 issue/repository collection and reliability hardening; Person weekly folders
 and path compatibility; tolerant bundle timestamps; and MemberKit standing
-project exclusions. Do not leave these entries under `Unreleased`.
+project exclusions. Do not leave these entries under `Unreleased`. Add a short
+reconciliation note that the tagged tree contains the listed TeamMem changes
+even though the published release description characterized the hub package as
+parity-only.
 
 - [ ] **Step 4: Backfill version 0.3.0**
 

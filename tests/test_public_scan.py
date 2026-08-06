@@ -41,6 +41,7 @@ no shell wrapper
 
 CANONICAL_PUBLIC_FILES = (
     "README.md",
+    "CHANGELOG.md",
     "docs/deployment.md",
     "docs/architecture.md",
     "docs/privacy.md",

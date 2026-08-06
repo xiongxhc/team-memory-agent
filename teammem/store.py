@@ -140,7 +140,7 @@ def reconcile_gitlab_events(
     events: Iterable[Event],
     ids: IdentityMaps,
 ) -> int:
-    """Atomically replace authoritative GitLab issue/repo facts and insert others."""
+    """Atomically reconcile authoritative and legacy GitLab event identities."""
     with conn:
         for repair in _legacy_opened_issue_repairs(conn, ids):
             _replace_gitlab_event(conn, repair, existing_only=True)
@@ -149,6 +149,8 @@ def reconcile_gitlab_events(
         for event in events:
             if event.source == "gitlab" and event.kind in {"issue", "repo"}:
                 inserted += _replace_gitlab_event(conn, event)
+            elif event.source == "gitlab" and event.kind == "commit":
+                inserted += _reconcile_gitlab_commit(conn, event)
             else:
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO events "
@@ -158,6 +160,48 @@ def reconcile_gitlab_events(
                 )
                 inserted += cursor.rowcount
     return inserted
+
+
+def _reconcile_gitlab_commit(conn: sqlite3.Connection, event: Event) -> int:
+    legacy_sha = _commit_sha(event.refs)
+    legacy_id = None
+    if legacy_sha and legacy_sha != event.hash:
+        candidates = conn.execute(
+            "SELECT id, refs FROM events "
+            "WHERE source = 'gitlab' AND kind = 'commit' AND hash = ? "
+            "AND project IS ?",
+            (legacy_sha, event.project),
+        ).fetchall()
+        candidates = [row for row in candidates if row[1] == event.refs]
+        if len(candidates) == 1:
+            legacy_id = candidates[0][0]
+
+    if legacy_id is not None:
+        conn.execute("DELETE FROM events WHERE id = ?", (legacy_id,))
+        conn.execute(
+            "INSERT OR IGNORE INTO events "
+            "(person, project, ts, source, kind, summary, refs, raw, hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            _event_values(event),
+        )
+        return 0
+
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO events "
+        "(person, project, ts, source, kind, summary, refs, raw, hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        _event_values(event),
+    )
+    return cursor.rowcount
+
+
+def _commit_sha(refs: str | None) -> str | None:
+    try:
+        parsed = json.loads(refs or "")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    sha = parsed.get("sha") if isinstance(parsed, dict) else None
+    return sha if isinstance(sha, str) and sha else None
 
 
 def _legacy_opened_issue_repairs(

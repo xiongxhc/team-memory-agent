@@ -29,7 +29,7 @@ fi
 
 private_wording_matches=
 for candidate in \
-  README.md docs/deployment.md docs/architecture.md docs/privacy.md teammem/render.py; do
+  README.md CHANGELOG.md docs/deployment.md docs/architecture.md docs/privacy.md teammem/render.py; do
   if [ -f "$candidate" ]; then
     private_wording_status=0
     candidate_matches=$(git grep -niI -E \

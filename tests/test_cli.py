@@ -48,6 +48,8 @@ COMMIT = {"id": "sha-abc", "author_email": "alex@example.com", "author_name": "A
 def fetch(path, params):
     if path == "/groups/42/projects":
         return PROJECTS if params["page"] == 1 else []
+    if path == "/projects/1/repository/branches":
+        return [{"name": "main"}] if params["page"] == 1 else []
     if path == "/projects/1/repository/commits":
         return [COMMIT] if params["page"] == 1 else []
     return []

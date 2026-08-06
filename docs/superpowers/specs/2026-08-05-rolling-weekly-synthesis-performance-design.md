@@ -71,17 +71,17 @@ Capture-only runs:
 3. run all enabled connectors;
 4. import MemberKit bundles;
 5. reclaim identities and channel projects;
-6. write the normal atomic ledger snapshot;
+6. write the normal atomic ledger snapshot when `TEAMMEM_SNAPSHOTS` is configured;
 7. stop.
 
 It explicitly records journal, report, docs sync, render, and push as skipped with the
 reason `capture-only`. It never calls an LLM and never publishes a partially
-regenerated vault. Snapshot remains enabled because it is cheap and protects evidence
-captured before an evening full-run failure.
+regenerated vault. A configured snapshot remains enabled because it is cheap and
+protects evidence captured before an evening full-run failure.
 
 Capture-only returns non-zero if any enabled connector or bundle import fails, while
-still reclaiming and snapshotting successfully captured evidence. Full mode preserves
-the existing provider-failure policy in this release.
+still reclaiming and, when configured, snapshotting successfully captured evidence.
+Full mode preserves the existing provider-failure policy in this release.
 
 Full mode retains the existing stages and additionally performs the rolling report
 behavior below.
@@ -413,10 +413,10 @@ Document in README, deployment, and architecture guides:
 
 ### Pipeline tests
 
-- capture-only performs connectors/import/reclaim/snapshot and skips synthesis and
-  publication without resolving an LLM backend;
-- capture-only returns non-zero on connector/import failure while retaining the
-  snapshot of successfully captured evidence;
+- capture-only performs connectors/import/reclaim and a configured snapshot, and
+  skips synthesis and publication without resolving an LLM backend;
+- capture-only returns non-zero on connector/import failure while retaining
+  successfully captured evidence and its snapshot when configured;
 - capture/full and manual/scheduled overlap is rejected by the shared run lock;
 - path aliases resolve to the same lock; capture fails fast while full waits and then
   runs after a short capture releases it;

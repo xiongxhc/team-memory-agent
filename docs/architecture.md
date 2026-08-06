@@ -48,7 +48,7 @@ silently discarded.
 | Provider | Query boundary | Event source and kinds |
 |---|---|---|
 | GitHub | Only `github_repos` explicitly mapped to projects | `github`: `commit`, `pr` |
-| GitLab | Projects in the `TEAMMEM_GITLAB_GROUP` hierarchy, including subgroups but excluding projects merely shared into it; commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`, plus default-on backfill of older commits from MRs merged inside that lookback; `gitlab_repos` maps known projects and unknown in-scope projects remain visible without project attribution | `gitlab`: `commit`, `mr`, `issue`, `repo` |
+| GitLab | Projects in the `TEAMMEM_GITLAB_GROUP` hierarchy, including subgroups but excluding projects merely shared into it; commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`, plus default-on collection of all unseen MR commits from MRs merged inside that lookback, including in-window commits from deleted or squashed source branches and older commits; `gitlab_repos` maps known projects and unknown in-scope projects remain visible without project attribution | `gitlab`: `commit`, `mr`, `issue`, `repo` |
 | Slack | Only `slack_channels` whose metadata identifies a public or private project channel containing the app | `slack-channel`: `message` |
 | Feishu | Only `feishu_channels` whose metadata identifies a group chat containing the app | `feishu-channel`: `message` |
 | Discord | Only `discord_channels` whose metadata includes a guild ID | `discord-channel`: `message` |
@@ -70,10 +70,13 @@ Feishu remains a first-class official adapter. GitHub and Slack form only the
 public quick-start example; operators may enable any supported adapters
 independently.
 
-GitLab branch activity is collected directly with the bounded repository commit
-query. `collect_mr_commits` defaults to `true` and supplements that result with
-older commits from MRs merged inside the same lookback; exact SHAs are emitted
-once per collection. Setting it to `false` disables only that supplement.
+GitLab branch activity is collected by paginating repository branches, then
+paginating each branch's commits with `ref_name` and the lookback boundary.
+Commits reachable only from tags are excluded, and `(project_id, sha)` is
+emitted once per collection. `collect_mr_commits` defaults to `true` and
+supplements that result with all unseen MR commits from MRs merged inside the
+same lookback, regardless of the original commit timestamp or whether its source
+branch still exists. Setting it to `false` disables only that supplement.
 
 ## Ledger and importer
 
@@ -81,6 +84,11 @@ The ledger stores one attributed fact per row. Its
 `UNIQUE(person, source, hash)` constraint makes connector replays and bundle
 revisions safe. Rendered vault files are projections: operators regenerate them
 rather than editing them as source data.
+
+GitLab commit hashes include the provider project ID and commit SHA. This keeps
+identical SHAs by the same author in different projects distinct. During normal
+collection, reconciliation upgrades a matching legacy bare-SHA commit row to
+the project-scoped identity instead of inserting a duplicate.
 
 The importer validates a complete bundle before inserting anything. Accepted
 input is archived by content hash through a synced temporary file and atomic
@@ -118,12 +126,13 @@ push failures remain warning-level for the aggregate exit status; lock, ledger,
 reclaim, render, and snapshot failures return non-zero.
 
 `teammem run-daily --capture-only` follows the same ledger boundary through
-collection, bundle import, identity/project reclaim, and the configured atomic
-SQLite snapshot, then stops. Journal, report, documentation-sync, render, and
+collection, bundle import, identity/project reclaim, and, when
+`TEAMMEM_SNAPSHOTS` is configured, an atomic SQLite snapshot, then stops.
+Journal, report, documentation-sync, render, and
 push stages are explicitly skipped with `capture-only`. Capture mode never calls
 an LLM and never publishes a partially regenerated vault. An enabled connector
 or import failure is fatal to the capture-mode exit status, while successfully
-captured evidence is retained and snapshotted.
+captured evidence is retained and, when configured, snapshotted.
 
 Both modes acquire one lock adjacent to the canonical real ledger path. The file
 descriptor remains held for the entire run. Capture mode fails fast with

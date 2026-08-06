@@ -78,6 +78,25 @@ class GitLabConnector:
         since = since_time.strftime("%Y-%m-%dT%H:%M:%SZ")
         events: list[Event] = []
         warnings: list[str] = []
+        seen_commits: set[tuple[object, str]] = set()
+
+        def append_commit(project_id: object, project: str | None, commit: dict) -> None:
+            key = (project_id, commit["id"])
+            if key in seen_commits:
+                return
+            seen_commits.add(key)
+            events.append(Event(
+                person=ids.person("email", commit.get("author_email", "")),
+                project=project,
+                ts=commit["committed_date"],
+                source="gitlab",
+                kind="commit",
+                summary=commit["title"],
+                refs=json.dumps({"sha": commit["id"], "url": commit.get("web_url")}),
+                raw=json.dumps(commit),
+                hash=event_hash("commit", str(project_id), commit["id"]),
+            ))
+
         projects = self._paginate(fetch_json, f"/groups/{cfg.gitlab_group}/projects",
                                   {
                                       "include_subgroups": "true",
@@ -105,24 +124,20 @@ class GitLabConnector:
                         raw=json.dumps(p),
                         hash=event_hash("repo", str(p["id"]), "created"),
                     ))
-            # Capture commits from every reachable branch inside the daily lookback.
-            # The merged-MR backfill below additionally recovers older commits that
-            # become relevant when their merge request lands inside the lookback.
-            seen_shas = set()
-            for c in self._paginate(fetch_json, f"/projects/{p['id']}/repository/commits",
-                                    {"since": since, "all": "true"}):
-                seen_shas.add(c["id"])
-                events.append(Event(
-                    person=ids.person("email", c.get("author_email", "")),
-                    project=project,
-                    ts=c["committed_date"],
-                    source="gitlab",
-                    kind="commit",
-                    summary=c["title"],
-                    refs=json.dumps({"sha": c["id"], "url": c.get("web_url")}),
-                    raw=json.dumps(c),
-                    hash=c["id"],
-                ))
+            # Enumerating branch refs excludes tag-only commits while preserving
+            # commits reachable from every repository branch inside the lookback.
+            branches = self._paginate(
+                fetch_json,
+                f"/projects/{p['id']}/repository/branches",
+                {},
+            )
+            for branch in branches:
+                for commit in self._paginate(
+                    fetch_json,
+                    f"/projects/{p['id']}/repository/commits",
+                    {"ref_name": branch["name"], "since": since},
+                ):
+                    append_commit(p["id"], project, commit)
             for mr in self._paginate(fetch_json, f"/projects/{p['id']}/merge_requests",
                                      {"updated_after": since}):
                 events.append(Event(
@@ -151,20 +166,7 @@ class GitLabConnector:
                         )
                         continue
                     for c in mr_commits:
-                        if c["id"] in seen_shas:
-                            continue
-                        seen_shas.add(c["id"])
-                        events.append(Event(
-                            person=ids.person("email", c.get("author_email", "")),
-                            project=project,
-                            ts=c["committed_date"],
-                            source="gitlab",
-                            kind="commit",
-                            summary=c["title"],
-                            refs=json.dumps({"sha": c["id"], "url": c.get("web_url")}),
-                            raw=json.dumps(c),
-                            hash=c["id"],
-                        ))
+                        append_commit(p["id"], project, c)
             for issue in self._paginate(fetch_json, f"/projects/{p['id']}/issues",
                                         {"updated_after": since}):
                 created_at = issue.get("created_at")

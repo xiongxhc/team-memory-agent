@@ -17,7 +17,7 @@
 - Worker threads call only the LLM callable; all SQLite reads/writes stay on the main thread.
 - Full-mode journal bounds are the previous report Monday through the operator-local current date; connector lookback and standalone `journal --since-days` remain unchanged.
 - Public `schedule install` still creates one full daily run. Extra capture jobs are operator-owned and never installed implicitly.
-- Preserve full-mode connector/import exit semantics; capture-only treats enabled connector/import failures as non-zero while still reclaiming and snapshotting.
+- Preserve full-mode connector/import exit semantics; capture-only treats enabled connector/import failures as non-zero while still reclaiming and snapshotting when `TEAMMEM_SNAPSHOTS` is configured.
 - Commit commands in this plan are checkpoint suggestions only. Do not stage or commit until the user explicitly authorizes `commit`.
 - Do not modify the dirty `feat/mr-commit-backfill` checkout or the private `local-agent-team` deployment during this public-engine plan.
 
@@ -585,7 +585,7 @@ def run_daily(
 ) -> DailyResult: ...
 ```
 
-Test capture-only runs connector/import/reclaim/configured snapshot, never resolves LLM or renders/pushes, and marks journal/report/docs-sync/render/push `skipped: capture-only`. Connector/import failure returns `1` but snapshot remains; full mode retains current `0`. Assert capture requests zero lock wait, full requests 1800 seconds, and collision occurs before `open_db()`.
+Test capture-only runs connector/import/reclaim and a configured snapshot, never resolves LLM or renders/pushes, and marks journal/report/docs-sync/render/push `skipped: capture-only`. Connector/import failure returns `1`; when a snapshot is configured it remains, while full mode retains current `0`. Assert capture requests zero lock wait, full requests 1800 seconds, and collision occurs before `open_db()`.
 
 - [ ] **Step 2: Write failing rolling-report tests**
 

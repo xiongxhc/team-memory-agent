@@ -24,7 +24,7 @@ present in each collected public/private project channel or group/guild channel.
 | Connector | Can see through Team Memory Agent | Deliberately excluded |
 |---|---|---|
 | GitHub | Default-branch commits and updated pull requests in explicitly mapped repositories | Unmapped repositories |
-| GitLab | Commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`; by default, older commits from MRs merged inside that lookback; merge requests, issue lifecycle observations, and repository creations in the configured group hierarchy and subgroups; known repositories receive project attribution | Projects outside the configured hierarchy, projects merely shared into it, issue/commit comments, and repeated reopen/reclose history (which requires a state-events or webhook source) |
+| GitLab | Commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`; by default, all unseen MR commits from MRs merged inside that lookback, including in-window commits from deleted or squashed source branches and older commits; merge requests, issue lifecycle observations, and repository creations in the configured group hierarchy and subgroups; known repositories receive project attribution | Projects outside the configured hierarchy, projects merely shared into it, tag-only commits, issue/commit comments, and repeated reopen/reclose history (which requires a state-events or webhook source) |
 | Slack | Human top-level messages in explicitly mapped public or private project channels containing the app | DMs, multi-person DMs, unlisted channels, thread replies, bot messages |
 | Feishu | Human messages in explicitly mapped group chats containing the app | Direct chats, unlisted group chats, non-user senders |
 | Discord | Human content messages in explicitly mapped guild channels visible to the bot | DMs/group DMs, unlisted guild channels, bot and webhook messages |
@@ -47,10 +47,11 @@ Feishu is an official option, not a legacy path. Enabling Slack does not migrate
 replace, or reconfigure Feishu; both remain opt-in and limited to explicitly
 allowlisted channels.
 
-GitLab merged-MR backfill is default-on because a commit can predate the daily
-lookback but become team-relevant when its MR lands. Operators may set
-`collect_mr_commits: false`; this does not disable daily collection across all
-reachable branches.
+GitLab merged-MR backfill is default-on because an original commit may be older
+than the daily lookback or disappear from reachable branches after deletion or
+squashing. For MRs merged inside the lookback, it collects all unseen MR
+commits. Operators may set `collect_mr_commits: false`; this does not disable
+daily collection across all reachable branches.
 
 ## Credentials and configuration
 
@@ -146,7 +147,8 @@ remove` removes it.
 
 `teammem run-daily --capture-only` keeps the same consent and collection
 boundaries. It collects enabled sources and reviewed bundles, reclaims mappings,
-and writes the configured atomic ledger snapshot, but it performs no LLM work,
+and writes an atomic ledger snapshot when `TEAMMEM_SNAPSHOTS` is configured, but
+it performs no LLM work,
 documentation sync, Markdown rendering, commit, or push. It therefore cannot
 publish a partially updated vault. A failed enabled source or import is reported
 with a non-zero exit after successfully captured evidence has been preserved.

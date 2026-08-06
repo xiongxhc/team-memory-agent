@@ -1,15 +1,19 @@
+import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
-from teammem.events import Event
-from teammem.store import insert_events, open_db, stats
+from teammem.events import Event, event_hash
+from teammem.identity import IdentityMaps
+from teammem.store import insert_events, open_db, reconcile_gitlab_events, stats
 
 
 PROVENANCE = {
     "evidence_cutoff", "cutoff_precision", "coverage_state",
     "source_input_hash", "effective_flags_json",
 }
+CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
 
 
 def _ev(**kw):
@@ -29,6 +33,115 @@ def test_insert_twice_is_idempotent(tmp_path):
 def test_same_hash_different_source_is_two_rows(tmp_path):
     conn = open_db(tmp_path / "ledger.db")
     assert insert_events(conn, [_ev(), _ev(source="bundle:alex")]) == 2
+
+
+def test_gitlab_commit_reconciliation_upgrades_legacy_bare_sha_without_duplicate(
+    tmp_path,
+):
+    conn = open_db(tmp_path / "ledger.db")
+    refs = json.dumps({"sha": "shared-sha", "url": "https://gitlab.test/a/commit/shared-sha"})
+    legacy = _ev(project="project-alpha", hash="shared-sha", refs=refs)
+    current = _ev(
+        project="project-alpha",
+        summary="current commit title",
+        hash=event_hash("commit", "1", "shared-sha"),
+        refs=refs,
+    )
+    assert insert_events(conn, [legacy]) == 1
+
+    inserted = reconcile_gitlab_events(
+        conn,
+        [current],
+        IdentityMaps.load(CONFIG_DIR),
+    )
+
+    assert inserted == 0
+    assert conn.execute(
+        "SELECT project, summary, hash FROM events"
+    ).fetchall() == [(
+        "project-alpha",
+        "current commit title",
+        event_hash("commit", "1", "shared-sha"),
+    )]
+
+
+def test_gitlab_commit_reconciliation_preserves_same_sha_across_projects(
+    tmp_path,
+):
+    conn = open_db(tmp_path / "ledger.db")
+    alpha_refs = json.dumps({
+        "sha": "shared-sha",
+        "url": "https://gitlab.test/a/commit/shared-sha",
+    })
+    alpha = _ev(
+        project="project-alpha",
+        hash=event_hash("commit", "1", "shared-sha"),
+        refs=alpha_refs,
+    )
+    beta = _ev(
+        project="project-beta",
+        hash=event_hash("commit", "2", "shared-sha"),
+        refs=json.dumps({
+            "sha": "shared-sha",
+            "url": "https://gitlab.test/b/commit/shared-sha",
+        }),
+    )
+    assert insert_events(conn, [_ev(
+        project="project-alpha",
+        hash="shared-sha",
+        refs=alpha_refs,
+    )]) == 1
+
+    inserted = reconcile_gitlab_events(
+        conn,
+        [alpha, beta],
+        IdentityMaps.load(CONFIG_DIR),
+    )
+
+    assert inserted == 1
+    assert conn.execute(
+        "SELECT project, hash FROM events ORDER BY project"
+    ).fetchall() == [
+        ("project-alpha", event_hash("commit", "1", "shared-sha")),
+        ("project-beta", event_hash("commit", "2", "shared-sha")),
+    ]
+
+
+def test_gitlab_commit_reconciliation_does_not_claim_other_repo_legacy_row(
+    tmp_path,
+):
+    conn = open_db(tmp_path / "ledger.db")
+    legacy_refs = json.dumps({
+        "sha": "shared-sha",
+        "url": "https://gitlab.test/a/commit/shared-sha",
+    })
+    current_refs = json.dumps({
+        "sha": "shared-sha",
+        "url": "https://gitlab.test/b/commit/shared-sha",
+    })
+    assert insert_events(conn, [_ev(
+        project="shared-product",
+        hash="shared-sha",
+        refs=legacy_refs,
+    )]) == 1
+
+    inserted = reconcile_gitlab_events(
+        conn,
+        [_ev(
+            project="shared-product",
+            hash=event_hash("commit", "2", "shared-sha"),
+            refs=current_refs,
+        )],
+        IdentityMaps.load(CONFIG_DIR),
+    )
+
+    assert inserted == 1
+    assert conn.execute(
+        "SELECT refs, hash FROM events ORDER BY refs"
+    ).fetchall() == [
+        (legacy_refs, "shared-sha"),
+        (current_refs, event_hash("commit", "2", "shared-sha")),
+    ]
 
 
 def test_open_db_twice_is_safe(tmp_path):

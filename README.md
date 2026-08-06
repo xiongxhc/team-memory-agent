@@ -293,7 +293,7 @@ teammem run-daily --capture-only
 ```
 
 It collects enabled sources, imports reviewed bundles, reclaims mappings, writes
-the configured atomic ledger snapshot, and stops. Journal/report synthesis,
+an atomic ledger snapshot when `TEAMMEM_SNAPSHOTS` is configured, and stops. Journal/report synthesis,
 documentation sync, rendering, and Git publication are skipped, so capture mode
 cannot partially publish a vault. An enabled connector or import failure makes
 capture mode return non-zero after preserving successfully captured evidence.
@@ -328,7 +328,7 @@ upgrades, and removal.
 | Connector | Collection boundary |
 |---|---|
 | GitHub | Commits and pull requests from explicitly mapped repositories |
-| GitLab | Commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`, merge requests, issue lifecycle observations, and repository creations in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; commits older than the lookback are also backfilled from merge requests merged inside it; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
+| GitLab | Commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`, merge requests, issue lifecycle observations, and repository creations in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; for merge requests merged inside the lookback, all unseen MR commits are also collected, including in-window commits from deleted or squashed source branches and older commits; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
 | Slack | Human top-level messages in explicitly mapped public or private project channels containing the app; no DMs and no thread replies |
 | Feishu | Human messages in explicitly mapped group chats; no direct chats |
 | Discord | Human messages in explicitly mapped guild channels; no DMs, bot messages, or webhooks |
@@ -347,8 +347,9 @@ connector.
 
 GitLab merged-MR commit backfill is enabled by default. Set
 `collect_mr_commits: false` under `gitlab` in `connectors.yaml` to opt out of
-that older-commit backfill; daily commits from every reachable branch are still
-collected.
+all unseen MR commits; daily commits from every reachable branch are still
+collected. Commit identities include the GitLab project ID, so the same author
+and SHA in different projects remain distinct ledger facts.
 
 ### Reviewed bundle inbox
 

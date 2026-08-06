@@ -2,9 +2,10 @@
 
 > **Superseded boundary (2026-08-04):** The branch-exclusion decision below is
 > retained as historical context. Current collection includes commits from every
-> reachable branch inside `TEAMMEM_SINCE_DAYS`, with older commits additionally
-> backfilled from merge requests merged inside that lookback. The backfill is
-> default-on and may be disabled with the boolean `collect_mr_commits: false`.
+> reachable branch inside `TEAMMEM_SINCE_DAYS`. For merge requests merged inside
+> that lookback, default-on backfill collects all unseen MR commits, including
+> in-window commits from deleted or squashed source branches and older commits;
+> it may be disabled with the boolean `collect_mr_commits: false`.
 
 ## Problem
 
@@ -47,8 +48,8 @@ lifecycle — land in the ledger as attributed facts.
 - **Issue/repository configuration:** the existing group `read_api` token already
   covers the issues and users APIs; the lookback stays `TEAMMEM_SINCE_DAYS`.
   **Historical configuration statement, superseded:** current collection also
-  has the default-on boolean `collect_mr_commits` option for older merged-MR
-  commit backfill.
+  has the default-on boolean `collect_mr_commits` option for all unseen MR
+  commits from MRs merged inside the lookback.
 
 ## Event identity mappings (binding)
 
@@ -60,6 +61,23 @@ lifecycle — land in the ledger as attributed facts.
 | summary | `[opened] <title>` or `[closed] <title>` | `[created] <path_with_namespace>` |
 | refs | `{"iid": iid, "url": web_url}` | `{"id": project_id, "url": web_url}` |
 | hash | existing `event_hash("issue", project_id, iid, "opened" | "closed")` identities | `event_hash("repo", project_id, "created")` |
+
+## Current commit collection and identity (2026-08-06)
+
+- The adapter paginates `/repository/branches`, then paginates
+  `/repository/commits` for each branch with `ref_name` and `since`. This
+  captures every branch-reachable commit inside the lookback without admitting
+  commits reachable only from tags.
+- One collection deduplicates commits by `(project_id, sha)`. A normalized
+  commit hash is `event_hash("commit", project_id, sha)`, so the same author and
+  SHA in different projects remain distinct ledger facts.
+- For every MR merged inside the lookback, the paginated MR commit endpoint
+  contributes all unseen MR commits. This includes in-window originals no
+  longer on a branch after deletion or squashing and commits older than the
+  lookback. `collect_mr_commits: false` disables only this supplement.
+- Ledger reconciliation replaces a matching legacy bare-SHA commit row with
+  the project-scoped event during the next lookback run instead of blindly
+  inserting both identities.
 
 ## Flag interaction
 
@@ -90,8 +108,9 @@ not scoring; no ranking views" constraint.
    when their provider timestamps are inside the lookback; closure attribution
    uses `closed_by`, and re-collection inserts zero rows for the pinned hashes.
 2. A repository created inside the lookback produces one attributed `repo`
-   event; repositories older than the lookback produce none, and all existing
-   event identities (commit, mr) are byte-identical to before.
+   event, and repositories older than the lookback produce none. Existing MR
+   identities remain byte-identical; commit identities are deliberately
+   project-scoped and legacy bare-SHA rows reconcile without duplication.
 3. Issue and repo events render as work bullets on Person and Projects pages
    and count in the Work Journal kind tally.
 4. `pytest -q tests` and `./scripts/check-public.sh` pass; the architecture,

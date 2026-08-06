@@ -12,13 +12,14 @@ Notable changes to Team Memory Agent and MemberKit are documented here.
   Journals are provisional Monday through Thursday, become Friday checkpoints,
   and can incorporate late evidence over the weekend.
 - `teammem run-daily --capture-only` records enabled source and reviewed-bundle
-  evidence, reclaims mappings, and snapshots the ledger without synthesis,
-  documentation sync, rendering, or publication.
-- Pending integration for this release train: GitLab collection will include
-  commits from every reachable branch inside the configured lookback, plus a
-  default-on backfill of older commits from merge requests merged in that
-  lookback. Operators may set `collect_mr_commits: false` to disable only the
-  older-commit supplement.
+  evidence, reclaims mappings, and, when configured, snapshots the ledger
+  without synthesis, documentation sync, rendering, or publication.
+- GitLab collection paginates every repository branch and collects its commits
+  inside the configured lookback while excluding tag-only commits. For merge
+  requests merged inside the lookback, default-on backfill collects all unseen
+  MR commits, including in-window commits from deleted or squashed source
+  branches and older commits. Operators may set `collect_mr_commits: false` to
+  disable only that supplement.
 
 #### Changed
 
@@ -27,16 +28,18 @@ Notable changes to Team Memory Agent and MemberKit are documented here.
   compacting evidence.
 - Full and capture runs share one ledger lock. Capture mode fails fast when it
   is held; a full run waits for at most 30 minutes.
-- Pending integration for this release train: documentation sync will accept
-  either `Architecture.md`/`Summary.md` or lowercase source filenames, while
-  continuing to write lowercase destination names for case-sensitive links.
-- Pending integration for this release train: public documentation and the
-  public-boundary scan will describe operator-configured deployments without
-  private-deployment wording and prevent that wording from returning to
-  canonical public documentation.
+- Documentation sync accepts either `Architecture.md`/`Summary.md` or lowercase
+  source filenames, while continuing to write lowercase destination names for
+  case-sensitive links.
+- Public documentation and the public-boundary scan describe operator-configured
+  deployments without private-deployment wording and prevent that wording from
+  returning to canonical public documentation.
 
-> The pending integration items above are not part of `v0.4.0` and are not yet
-> on `master`.
+#### Fixed
+
+- GitLab commit identities include the project ID, preserving the same author
+  and SHA in different projects. Normal collection reconciles matching legacy
+  bare-SHA rows instead of duplicating them on the next lookback run.
 
 ## 0.4.0 — 2026-08-04
 
@@ -70,6 +73,10 @@ Notable changes to Team Memory Agent and MemberKit are documented here.
   deterministic and preserve idempotency.
 - Claude CLI synthesis failures include compact, sanitized, bounded diagnostics
   from stderr and stdout.
+
+> Reconciliation note: the `v0.4.0` tagged tree contains the TeamMem changes
+> listed above even though the published release description characterized the
+> hub package as parity-only.
 
 ### MemberKit
 

@@ -10,10 +10,8 @@
 
 Team Memory Agent has useful GitHub release descriptions for `v0.1.0` through
 `v0.4.0`, but no source-controlled version history. The current `master` also
-contains post-`v0.4.0` TeamMem changes, and the same release train has pending
-GitLab collection, documentation-sync, and public-boundary changes. Readers
-therefore cannot reliably tell what changed in a release, what is pending, or
-whether a change belongs to the hub or MemberKit.
+contains post-`v0.4.0` TeamMem changes. Readers therefore cannot reliably tell
+what changed in a release or whether a change belongs to the hub or MemberKit.
 
 ## Decision summary
 
@@ -26,6 +24,9 @@ whether a change belongs to the hub or MemberKit.
   and the corresponding tagged source. Preserve the historical fact that the
   `v0.2.0` release description announced Windows MemberKit scheduling before it
   was complete; state clearly that `v0.3.0` completed and verified it.
+- Preserve the reconciliation fact that the `v0.4.0` tagged tree contains the
+  listed TeamMem changes even though the published release description
+  characterized the hub package as parity-only.
 - Document user-visible behavior, compatibility implications, and operational
   changes. Do not reproduce commit-by-commit development mechanics.
 - Treat the changelog as the source for future concise GitHub release
@@ -37,12 +38,13 @@ whether a change belongs to the hub or MemberKit.
 
 - Rolling current/previous-week synthesis, report provenance, bounded journal
   concurrency, and capture-only operation with a ledger-wide lock.
-- Pending integration: GitLab all-reachable-branch collection and default-on
-  older-commit backfill from merge requests merged inside the lookback, with a
-  `collect_mr_commits: false` opt-out for the backfill only.
-- Pending integration: documentation sync accepts capitalized and lowercase
+- GitLab paginated branch enumeration and default-on collection of all unseen
+  MR commits from merge requests merged inside the lookback, with a
+  `collect_mr_commits: false` opt-out for the MR supplement only. Commit
+  identities are project-scoped and matching legacy bare-SHA rows reconcile.
+- Documentation sync accepts capitalized and lowercase
   `Architecture`/`Summary` filenames but writes lowercase destinations.
-- Pending integration: public-boundary documentation and scanning remove
+- Public-boundary documentation and scanning remove
   private-deployment wording from canonical public content.
 
 ### MemberKit
