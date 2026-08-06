@@ -408,6 +408,7 @@ See
 [architecture](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/architecture.md),
 [privacy](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/privacy.md),
 [deployment](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md),
+[changelog](https://github.com/xiongxhc/team-memory-agent/blob/master/CHANGELOG.md),
 the
 [MemberKit guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/member-guide.md),
 and the
