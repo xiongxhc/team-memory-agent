@@ -33,20 +33,20 @@ def test_rules_normalize_and_assign_first_matching_rule(tmp_path):
         b"  # comment\r\n"
         b"team-memory-agent\r\n"
         b"scratch*\r\n"
-        b"estidama-sdk ~ ^test(s)? passed$\r\n"
-        b"estidama-sdk ~ passed\r\n"
+        b"acme-sdk ~ ^test(s)? passed$\r\n"
+        b"acme-sdk ~ passed\r\n"
     )
     rules = exclusions.load_rules(path)
     result = exclusions.apply_rules([
         event("team-memory-agent", "keep no source narrative"),
         event("scratch-one", "other"),
-        event("estidama-sdk", "Tests Passed"),
+        event("acme-sdk", "Tests Passed"),
         event(None, "Tests Passed"),
     ], rules)
 
     assert [rule.normalized() for rule in rules] == [
         "team-memory-agent", "scratch*",
-        "estidama-sdk ~ ^test(s)? passed$", "estidama-sdk ~ passed",
+        "acme-sdk ~ ^test(s)? passed$", "acme-sdk ~ passed",
     ]
     assert result.included == [event(None, "Tests Passed")]
     assert result.excluded_count == 3

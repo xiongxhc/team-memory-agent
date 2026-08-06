@@ -126,7 +126,7 @@ Examples:
 
 ```text
 team-memory-agent ~ ^task [0-9]+$
-estidama-sdk ~ test(s)? passed
+acme-sdk ~ test(s)? passed
 ```
 
 ### Validation and normalization
