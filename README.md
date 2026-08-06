@@ -121,7 +121,7 @@ valid `journal-highlight` entry to an existing local draft's `events` list, run
 `memberkit review`, and push only if the draft is correct. The entry stays local
 until `memberkit push`; MemberKit does not log in to, scrape, or automatically
 read those applications. See the
-[`teammem-bundle/v1` contract](https://github.com/xiongxhc/team-memory-agent/blob/master/schemas/teammem-bundle-v1.md)
+[`teammem-bundle/v1` contract](https://github.com/xiongxhc/team-memory-agent/blob/main/schemas/teammem-bundle-v1.md)
 for the five required event fields.
 
 ### Schedule behavior
@@ -172,7 +172,7 @@ To discard a malformed draft, delete that local draft file before running
 upgrading or uninstalling the executable used by the schedule.
 
 See the complete
-[MemberKit guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/member-guide.md)
+[MemberKit guide](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/member-guide.md)
 for upgrades, troubleshooting, files created locally, and safe removal.
 
 ## Hub quick start
@@ -253,7 +253,7 @@ file.
 
 The complete provider table, current official permission links, and all runtime
 paths are in the
-[deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md).
+[deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/deployment.md).
 
 ### 3. Check locally, then run once
 
@@ -323,7 +323,7 @@ export a private MemberKit inbox and it does not install extra capture triggers.
 Any intraday `--capture-only` trigger is an explicit operator-managed scheduler
 choice. On Windows it is a current-user, logged-in-only
 Task Scheduler task: a screen lock is fine, but logout prevents runs. See the
-[deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md)
+[deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/deployment.md)
 for macOS/Linux/Windows paths, logs, missed-run behavior, safe inbox staging,
 upgrades, and removal.
 
@@ -361,7 +361,7 @@ The operator creates a private inbox Git repository, grants each member push
 access, and provides each member an inbox URL and roster slug. Import from a
 disposable `git archive` export, never directly from the transport checkout:
 accepted and quarantined files are consumed from the configured import directory.
-See the [deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md)
+See the [deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/deployment.md)
 for the safe export and `run-daily` workflow.
 
 ### Published-package installation
@@ -410,14 +410,14 @@ deterministic renderer continue to work.
   evaluation.
 
 See
-[architecture](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/architecture.md),
-[privacy](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/privacy.md),
-[deployment](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/deployment.md),
-[changelog](https://github.com/xiongxhc/team-memory-agent/blob/master/CHANGELOG.md),
+[architecture](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/architecture.md),
+[privacy](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/privacy.md),
+[deployment](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/deployment.md),
+[changelog](https://github.com/xiongxhc/team-memory-agent/blob/main/CHANGELOG.md),
 the
-[MemberKit guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/member-guide.md),
+[MemberKit guide](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/member-guide.md),
 and the
-[`teammem-bundle/v1` contract](https://github.com/xiongxhc/team-memory-agent/blob/master/schemas/teammem-bundle-v1.md).
+[`teammem-bundle/v1` contract](https://github.com/xiongxhc/team-memory-agent/blob/main/schemas/teammem-bundle-v1.md).
 
 ## Development
 

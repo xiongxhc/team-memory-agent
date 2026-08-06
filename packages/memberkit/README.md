@@ -166,6 +166,6 @@ member-owned configuration, drafts, state, or the local inbox clone.
 
 For configuration options, non-interactive setup, file locations, timing examples,
 and troubleshooting, see the
-[complete MemberKit guide](https://github.com/xiongxhc/team-memory-agent/blob/master/docs/member-guide.md).
+[complete MemberKit guide](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/member-guide.md).
 
 Licensed under Apache-2.0.

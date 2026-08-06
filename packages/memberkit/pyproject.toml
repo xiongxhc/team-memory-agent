@@ -25,7 +25,7 @@ Homepage = "https://github.com/xiongxhc/team-memory-agent"
 Documentation = "https://github.com/xiongxhc/team-memory-agent#member-setup"
 Issues = "https://github.com/xiongxhc/team-memory-agent/issues"
 Repository = "https://github.com/xiongxhc/team-memory-agent"
-Changelog = "https://github.com/xiongxhc/team-memory-agent/blob/master/CHANGELOG.md"
+Changelog = "https://github.com/xiongxhc/team-memory-agent/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = ["pytest"]
