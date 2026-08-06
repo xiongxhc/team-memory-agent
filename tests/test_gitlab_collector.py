@@ -99,11 +99,37 @@ def test_since_and_updated_after_params_sent():
     ids = IdentityMaps.load(CONFIG_DIR)
     collect_gitlab(cfg, ids, fetch, NOW)
     assert seen["/projects/1/repository/commits"]["since"] == "2026-07-08T00:00:00Z"
+    assert seen["/projects/1/repository/commits"]["all"] == "true"
     assert seen["/projects/1/merge_requests"]["updated_after"] == "2026-07-08T00:00:00Z"
     assert seen["/projects/1/issues"]["updated_after"] == "2026-07-08T00:00:00Z"
     assert seen["/projects/1/repository/commits"]["per_page"] == 100
     assert seen["/groups/42/projects"]["include_subgroups"] == "true"
     assert seen["/groups/42/projects"]["with_shared"] == "false"
+
+
+def test_daily_commits_include_non_default_branches():
+    """Removing all=true would make the fake GitLab endpoint hide branch work."""
+    branch_commit = dict(
+        COMMIT,
+        id="sha-feature",
+        title="feat: work still on a feature branch",
+    )
+
+    def fetch(path, params):
+        if path == "/groups/42/projects":
+            return PROJECTS if params["page"] == 1 else []
+        if path == "/projects/1/repository/commits":
+            if params["page"] == 1 and params.get("all") == "true":
+                return [branch_commit]
+            return []
+        return []
+
+    result = _collect_result(fetch)
+
+    commits = [event for event in result.events if event.kind == "commit"]
+    assert [(event.hash, event.summary, event.ts) for event in commits] == [
+        ("sha-feature", "feat: work still on a feature branch", "2026-07-14T09:00:00Z"),
+    ]
 
 
 def test_new_issue_uses_creation_time_and_attributes_to_author():
@@ -261,6 +287,177 @@ def test_repo_creator_unusable_response_defers_event_with_warning():
     assert result.warnings == (
         "repository creator lookup failed for team/project-alpha; creation deferred",
     )
+
+
+def test_merged_mr_backfills_commits_older_than_window():
+    """A feature-branch commit authored before the window but merged inside it
+    only ever surfaces via the MR's commit list — the bounded all-branch listing
+    filters it out by committed_date."""
+    old_commit = dict(COMMIT, id="sha-old", committed_date="2026-06-01T09:00:00Z",
+                      title="feat: branch work started long ago")
+    events = _collect({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/repository/commits": [[]],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/merge_requests/7/commits": [[old_commit]],
+    })
+    commit = next(e for e in events if e.kind == "commit")
+    assert (commit.person, commit.project, commit.hash) == ("alex", "project-alpha", "sha-old")
+    assert commit.ts == "2026-06-01T09:00:00Z"
+    assert commit.summary == "feat: branch work started long ago"
+
+
+def test_mr_backfill_skips_commits_already_in_daily_all_branch_listing():
+    """UNIQUE(person, source, hash) would drop the duplicate at ingest anyway,
+    but one collection run should not emit the same sha twice."""
+    events = _collect({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/repository/commits": [[COMMIT]],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/merge_requests/7/commits": [[COMMIT]],
+    })
+    assert len([e for e in events if e.kind == "commit"]) == 1
+
+
+def test_mr_backfill_preserves_distinct_squash_and_original_commit_shas():
+    squash = dict(COMMIT, id="sha-squash", title="feat: squashed result")
+    original = dict(
+        COMMIT,
+        id="sha-original",
+        committed_date="2026-06-01T09:00:00Z",
+        title="feat: original branch commit",
+    )
+    events = _collect({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/repository/commits": [[squash]],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/merge_requests/7/commits": [[original]],
+    })
+
+    assert {event.hash for event in events if event.kind == "commit"} == {
+        "sha-squash",
+        "sha-original",
+    }
+
+
+def _paths_fetched(responses):
+    seen = []
+    inner = fake_fetch(responses)
+    def fetch(path, params):
+        seen.append(path)
+        return inner(path, params)
+    return fetch, seen
+
+
+def test_unmerged_mr_does_not_fetch_commits():
+    opened = dict(MR, state="opened", merged_at=None)
+    fetch, seen = _paths_fetched({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/merge_requests": [[opened]],
+    })
+    cfg = Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"})
+    collect_gitlab(cfg, IdentityMaps.load(CONFIG_DIR), fetch, NOW)
+    assert "/projects/1/merge_requests/7/commits" not in seen
+
+
+def test_mr_merged_before_window_does_not_fetch_commits():
+    """An old merged MR bumped by a comment re-enters the listing via
+    updated_after; its commits were already collectable when it merged."""
+    stale = dict(MR, merged_at="2026-01-05T10:00:00Z")
+    fetch, seen = _paths_fetched({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/merge_requests": [[stale]],
+    })
+    cfg = Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"})
+    collect_gitlab(cfg, IdentityMaps.load(CONFIG_DIR), fetch, NOW)
+    assert "/projects/1/merge_requests/7/commits" not in seen
+
+
+def test_mr_merged_at_exact_lookback_boundary_backfills_commits():
+    boundary = dict(MR, merged_at="2026-07-08T00:00:00.000000Z")
+    fetch, seen = _paths_fetched({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/merge_requests": [[boundary]],
+        "/projects/1/merge_requests/7/commits": [[]],
+    })
+
+    cfg = Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"})
+    collect_gitlab(cfg, IdentityMaps.load(CONFIG_DIR), fetch, NOW)
+
+    assert "/projects/1/merge_requests/7/commits" in seen
+
+
+def test_mr_commit_backfill_uses_pagination():
+    page1 = [dict(COMMIT, id=f"sha-mr-{index}") for index in range(100)]
+    page2 = [dict(COMMIT, id="sha-mr-last")]
+    events = _collect({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/repository/commits": [[]],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/merge_requests/7/commits": [page1, page2],
+    })
+
+    assert len([event for event in events if event.kind == "commit"]) == 101
+
+
+def test_collect_mr_commits_option_disables_backfill():
+    fetch, seen = _paths_fetched({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/merge_requests/7/commits": [[COMMIT]],
+    })
+    result = GitLabConnector(fetch_json=fetch).collect(
+        Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
+        IdentityMaps.load(CONFIG_DIR),
+        ConnectorSettings(name="gitlab", enabled=True,
+                          options={"collect_mr_commits": False}),
+        NOW,
+    )
+    assert "/projects/1/merge_requests/7/commits" not in seen
+    assert [e for e in result.events if e.kind == "commit"] == []
+
+
+def test_failed_mr_commit_lookup_warns_without_losing_other_events_and_retries():
+    old_commit = dict(
+        COMMIT,
+        id="sha-old",
+        committed_date="2026-06-01T09:00:00Z",
+        title="feat: older branch work",
+    )
+    attempts = 0
+
+    def fetch(path, params):
+        nonlocal attempts
+        if path == "/groups/42/projects":
+            return PROJECTS if params["page"] == 1 else []
+        if path == "/projects/1/repository/commits":
+            return [COMMIT] if params["page"] == 1 else []
+        if path == "/projects/1/merge_requests":
+            return [MR] if params["page"] == 1 else []
+        if path == "/projects/1/merge_requests/7/commits":
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("token=super-secret upstream detail")
+            return [old_commit] if params["page"] == 1 else []
+        if path == "/projects/1/issues":
+            return [ISSUE] if params["page"] == 1 else []
+        return []
+
+    first = _collect_result(fetch)
+
+    assert {event.kind for event in first.events} == {"commit", "mr", "issue"}
+    assert [event.hash for event in first.events if event.kind == "commit"] == ["sha-abc"]
+    assert first.warnings == (
+        "merge request commit lookup failed for team/project-alpha !7; backfill deferred",
+    )
+    assert "super-secret" not in first.warnings[0]
+
+    second = _collect_result(fetch)
+    assert {event.hash for event in second.events if event.kind == "commit"} == {
+        "sha-abc",
+        "sha-old",
+    }
+    assert second.warnings == ()
 
 
 def test_ghost_mr_author_is_unmapped_not_crash():

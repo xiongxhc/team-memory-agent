@@ -51,9 +51,16 @@ def load_connector_settings(config_dir: Path) -> dict[str, ConnectorSettings]:
         enabled = raw.get("enabled", False)
         if not isinstance(enabled, bool):
             raise ValueError(f"connector enabled flag for {name} must be a boolean")
+        options = {key: value for key, value in raw.items() if key != "enabled"}
+        if name == "gitlab":
+            collect_mr_commits = options.setdefault("collect_mr_commits", True)
+            if not isinstance(collect_mr_commits, bool):
+                raise ValueError(
+                    "connector option collect_mr_commits for gitlab must be a boolean"
+                )
         settings[name] = ConnectorSettings(
             name=name,
             enabled=enabled,
-            options={key: value for key, value in raw.items() if key != "enabled"},
+            options=options,
         )
     return settings

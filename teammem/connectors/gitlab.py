@@ -55,7 +55,8 @@ class GitLabConnector:
         now: datetime,
     ) -> CollectionResult:
         fetch_json = self._fetch_json or self.http_fetch_json(cfg)
-        events, warnings = self._collect_events(cfg, ids, fetch_json, now)
+        events, warnings = self._collect_events(cfg, ids, fetch_json, now,
+                                                settings.options)
         return CollectionResult(events=tuple(events), warnings=tuple(warnings))
 
     @staticmethod
@@ -69,8 +70,10 @@ class GitLabConnector:
             page += 1
 
     def _collect_events(
-        self, cfg: Config, ids: IdentityMaps, fetch_json: FetchJson, now: datetime
+        self, cfg: Config, ids: IdentityMaps, fetch_json: FetchJson, now: datetime,
+        options: dict,
     ) -> tuple[list[Event], list[str]]:
+        collect_mr_commits = options.get("collect_mr_commits", True)
         since_time = now - timedelta(days=cfg.since_days)
         since = since_time.strftime("%Y-%m-%dT%H:%M:%SZ")
         events: list[Event] = []
@@ -102,10 +105,13 @@ class GitLabConnector:
                         raw=json.dumps(p),
                         hash=event_hash("repo", str(p["id"]), "created"),
                     ))
-            # Default-branch commits only (no all=true): branch work appears at merge via MRs.
-            # Revisit during live dry-run / M2 gap logic if branch-level visibility is needed.
+            # Capture commits from every reachable branch inside the daily lookback.
+            # The merged-MR backfill below additionally recovers older commits that
+            # become relevant when their merge request lands inside the lookback.
+            seen_shas = set()
             for c in self._paginate(fetch_json, f"/projects/{p['id']}/repository/commits",
-                                    {"since": since}):
+                                    {"since": since, "all": "true"}):
+                seen_shas.add(c["id"])
                 events.append(Event(
                     person=ids.person("email", c.get("author_email", "")),
                     project=project,
@@ -130,6 +136,35 @@ class GitLabConnector:
                     raw=json.dumps(mr),
                     hash=event_hash("mr", str(p["id"]), str(mr["iid"]), mr["state"]),
                 ))
+                merged_at = mr.get("merged_at")
+                if (collect_mr_commits and mr["state"] == "merged" and merged_at
+                        and _parse_iso8601(merged_at) >= since_time):
+                    try:
+                        mr_commits = self._paginate(
+                            fetch_json,
+                            f"/projects/{p['id']}/merge_requests/{mr['iid']}/commits", {},
+                        )
+                    except Exception:
+                        warnings.append(
+                            "merge request commit lookup failed for "
+                            f"{p['path_with_namespace']} !{mr['iid']}; backfill deferred"
+                        )
+                        continue
+                    for c in mr_commits:
+                        if c["id"] in seen_shas:
+                            continue
+                        seen_shas.add(c["id"])
+                        events.append(Event(
+                            person=ids.person("email", c.get("author_email", "")),
+                            project=project,
+                            ts=c["committed_date"],
+                            source="gitlab",
+                            kind="commit",
+                            summary=c["title"],
+                            refs=json.dumps({"sha": c["id"], "url": c.get("web_url")}),
+                            raw=json.dumps(c),
+                            hash=c["id"],
+                        ))
             for issue in self._paginate(fetch_json, f"/projects/{p['id']}/issues",
                                         {"updated_after": since}):
                 created_at = issue.get("created_at")

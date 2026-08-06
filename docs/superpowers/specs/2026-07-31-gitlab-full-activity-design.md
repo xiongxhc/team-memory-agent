@@ -1,21 +1,28 @@
 # GitLab Full Activity — Design
 
+> **Superseded boundary (2026-08-04):** The branch-exclusion decision below is
+> retained as historical context. Current collection includes commits from every
+> reachable branch inside `TEAMMEM_SINCE_DAYS`, with older commits additionally
+> backfilled from merge requests merged inside that lookback. The backfill is
+> default-on and may be disabled with the boolean `collect_mr_commits: false`.
+
 ## Problem
 
-The GitLab adapter collects two kinds — default-branch `commit` and `mr` — so the
-ledger records code landing but not the movement around it: issues opened and
-closed, and repositories appearing in the group. Teams that run their planning in
-GitLab issues are invisible between merges, and a new project's first days (often
-setup work with few default-branch commits) produce no attributable events at
-all. The operator's goal is that all GitLab movement in the configured group —
-change requests, issues, and repository lifecycle — lands in the ledger as
-attributed facts.
+At the time of this design, the GitLab adapter collected two kinds —
+default-branch `commit` and `mr` — so the ledger recorded code landing but not the
+movement around it: issues opened and closed, and repositories appearing in the
+group. Teams that ran their planning in GitLab issues were invisible between
+merges, and a new project's first days (often setup work with few default-branch
+commits) produced no attributable events at all. The operator's goal was that all
+GitLab movement in the configured group — change requests, issues, and repository
+lifecycle — land in the ledger as attributed facts.
 
 ## Decision summary
 
 - **Two new kinds, provider-native names:** `issue` and `repo`, both
-  `source="gitlab"`. Branch pushes stay excluded — branch work surfaces at merge
-  via MRs, the deliberate boundary carried since the first GitLab collector.
+  `source="gitlab"`. **Historical boundary, superseded:** branch commits were
+  excluded until they surfaced through a merge. Current daily collection reads
+  commits from every reachable branch inside `TEAMMEM_SINCE_DAYS`.
 - **Issues produce stable lifecycle observations:** polling emits one initial
   creation fact with `hash = event_hash("issue", project_id, iid, "opened")`
   when `created_at` is inside the lookback, and one provider-reported closure
@@ -37,8 +44,11 @@ attributed facts.
 - **Rendering treats both kinds as work items:** the three render kind filters
   widen to `("commit", "pr", "mr", "issue", "repo", "journal-highlight")`.
   Synthesis needs no change — slices pass the kind string to the LLM verbatim.
-- **No new configuration:** the existing group `read_api` token already covers
-  the issues and users APIs; the lookback stays `TEAMMEM_SINCE_DAYS`.
+- **Issue/repository configuration:** the existing group `read_api` token already
+  covers the issues and users APIs; the lookback stays `TEAMMEM_SINCE_DAYS`.
+  **Historical configuration statement, superseded:** current collection also
+  has the default-on boolean `collect_mr_commits` option for older merged-MR
+  commit backfill.
 
 ## Event identity mappings (binding)
 
@@ -60,8 +70,10 @@ not scoring; no ranking views" constraint.
 
 ## Out of scope
 
-- Branch pushes, comments/notes, wiki, releases/tags, milestones — future kinds
-  if wanted, same pattern.
+- **Historical branch exclusion, superseded for commit visibility:** current
+  polling captures commits from every reachable branch inside the lookback.
+  Provider push/force-push lifecycle events remain out of scope, as do
+  comments/notes, wiki, releases/tags, and milestones.
 - Project `archived` transitions — the listing has no archived-at timestamp to
   place the event in the lookback window.
 - Repeated issue reopen/reclose history — polling the current issue record

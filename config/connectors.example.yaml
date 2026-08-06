@@ -3,6 +3,7 @@ connectors:
     enabled: false
   gitlab:
     enabled: false
+    # collect_mr_commits: false   # opt out of older merged-MR commit backfill
   slack:
     enabled: false
   feishu:

@@ -28,3 +28,45 @@ def test_unknown_connector_key_is_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match="unknown connector: unknown"):
         load_connector_settings(tmp_path)
+
+
+def test_gitlab_collect_mr_commits_defaults_true_at_collection_boundary(tmp_path):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: true\n"
+    )
+
+    settings = load_connector_settings(tmp_path)
+
+    assert settings["gitlab"].options["collect_mr_commits"] is True
+
+
+@pytest.mark.parametrize("configured", ["true", "false"])
+def test_gitlab_collect_mr_commits_accepts_yaml_boolean(tmp_path, configured):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: true\n"
+        f"    collect_mr_commits: {configured}\n"
+    )
+
+    settings = load_connector_settings(tmp_path)
+
+    assert settings["gitlab"].options["collect_mr_commits"] is (configured == "true")
+
+
+@pytest.mark.parametrize("configured", ['\"false\"', "null", "0", "1.0"])
+def test_gitlab_collect_mr_commits_rejects_non_boolean_yaml(tmp_path, configured):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: true\n"
+        f"    collect_mr_commits: {configured}\n"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="connector option collect_mr_commits for gitlab must be a boolean",
+    ):
+        load_connector_settings(tmp_path)

@@ -24,7 +24,7 @@ present in each collected public/private project channel or group/guild channel.
 | Connector | Can see through Team Memory Agent | Deliberately excluded |
 |---|---|---|
 | GitHub | Default-branch commits and updated pull requests in explicitly mapped repositories | Unmapped repositories |
-| GitLab | Commits, merge requests, issue lifecycle observations, and repository creations in the operator-configured group hierarchy and subgroups; polling captures one initial-creation fact and one provider-reported closure fact per issue; known repositories receive project attribution | Projects outside the configured hierarchy, projects merely shared into it, issue/commit comments, and repeated reopen/reclose history (which requires a state-events or webhook source) |
+| GitLab | Commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`; by default, older commits from MRs merged inside that lookback; merge requests, issue lifecycle observations, and repository creations in the configured group hierarchy and subgroups; known repositories receive project attribution | Projects outside the configured hierarchy, projects merely shared into it, issue/commit comments, and repeated reopen/reclose history (which requires a state-events or webhook source) |
 | Slack | Human top-level messages in explicitly mapped public or private project channels containing the app | DMs, multi-person DMs, unlisted channels, thread replies, bot messages |
 | Feishu | Human messages in explicitly mapped group chats containing the app | Direct chats, unlisted group chats, non-user senders |
 | Discord | Human content messages in explicitly mapped guild channels visible to the bot | DMs/group DMs, unlisted guild channels, bot and webhook messages |
@@ -47,6 +47,11 @@ Feishu is an official option, not a legacy path. The existing private deployment
 remains Feishu-based and unchanged; enabling Slack in a separate public
 deployment does not migrate, replace, or reconfigure it. Public Slack remains
 optional and collects only human top-level messages in its allowlisted channels.
+
+GitLab merged-MR backfill is default-on because a commit can predate the daily
+lookback but become team-relevant when its MR lands. Operators may set
+`collect_mr_commits: false`; this does not disable daily collection across all
+reachable branches.
 
 ## Credentials and configuration
 

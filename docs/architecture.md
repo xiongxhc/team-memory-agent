@@ -48,7 +48,7 @@ silently discarded.
 | Provider | Query boundary | Event source and kinds |
 |---|---|---|
 | GitHub | Only `github_repos` explicitly mapped to projects | `github`: `commit`, `pr` |
-| GitLab | Projects in the `TEAMMEM_GITLAB_GROUP` hierarchy, including subgroups but excluding projects merely shared into it; `gitlab_repos` maps known projects and unknown in-scope projects remain visible without project attribution | `gitlab`: `commit`, `mr`, `issue`, `repo` |
+| GitLab | Projects in the `TEAMMEM_GITLAB_GROUP` hierarchy, including subgroups but excluding projects merely shared into it; commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`, plus default-on backfill of older commits from MRs merged inside that lookback; `gitlab_repos` maps known projects and unknown in-scope projects remain visible without project attribution | `gitlab`: `commit`, `mr`, `issue`, `repo` |
 | Slack | Only `slack_channels` whose metadata identifies a public or private project channel containing the app | `slack-channel`: `message` |
 | Feishu | Only `feishu_channels` whose metadata identifies a group chat containing the app | `feishu-channel`: `message` |
 | Discord | Only `discord_channels` whose metadata includes a guild ID | `discord-channel`: `message` |
@@ -70,6 +70,11 @@ Feishu remains a first-class official adapter. The existing private deployment
 continues to use Feishu and is not reconfigured, migrated, or replaced by the
 GitHub + Slack public quick start. Public Slack remains an optional,
 top-level-message-only adapter.
+
+GitLab branch activity is collected directly with the bounded repository commit
+query. `collect_mr_commits` defaults to `true` and supplements that result with
+older commits from MRs merged inside the same lookback; exact SHAs are emitted
+once per collection. Setting it to `false` disables only that supplement.
 
 ## Ledger and importer
 

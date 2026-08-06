@@ -328,7 +328,7 @@ upgrades, and removal.
 | Connector | Collection boundary |
 |---|---|
 | GitHub | Commits and pull requests from explicitly mapped repositories |
-| GitLab | Commits, merge requests, issue lifecycle observations, and repository creations in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; polling captures one initial-creation fact and one provider-reported closure fact per issue, while repeated reopen/reclose history requires a state-events or webhook source; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
+| GitLab | Commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`, merge requests, issue lifecycle observations, and repository creations in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; commits older than the lookback are also backfilled from merge requests merged inside it; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
 | Slack | Human top-level messages in explicitly mapped public or private project channels containing the app; no DMs and no thread replies |
 | Feishu | Human messages in explicitly mapped group chats; no direct chats |
 | Discord | Human messages in explicitly mapped guild channels; no DMs, bot messages, or webhooks |
@@ -344,6 +344,11 @@ return empty content or history when `READ_MESSAGE_HISTORY` or
 Feishu remains a first-class official connector. The existing private deployment
 continues to use Feishu unchanged. Public Slack is an optional,
 top-level-message-only connector, not a migration or replacement.
+
+GitLab merged-MR commit backfill is enabled by default. Set
+`collect_mr_commits: false` under `gitlab` in `connectors.yaml` to opt out of
+that older-commit backfill; daily commits from every reachable branch are still
+collected.
 
 ### Reviewed bundle inbox
 
