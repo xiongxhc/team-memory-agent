@@ -4,7 +4,7 @@ from teammem.docs_sync import sync_docs
 def _obsidian(tmp_path):
     src = tmp_path / "obsidian"
     (src / "Award").mkdir(parents=True)
-    (src / "Award" / "architecture.md").write_text(
+    (src / "Award" / "Architecture.md").write_text(
         "# Award — Architecture\nSee [[Award]] and [[Deploy Notes|notes]].\n")
     (src / "Award" / "Award.md").write_text("personal activity index")
     (src / "Smart App").mkdir()

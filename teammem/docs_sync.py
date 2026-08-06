@@ -8,7 +8,11 @@ case/punctuation-insensitive name match against the Obsidian folder name."""
 import re
 from pathlib import Path
 
-DOC_FILES = ("architecture.md", "summary.md")
+# Source vaults may use capitalized (Architecture.md) or lowercase names; try
+# capitalized first, fall back to lowercase. Destinations are always lowercase —
+# vault project notes link ../Docs/<slug>/architecture.md and Git web UIs are
+# case-sensitive.
+DOC_FILES = ("Architecture.md", "Summary.md")
 
 
 def _norm(s: str) -> str:
@@ -38,9 +42,11 @@ def sync_docs(projects: dict, obsidian_dir: Path, vault_dir: Path) -> dict:
         for name in DOC_FILES:
             src = folder / name
             if not src.is_file():
-                continue
+                src = folder / name.lower()
+                if not src.is_file():
+                    continue
             text = flatten_wikilinks(src.read_text())
-            dst = vault_dir / "Docs" / slug / name
+            dst = vault_dir / "Docs" / slug / name.lower()
             if dst.is_file() and dst.read_text() == text:
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
