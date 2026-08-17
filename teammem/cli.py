@@ -83,6 +83,9 @@ def _parser() -> argparse.ArgumentParser:
     p_render.add_argument("--today", type=str, default=None)
     p_render.add_argument("--push", action="store_true")
     p_render.add_argument("--dry-run", action="store_true")
+    p_render.add_argument("--verify", action="store_true",
+                          help="re-render to a temp tree and diff managed vault"
+                               " paths; writes nothing, exit 1 on drift")
 
     p_journal = sub.add_parser(
         "journal", help="generate cached daily per-person journals"
@@ -339,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
             weeks=args.weeks,
             push_requested=args.push,
             dry_run=args.dry_run,
+            verify=args.verify,
         )
 
     if args.cmd == "journal":

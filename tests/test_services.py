@@ -681,3 +681,29 @@ def test_render_push_warning_keeps_sanitized_final_git_stderr_line(
         "commits retained for next push"
     ) in captured.err
     assert "secret-token" not in captured.out + captured.err
+
+
+def test_render_service_verify_reports_clean_then_drift(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    _seed(cfg)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    assert run_render(cfg, ids, today=date(2026, 7, 16)) == 0
+    capsys.readouterr()
+
+    assert run_render(cfg, ids, today=date(2026, 7, 16), verify=True) == 0
+    assert "verify-render: vault matches ledger render" in capsys.readouterr().out
+
+    (cfg.vault_dir / "README.md").write_text("tampered")
+    assert run_render(cfg, ids, today=date(2026, 7, 16), verify=True) == 1
+    out = capsys.readouterr().out
+    assert "DIFFERS README.md" in out
+
+
+def test_render_service_verify_rejects_push_and_dry_run(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    _seed(cfg)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    assert run_render(cfg, ids, today=date(2026, 7, 16), verify=True,
+                      push_requested=True) == 2
+    assert run_render(cfg, ids, today=date(2026, 7, 16), verify=True,
+                      dry_run=True) == 2

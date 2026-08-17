@@ -6,7 +6,7 @@ import pytest
 
 from teammem.events import Event
 from teammem.identity import IdentityMaps
-from teammem.render import render_vault
+from teammem.render import render_vault, verify_vault
 from teammem.store import SummaryRecord, insert_events, open_db, put_summary
 
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
@@ -569,3 +569,29 @@ def test_person_week_activity_detail_capped(tmp_path):
     week = (vault / "Person" / "Alex Rivera" / "Week 2026-07-13-17.md").read_text()
     assert week.count("- commit —") + week.count("- mr —") == 12
     assert "…and 3 more work items" in week
+
+
+def test_verify_vault_clean_after_render(tmp_path):
+    conn = _seed(tmp_path)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    vault = tmp_path / "vault"
+    render_vault(conn, ids, vault, TODAY)
+    assert verify_vault(conn, ids, vault, TODAY) == {
+        "missing": [], "unexpected": [], "differing": []}
+
+
+def test_verify_vault_reports_drift_ignores_unmanaged(tmp_path):
+    conn = _seed(tmp_path)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    vault = tmp_path / "vault"
+    render_vault(conn, ids, vault, TODAY)
+    (vault / "Projects" / "project-alpha.md").write_text("tampered")
+    (vault / "Person" / "Sam Lee" / "README.md").unlink()
+    (vault / "Work Journal" / "extra.md").write_text("x")
+    (vault / "Docs").mkdir()
+    (vault / "Docs" / "note.md").write_text("unmanaged, must be ignored")
+    out = verify_vault(conn, ids, vault, TODAY)
+    assert out["differing"] == ["Projects/project-alpha.md"]
+    assert out["missing"] == ["Person/Sam Lee/README.md"]
+    assert out["unexpected"] == ["Work Journal/extra.md"]
+    assert (vault / "Projects" / "project-alpha.md").read_text() == "tampered"  # read-only

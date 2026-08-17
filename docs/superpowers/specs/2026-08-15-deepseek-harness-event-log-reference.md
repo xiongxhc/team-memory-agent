@@ -3,7 +3,8 @@
 Source: [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)
 (MIT, developer preview, open-sourced 2026-08-13). File paths below are relative
 to that repo and pinned to the preview state — verify against upstream before
-citing later. Status: reference record, no work item attached.
+citing later. Status: reference record; item 3 (derivation-desync check)
+implemented 2026-08-15 as `teammem render --verify`.
 
 ## Why this record exists
 

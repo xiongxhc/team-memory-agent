@@ -11,6 +11,7 @@ import math
 import re
 import shutil
 import sqlite3
+import tempfile
 from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -381,3 +382,36 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         f"- events in window: {len(all_rows)}\n"
         f"- current: [{label}](Work%20Journal/{quote(label)}.md)\n")
     return {"files": files + 1, "week_label": label}
+
+
+def _managed_files(root: Path) -> set[str]:
+    found: set[str] = set()
+    for m in MANAGED:
+        p = root / m
+        if p.is_dir():
+            found |= {f.relative_to(root).as_posix()
+                      for f in p.rglob("*") if f.is_file()}
+        elif p.is_file():
+            found.add(m)
+    return found
+
+
+def verify_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
+                 today: date, weeks: int = 4,
+                 channel_names: dict | None = None) -> dict:
+    """Re-render into a temp tree and diff managed paths against vault_dir.
+    Never writes to vault_dir; detects hand-edits under managed paths and
+    renderer nondeterminism."""
+    with tempfile.TemporaryDirectory() as td:
+        expected_dir = Path(td) / "vault"
+        render_vault(conn, ids, expected_dir, today, weeks=weeks,
+                     channel_names=channel_names)
+        expected, actual = _managed_files(expected_dir), _managed_files(vault_dir)
+        return {
+            "missing": sorted(expected - actual),
+            "unexpected": sorted(actual - expected),
+            "differing": sorted(
+                rel for rel in expected & actual
+                if (expected_dir / rel).read_bytes()
+                != (vault_dir / rel).read_bytes()),
+        }

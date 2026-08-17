@@ -22,7 +22,7 @@ from .events import Event
 from .identity import IdentityMaps, _read
 from .queries import report_context, week_label, week_monday
 from .reclaim import reclaim, reclaim_channel_projects
-from .render import render_vault
+from .render import render_vault, verify_vault
 from .slices import active_person_days
 from .store import get_summary, insert_events, open_db, reconcile_gitlab_events
 from .summarize import (
@@ -270,8 +270,13 @@ def run_render(
     weeks: int = 4,
     push_requested: bool = False,
     dry_run: bool = False,
+    verify: bool = False,
     conn: sqlite3.Connection | None = None,
 ) -> int:
+    if verify and (push_requested or dry_run):
+        print("render --verify cannot combine with --push or --dry-run",
+              file=sys.stderr)
+        return 2
     if dry_run:
         print(
             f"DRY render -> {cfg.vault_dir} ({week_label(week_monday(today))},"
@@ -279,9 +284,27 @@ def run_render(
         )
         return 0
     connection = conn or open_db(cfg.db_path)
-    ensure_repo(cfg.vault_dir)
     names_file = cfg.config_dir / "channel_names.json"
     channel_names = json.loads(names_file.read_text()) if names_file.exists() else {}
+    if verify:
+        out = verify_vault(
+            connection, ids, cfg.vault_dir, today,
+            weeks=weeks, channel_names=channel_names,
+        )
+        drift = [(label, path)
+                 for label, paths in (("MISSING", out["missing"]),
+                                      ("UNEXPECTED", out["unexpected"]),
+                                      ("DIFFERS", out["differing"]))
+                 for path in paths]
+        for label, path in drift:
+            print(f"verify-render: {label} {path}")
+        if drift:
+            print(f"verify-render: {len(drift)} managed path(s) drifted from "
+                  f"ledger render -> re-run `teammem render` to republish")
+            return 1
+        print("verify-render: vault matches ledger render")
+        return 0
+    ensure_repo(cfg.vault_dir)
     out = render_vault(
         connection,
         ids,

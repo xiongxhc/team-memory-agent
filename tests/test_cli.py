@@ -1260,3 +1260,22 @@ def test_schedule_programming_and_base_exceptions_still_propagate(
         main([
             "--env-file", str(tmp_path / "broken.env"), "schedule", "status"
         ])
+
+
+def test_main_render_verify_flag(tmp_path, monkeypatch, capsys):
+    from teammem.store import open_db, insert_events
+    from teammem.events import Event
+    db = tmp_path / "l.db"
+    insert_events(open_db(db), [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="x", hash="h1")])
+    monkeypatch.setenv("TEAMMEM_DB", str(db))
+    monkeypatch.setenv("TEAMMEM_VAULT", str(tmp_path / "vault"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    monkeypatch.delenv("TEAMMEM_PUSH", raising=False)
+    assert main(["render", "--today", "2026-07-16"]) == 0
+    capsys.readouterr()
+    assert main(["render", "--today", "2026-07-16", "--verify"]) == 0
+    assert "vault matches" in capsys.readouterr().out
+    (tmp_path / "vault" / "README.md").write_text("tampered")
+    assert main(["render", "--today", "2026-07-16", "--verify"]) == 1
