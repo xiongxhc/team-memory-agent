@@ -1,6 +1,7 @@
 """GitLab connector adapter with legacy event identities preserved."""
 
 import json
+import re
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
@@ -13,6 +14,9 @@ from .config import ConnectorSettings
 
 
 _PER_PAGE = 100
+# GitLab reserves this username namespace for group/project access-token bot
+# accounts; humans cannot register such names.
+_TOKEN_BOT_RE = re.compile(r"(group|project)_\d+_bot_")
 FetchJson = Callable[[str, dict], list]
 
 
@@ -113,7 +117,7 @@ class GitLabConnector:
                 if note.get("system"):
                     continue
                 author = (note.get("author") or {}).get("username", "")
-                if author in exclude_note_authors:
+                if author in exclude_note_authors or _TOKEN_BOT_RE.match(author):
                     continue
                 created_at = note.get("created_at")
                 if not created_at or _parse_iso8601(created_at) < since_time:

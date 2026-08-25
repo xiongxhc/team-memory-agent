@@ -358,9 +358,11 @@ and SHA in different projects remain distinct ledger facts.
 GitLab comment collection turns each human, non-system note on an in-window
 merge request or issue into a `comment` event attributed to its author, with
 the summary capped at 120 characters; the full note body stays in the local
-ledger only. List bot accounts under `exclude_note_authors` under `gitlab` in
-`connectors.yaml` to keep automated reviewers (for example a review-agent bot
-that comments on every MR) out of team memory.
+ledger only. GitLab group/project access-token bot accounts
+(`group_N_bot_…`/`project_N_bot_…`) are always skipped — every token an
+automated reviewer posts through gets its own bot identity, so a name list
+cannot keep up. List additional bot accounts with human-registerable names
+under `exclude_note_authors` under `gitlab` in `connectors.yaml`.
 
 ### Reviewed bundle inbox
 

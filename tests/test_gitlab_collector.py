@@ -744,3 +744,16 @@ def test_empty_comment_body_is_skipped():
         "/projects/1/merge_requests/7/notes": [[empty]],
     })
     assert [e for e in events if e.kind == "comment"] == []
+
+
+def test_gitlab_token_bot_authors_skipped_by_default():
+    bot_notes = [dict(MR_NOTE, id=908,
+                      author={"username": "group_9_bot_4de70c3f2a9cb6ae"}),
+                 dict(MR_NOTE, id=909,
+                      author={"username": "project_12_bot_aa11bb22"})]
+    events = _collect({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/merge_requests/7/notes": [bot_notes],
+    })
+    assert [e for e in events if e.kind == "comment"] == []
