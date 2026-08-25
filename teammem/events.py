@@ -9,7 +9,7 @@ class Event:
     person: str          # canonical slug from roster.yaml, or "_unmapped/<raw>"
     ts: str              # ISO 8601
     source: str          # "gitlab" | "feishu-channel" | "calendar" | "bundle:<member>"
-    kind: str            # "commit" | "pr" | "mr" | "issue" | "repo" | "message" | "meeting" | "journal-highlight"
+    kind: str            # "commit" | "pr" | "mr" | "issue" | "repo" | "comment" | "message" | "meeting" | "journal-highlight"
     summary: str         # one attributed line
     hash: str            # dedup key within (person, source)
     project: str | None = None

@@ -332,7 +332,7 @@ upgrades, and removal.
 | Connector | Collection boundary |
 |---|---|
 | GitHub | Commits and pull requests from explicitly mapped repositories |
-| GitLab | Commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`, merge requests, issue lifecycle observations, and repository creations in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; for merge requests merged inside the lookback, all unseen MR commits are also collected, including in-window commits from deleted or squashed source branches and older commits; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
+| GitLab | Commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`, merge requests, issue lifecycle observations, human comments on in-window merge requests and issues, and repository creations in the operator-configured group hierarchy, including subgroups but excluding projects merely shared into it; for merge requests merged inside the lookback, all unseen MR commits are also collected, including in-window commits from deleted or squashed source branches and older commits; mapped repositories get project attribution and other in-scope repositories remain visibly unmapped |
 | Slack | Human top-level messages in explicitly mapped public or private project channels containing the app; no DMs and no thread replies |
 | Feishu | Human messages in explicitly mapped group chats; no direct chats |
 | Discord | Human messages in explicitly mapped guild channels; no DMs, bot messages, or webhooks |
@@ -354,6 +354,13 @@ GitLab merged-MR commit backfill is enabled by default. Set
 all unseen MR commits; daily commits from every reachable branch are still
 collected. Commit identities include the GitLab project ID, so the same author
 and SHA in different projects remain distinct ledger facts.
+
+GitLab comment collection turns each human, non-system note on an in-window
+merge request or issue into a `comment` event attributed to its author, with
+the summary capped at 120 characters; the full note body stays in the local
+ledger only. List bot accounts under `exclude_note_authors` under `gitlab` in
+`connectors.yaml` to keep automated reviewers (for example a review-agent bot
+that comments on every MR) out of team memory.
 
 ### Reviewed bundle inbox
 

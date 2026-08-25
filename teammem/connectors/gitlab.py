@@ -74,6 +74,7 @@ class GitLabConnector:
         options: dict,
     ) -> tuple[list[Event], list[str]]:
         collect_mr_commits = options.get("collect_mr_commits", True)
+        exclude_note_authors = set(options.get("exclude_note_authors", []))
         since_time = now - timedelta(days=cfg.since_days)
         since = since_time.strftime("%Y-%m-%dT%H:%M:%SZ")
         events: list[Event] = []
@@ -96,6 +97,47 @@ class GitLabConnector:
                 raw=json.dumps(commit),
                 hash=event_hash("commit", str(project_id), commit["id"]),
             ))
+
+        def append_comments(project_id: object, project: str | None, ref: str,
+                            parent_url: str | None, notes_path: str,
+                            path_with_namespace: str) -> None:
+            try:
+                notes = self._paginate(fetch_json, notes_path, {})
+            except Exception:
+                warnings.append(
+                    f"comment lookup failed for {path_with_namespace} {ref}; "
+                    "backfill deferred"
+                )
+                return
+            for note in notes:
+                if note.get("system"):
+                    continue
+                author = (note.get("author") or {}).get("username", "")
+                if author in exclude_note_authors:
+                    continue
+                created_at = note.get("created_at")
+                if not created_at or _parse_iso8601(created_at) < since_time:
+                    continue
+                body = " ".join((note.get("body") or "").split())
+                if not body:
+                    continue
+                if len(body) > 120:
+                    body = body[:119] + "…"
+                events.append(Event(
+                    person=ids.person("gitlab", author),
+                    project=project,
+                    ts=created_at,
+                    source="gitlab",
+                    kind="comment",
+                    summary=f"[{ref}] {body}",
+                    refs=json.dumps({
+                        "note_id": note["id"],
+                        "url": (f"{parent_url}#note_{note['id']}"
+                                if parent_url else None),
+                    }),
+                    raw=json.dumps(note),
+                    hash=event_hash("comment", str(project_id), str(note["id"])),
+                ))
 
         projects = self._paginate(fetch_json, f"/groups/{cfg.gitlab_group}/projects",
                                   {
@@ -151,6 +193,11 @@ class GitLabConnector:
                     raw=json.dumps(mr),
                     hash=event_hash("mr", str(p["id"]), str(mr["iid"]), mr["state"]),
                 ))
+                append_comments(
+                    p["id"], project, f"!{mr['iid']}", mr.get("web_url"),
+                    f"/projects/{p['id']}/merge_requests/{mr['iid']}/notes",
+                    p["path_with_namespace"],
+                )
                 merged_at = mr.get("merged_at")
                 if (collect_mr_commits and mr["state"] == "merged" and merged_at
                         and _parse_iso8601(merged_at) >= since_time):
@@ -169,6 +216,11 @@ class GitLabConnector:
                         append_commit(p["id"], project, c)
             for issue in self._paginate(fetch_json, f"/projects/{p['id']}/issues",
                                         {"updated_after": since}):
+                append_comments(
+                    p["id"], project, f"#{issue['iid']}", issue.get("web_url"),
+                    f"/projects/{p['id']}/issues/{issue['iid']}/notes",
+                    p["path_with_namespace"],
+                )
                 created_at = issue.get("created_at")
                 if created_at and _parse_iso8601(created_at) >= since_time:
                     author = issue.get("author") or {}

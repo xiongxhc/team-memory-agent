@@ -48,7 +48,7 @@ silently discarded.
 | Provider | Query boundary | Event source and kinds |
 |---|---|---|
 | GitHub | Only `github_repos` explicitly mapped to projects | `github`: `commit`, `pr` |
-| GitLab | Projects in the `TEAMMEM_GITLAB_GROUP` hierarchy, including subgroups but excluding projects merely shared into it; commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`, plus default-on collection of all unseen MR commits from MRs merged inside that lookback, including in-window commits from deleted or squashed source branches and older commits; `gitlab_repos` maps known projects and unknown in-scope projects remain visible without project attribution | `gitlab`: `commit`, `mr`, `issue`, `repo` |
+| GitLab | Projects in the `TEAMMEM_GITLAB_GROUP` hierarchy, including subgroups but excluding projects merely shared into it; commits on every reachable branch inside `TEAMMEM_SINCE_DAYS`, plus default-on collection of all unseen MR commits from MRs merged inside that lookback, including in-window commits from deleted or squashed source branches and older commits; human non-system notes on in-window MRs and issues become `comment` events (summary capped at 120 chars, authors in `exclude_note_authors` skipped); `gitlab_repos` maps known projects and unknown in-scope projects remain visible without project attribution | `gitlab`: `commit`, `mr`, `issue`, `repo`, `comment` |
 | Slack | Only `slack_channels` whose metadata identifies a public or private project channel containing the app | `slack-channel`: `message` |
 | Feishu | Only `feishu_channels` whose metadata identifies a group chat containing the app | `feishu-channel`: `message` |
 | Discord | Only `discord_channels` whose metadata includes a guild ID | `discord-channel`: `message` |

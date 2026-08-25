@@ -70,3 +70,28 @@ def test_gitlab_collect_mr_commits_rejects_non_boolean_yaml(tmp_path, configured
         match="connector option collect_mr_commits for gitlab must be a boolean",
     ):
         load_connector_settings(tmp_path)
+
+
+def test_gitlab_exclude_note_authors_defaults_empty(tmp_path):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: true\n"
+    )
+    settings = load_connector_settings(tmp_path)
+    assert settings["gitlab"].options["exclude_note_authors"] == []
+
+
+@pytest.mark.parametrize("configured", ["fgbot", "true", "{a: 1}", "[1, 2]"])
+def test_gitlab_exclude_note_authors_rejects_non_string_list(tmp_path, configured):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: true\n"
+        f"    exclude_note_authors: {configured}\n"
+    )
+    with pytest.raises(
+        ValueError,
+        match="connector option exclude_note_authors for gitlab must be a list of strings",
+    ):
+        load_connector_settings(tmp_path)

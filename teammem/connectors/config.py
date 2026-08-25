@@ -58,6 +58,13 @@ def load_connector_settings(config_dir: Path) -> dict[str, ConnectorSettings]:
                 raise ValueError(
                     "connector option collect_mr_commits for gitlab must be a boolean"
                 )
+            exclude_note_authors = options.setdefault("exclude_note_authors", [])
+            if (not isinstance(exclude_note_authors, list)
+                    or any(not isinstance(u, str) for u in exclude_note_authors)):
+                raise ValueError(
+                    "connector option exclude_note_authors for gitlab must be "
+                    "a list of strings"
+                )
         settings[name] = ConnectorSettings(
             name=name,
             enabled=enabled,

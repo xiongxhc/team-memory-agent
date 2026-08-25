@@ -23,7 +23,7 @@ from .store import get_summary
 
 MANAGED = ("Person", "Projects", "Work Journal", "README.md")
 MAX_WORK_LINES = 12   # work bullets per person per week (project pages, person week files)
-WORK_KINDS = ("commit", "pr", "mr", "issue", "repo", "journal-highlight")
+WORK_KINDS = ("commit", "pr", "mr", "issue", "repo", "comment", "journal-highlight")
 _FLAG_KEYS = frozenset({"gaps", "unmapped", "unmapped_channels", "concentration"})
 _INVALID_FLAGS_MESSAGE = "invalid weekly report effective flags provenance"
 

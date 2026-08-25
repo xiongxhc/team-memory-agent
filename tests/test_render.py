@@ -595,3 +595,18 @@ def test_verify_vault_reports_drift_ignores_unmanaged(tmp_path):
     assert out["missing"] == ["Person/Sam Lee/README.md"]
     assert out["unexpected"] == ["Work Journal/extra.md"]
     assert (vault / "Projects" / "project-alpha.md").read_text() == "tampered"  # read-only
+
+
+def test_comment_events_render_as_work(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T10:30:00+04:00", source="gitlab",
+              kind="comment", summary="[!7] LGTM, one nit on the quota check",
+              hash="n1", project="project-alpha",
+              refs='{"url": "https://x/mr7#note_900"}'),
+    ])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    report = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text()
+    assert "[!7] LGTM, one nit on the quota check" in report
+    assert "1 comment" in report                   # kind shows in per-person detail

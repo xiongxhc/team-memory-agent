@@ -4,6 +4,7 @@ connectors:
   gitlab:
     enabled: false
     # collect_mr_commits: false   # opt out of unseen commits from in-window merged MRs
+    # exclude_note_authors: []    # GitLab usernames (e.g. bot accounts) whose MR/issue comments are not collected
   slack:
     enabled: false
   feishu:

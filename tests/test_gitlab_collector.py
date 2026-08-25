@@ -646,3 +646,101 @@ def test_connector_preserves_non_commit_gitlab_identities():
          '{"iid": 31, "url": "https://gitlab.internal/team/project-alpha/-/issues/31"}',
          "789bb2e605c8237773c1eb4c159aa90a6ad895365f1b86de054cb1cc1a23ccf8"),
     ]
+
+
+MR_NOTE = {"id": 900, "body": "LGTM, one nit on the quota check", "system": False,
+           "author": {"username": "alexdev"},
+           "created_at": "2026-07-14T10:30:00Z"}
+ISSUE_NOTE = {"id": 901, "body": "Repro confirmed on staging", "system": False,
+              "author": {"username": "alexdev"},
+              "created_at": "2026-07-14T11:30:00Z"}
+
+
+def test_mr_and_issue_comments_become_events():
+    events = _collect({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/issues": [[ISSUE]],
+        "/projects/1/merge_requests/7/notes": [[MR_NOTE]],
+        "/projects/1/issues/31/notes": [[ISSUE_NOTE]],
+    })
+    comments = [e for e in events if e.kind == "comment"]
+    assert len(comments) == 2
+    mr_c = next(c for c in comments if c.summary.startswith("[!7]"))
+    assert mr_c.person == "alex"
+    assert mr_c.summary == "[!7] LGTM, one nit on the quota check"
+    assert mr_c.ts == "2026-07-14T10:30:00Z"
+    assert mr_c.hash == event_hash("comment", "1", "900")
+    assert json.loads(mr_c.refs)["url"] == MR["web_url"] + "#note_900"
+    issue_c = next(c for c in comments if c.summary.startswith("[#31]"))
+    assert issue_c.summary == "[#31] Repro confirmed on staging"
+    assert issue_c.hash == event_hash("comment", "1", "901")
+
+
+def test_system_bot_and_stale_notes_not_collected():
+    system_note = dict(MR_NOTE, id=902, system=True, body="changed milestone")
+    bot_note = dict(MR_NOTE, id=903, author={"username": "fgbot"})
+    stale_note = dict(MR_NOTE, id=904, created_at="2026-06-01T00:00:00Z")
+    result = GitLabConnector(fetch_json=fake_fetch({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/merge_requests/7/notes": [[system_note, bot_note, stale_note]],
+    })).collect(
+        Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
+        IdentityMaps.load(CONFIG_DIR),
+        ConnectorSettings(name="gitlab", enabled=True,
+                          options={"exclude_note_authors": ["fgbot"]}),
+        NOW,
+    )
+    assert [e for e in result.events if e.kind == "comment"] == []
+
+
+def test_comment_summary_is_capped_at_120_chars():
+    long_note = dict(MR_NOTE, id=905, body="x" * 200)
+    events = _collect({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/merge_requests/7/notes": [[long_note]],
+    })
+    comment = next(e for e in events if e.kind == "comment")
+    assert comment.summary == "[!7] " + "x" * 119 + "…"
+
+
+def test_failed_note_lookup_warns_without_losing_other_events():
+    def fetch(path, params):
+        if path.endswith("/notes"):
+            raise RuntimeError("boom")
+        return fake_fetch({
+            "/groups/42/projects": [PROJECTS],
+            "/projects/1/merge_requests": [[dict(MR, state="opened", merged_at=None)]],
+        })(path, params)
+    result = GitLabConnector(fetch_json=fetch).collect(
+        Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
+        IdentityMaps.load(CONFIG_DIR),
+        ConnectorSettings(name="gitlab", enabled=True, options={}),
+        NOW,
+    )
+    assert [e.kind for e in result.events] == ["mr"]
+    assert any("comment lookup failed" in w and "!7" in w for w in result.warnings)
+
+
+def test_multiline_comment_body_collapses_to_one_line():
+    noisy = dict(MR_NOTE, id=906,
+                 body="LGTM overall.\n\n- fix the quota check\n- add a test\n")
+    events = _collect({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/merge_requests/7/notes": [[noisy]],
+    })
+    comment = next(e for e in events if e.kind == "comment")
+    assert comment.summary == "[!7] LGTM overall. - fix the quota check - add a test"
+
+
+def test_empty_comment_body_is_skipped():
+    empty = dict(MR_NOTE, id=907, body="   \n  ")
+    events = _collect({
+        "/groups/42/projects": [PROJECTS],
+        "/projects/1/merge_requests": [[MR]],
+        "/projects/1/merge_requests/7/notes": [[empty]],
+    })
+    assert [e for e in events if e.kind == "comment"] == []

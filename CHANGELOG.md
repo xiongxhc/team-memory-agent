@@ -8,6 +8,12 @@ Notable changes to Team Memory Agent and MemberKit are documented here.
 
 #### Added
 
+- GitLab collection turns each human, non-system note on an in-window merge
+  request or issue into a `comment` event attributed to its author (summary
+  capped at 120 characters; full body kept in the local ledger only). Comments
+  render as work in the vault. New `exclude_note_authors` connector option
+  keeps bot accounts out of team memory.
+
 - Full runs reconcile the current and previous report weeks. Current-week Work
   Journals are provisional Monday through Thursday, become Friday checkpoints,
   and can incorporate late evidence over the weekend.
