@@ -1,0 +1,275 @@
+{
+  "schema": "teammem-meeting/v1",
+  "occurrence_id": "vc:9f3a/board-sync@2026-09-02T14:00:00Z",
+  "revision": 3,
+  "provider": "feishu",
+  "provider_meeting_id": "vc:9f3a/board-sync",
+  "title": "Atlas Launch Readiness",
+  "started_at": "2026-09-02T14:00:00Z",
+  "ended_at": "2026-09-02T14:52:00Z",
+  "organizer": {
+    "person_id": "ou_ada",
+    "display_name": "Ada Chen"
+  },
+  "organizer_source": "reservation",
+  "organizer_unresolved_reason": null,
+  "transcript_complete": true,
+  "summary": "The team walked the Atlas launch checklist, cleared the Borealis migration blocker, and agreed to keep Cygnus on the current sprint. The go/no-go call moves to Friday.",
+  "participants": [
+    {
+      "person_id": "ou_ada",
+      "display_name": "Ada Chen",
+      "attendance": [
+        {"joined_at": "2026-09-02T13:58:40Z", "left_at": "2026-09-02T14:52:00Z"}
+      ]
+    },
+    {
+      "person_id": "ou_ben",
+      "display_name": "Ben Ortiz",
+      "attendance": [
+        {"joined_at": "2026-09-02T14:00:12Z", "left_at": "2026-09-02T14:51:30Z"}
+      ]
+    },
+    {
+      "person_id": "ou_chi",
+      "display_name": "Chidi Okafor",
+      "attendance": [
+        {"joined_at": "2026-09-02T14:00:20Z", "left_at": "2026-09-02T14:20:00Z"},
+        {"joined_at": "2026-09-02T14:24:05Z", "left_at": "2026-09-02T14:52:00Z"}
+      ]
+    },
+    {
+      "person_id": "ou_dana",
+      "display_name": "Dana Whitfield",
+      "attendance": [
+        {"joined_at": "2026-09-02T14:01:02Z", "left_at": null}
+      ]
+    },
+    {
+      "person_id": "ou_eli",
+      "display_name": "Eli Novak",
+      "attendance": [
+        {"joined_at": "2026-09-02T14:02:11Z", "left_at": "2026-09-02T14:49:00Z"}
+      ]
+    },
+    {
+      "person_id": "ou_fen",
+      "display_name": "Fen Zhao",
+      "attendance": [
+        {"joined_at": "2026-09-02T14:00:05Z", "left_at": "2026-09-02T14:52:00Z"}
+      ]
+    },
+    {
+      "person_id": "ou_gus",
+      "display_name": "Gus Petrov",
+      "attendance": [
+        {"joined_at": "2026-09-02T14:03:44Z", "left_at": "2026-09-02T14:52:00Z"}
+      ]
+    },
+    {
+      "person_id": "ou_hana",
+      "display_name": "Hana Suzuki",
+      "attendance": [
+        {"joined_at": "2026-09-02T14:04:30Z", "left_at": "2026-09-02T14:52:00Z"}
+      ]
+    }
+  ],
+  "transcript": [
+    {
+      "segment_id": "s001",
+      "started_at": "2026-09-02T14:00:05Z",
+      "ended_at": "2026-09-02T14:00:35Z",
+      "text": "Let us walk the Atlas launch checklist top to bottom before anything else.",
+      "speaker": {"kind": "person", "person_id": "ou_ada", "display_name": "Ada Chen", "reconciled": true},
+      "attribution_confidence": 0.94,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s002",
+      "started_at": "2026-09-02T14:00:35Z",
+      "ended_at": "2026-09-02T14:01:10Z",
+      "text": "Atlas has two open packaging items and both have owners already.",
+      "speaker": {"kind": "person", "person_id": "ou_ben", "display_name": "Ben Ortiz", "reconciled": true},
+      "attribution_confidence": 0.91,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s003",
+      "started_at": "2026-09-02T14:01:10Z",
+      "ended_at": "2026-09-02T14:01:50Z",
+      "text": "The staging soak has been green for six days, so I am comfortable with the current build.",
+      "speaker": {"kind": "person", "person_id": "ou_chi", "display_name": "Chidi Okafor", "reconciled": true},
+      "attribution_confidence": 0.88,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s004",
+      "started_at": "2026-09-02T14:02:00Z",
+      "ended_at": "2026-09-02T14:02:40Z",
+      "text": "Borealis is blocked on the migration window, and we need one night of downtime.",
+      "speaker": {"kind": "person", "person_id": "ou_dana", "display_name": "Dana Whitfield", "reconciled": true},
+      "attribution_confidence": 0.93,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s005",
+      "started_at": "2026-09-02T14:02:40Z",
+      "ended_at": "2026-09-02T14:03:20Z",
+      "text": "We can take that window on Thursday night; the read replicas absorb the traffic.",
+      "speaker": {"kind": "person", "person_id": "ou_eli", "display_name": "Eli Novak", "reconciled": true},
+      "attribution_confidence": 0.9,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s006",
+      "started_at": "2026-09-02T14:03:20Z",
+      "ended_at": "2026-09-02T14:04:00Z",
+      "text": "Cygnus is mid-sprint and nothing in the launch depends on it this month.",
+      "speaker": {"kind": "person", "person_id": "ou_fen", "display_name": "Fen Zhao", "reconciled": true},
+      "attribution_confidence": 0.87,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s007",
+      "started_at": "2026-09-02T14:04:10Z",
+      "ended_at": "2026-09-02T14:04:50Z",
+      "text": "Agreed, Cygnus stays on its current sprint plan and we revisit after launch.",
+      "speaker": {"kind": "person", "person_id": "ou_gus", "display_name": "Gus Petrov", "reconciled": true},
+      "attribution_confidence": 0.85,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s008",
+      "started_at": "2026-09-02T14:05:00Z",
+      "ended_at": "2026-09-02T14:05:30Z",
+      "text": "One question on the rollback path, does it cover the schema change too?",
+      "speaker": {"kind": "anonymous", "cluster_id": "spk_3"},
+      "attribution_confidence": 0.42,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s009",
+      "started_at": "2026-09-02T14:05:30Z",
+      "ended_at": "2026-09-02T14:06:15Z",
+      "text": "It does, but only for the first hour after the cutover.",
+      "speaker": {"kind": "ambiguous"},
+      "attribution_confidence": 0.31,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s010",
+      "started_at": "2026-09-02T14:06:15Z",
+      "ended_at": "2026-09-02T14:07:00Z",
+      "text": "Then the Atlas go/no-go call moves to Friday morning so the soak keeps running.",
+      "speaker": {"kind": "person", "person_id": "ou_ada", "display_name": "Ada Chen", "reconciled": true},
+      "attribution_confidence": 0.95,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s011",
+      "started_at": "2026-09-02T14:07:00Z",
+      "ended_at": "2026-09-02T14:07:45Z",
+      "text": "I will write the Borealis migration runbook and circulate it before Thursday.",
+      "speaker": {"kind": "person", "person_id": "ou_dana", "display_name": "Dana Whitfield", "reconciled": true},
+      "attribution_confidence": 0.92,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s012",
+      "started_at": "2026-09-02T14:07:45Z",
+      "ended_at": "2026-09-02T14:08:30Z",
+      "text": "The packaging items land tomorrow, I already have both branches open.",
+      "speaker": {"kind": "person", "person_id": "ou_ben", "display_name": "Ben Ortiz", "reconciled": true},
+      "attribution_confidence": 0.89,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s013",
+      "started_at": "2026-09-02T14:08:30Z",
+      "ended_at": "2026-09-02T14:09:20Z",
+      "text": "Someone should still review the Cygnus interface note, it has been open a while.",
+      "speaker": {"kind": "person", "person_id": "ou_fen", "display_name": "Fen Zhao", "reconciled": true},
+      "attribution_confidence": 0.86,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    },
+    {
+      "segment_id": "s014",
+      "started_at": "2026-09-02T14:09:20Z",
+      "ended_at": "2026-09-02T14:10:00Z",
+      "text": "That is everything on the checklist, thank you all.",
+      "speaker": {"kind": "person", "person_id": "ou_ada", "display_name": "Ada Chen", "reconciled": true},
+      "attribution_confidence": 0.94,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    }
+  ],
+  "projects": [
+    {"name": "project-atlas", "evidence_segment_ids": ["s001", "s002", "s010"]},
+    {"name": "project-borealis", "evidence_segment_ids": ["s004", "s005", "s011"]},
+    {"name": "project-cygnus", "evidence_segment_ids": ["s006", "s007", "s013"]}
+  ],
+  "decisions": [
+    {"text": "The Atlas go/no-go call moves to Friday morning.", "evidence_segment_ids": ["s010"]},
+    {"text": "The Borealis migration takes the Thursday night downtime window.", "evidence_segment_ids": ["s004", "s005"]},
+    {"text": "Cygnus stays on its current sprint plan until after launch.", "evidence_segment_ids": ["s006", "s007"]}
+  ],
+  "action_items": [
+    {
+      "text": "Write the Borealis migration runbook and circulate it.",
+      "owner": {"person_id": "ou_dana", "display_name": "Dana Whitfield", "explicitly_stated": true},
+      "due_date": {"date": "2026-09-03", "explicitly_stated": true},
+      "evidence_segment_ids": ["s011"]
+    },
+    {
+      "text": "Land the two open Atlas packaging items.",
+      "owner": {"person_id": "ou_ben", "display_name": "Ben Ortiz", "explicitly_stated": true},
+      "due_date": null,
+      "evidence_segment_ids": ["s002", "s012"]
+    },
+    {
+      "text": "Review the open Cygnus interface note.",
+      "owner": null,
+      "due_date": null,
+      "evidence_segment_ids": ["s013"]
+    }
+  ],
+  "discussion_points": [
+    {"text": "The staging soak has been green for six days.", "evidence_segment_ids": ["s003"]},
+    {"text": "The rollback path covers the schema change for one hour after cutover.", "evidence_segment_ids": ["s008", "s009"]},
+    {"text": "Read replicas absorb traffic during the migration window.", "evidence_segment_ids": ["s005"]}
+  ],
+  "person_summaries": [
+    {"person_id": "ou_ada", "display_name": "Ada Chen", "text": "Ran the launch checklist and moved the go/no-go call to Friday."},
+    {"person_id": "ou_ben", "display_name": "Ben Ortiz", "text": "Reported two open Atlas packaging items landing tomorrow."},
+    {"person_id": "ou_chi", "display_name": "Chidi Okafor", "text": "Confirmed six green days of staging soak on the current build."},
+    {"person_id": "ou_dana", "display_name": "Dana Whitfield", "text": "Raised the Borealis migration blocker and took the runbook."},
+    {"person_id": "ou_eli", "display_name": "Eli Novak", "text": "Offered the Thursday night downtime window."},
+    {"person_id": "ou_fen", "display_name": "Fen Zhao", "text": "Kept Cygnus out of the launch scope and flagged the interface note."},
+    {"person_id": "ou_gus", "display_name": "Gus Petrov", "text": "Agreed to revisit Cygnus after launch."}
+  ],
+  "recording_gaps": [
+    {"started_at": "2026-09-02T14:01:50Z", "ended_at": "2026-09-02T14:02:00Z", "reason": "bridge_reconnect"},
+    {"started_at": "2026-09-02T14:04:00Z", "ended_at": "2026-09-02T14:04:10Z", "reason": "bridge_reconnect"}
+  ],
+  "processing_warnings": [
+    {"code": "overlapping_speech_ambiguous", "detail": "One segment kept an ambiguous speaker because two people spoke at once."},
+    {"code": "active_speaker_signal_missing", "detail": "The client exposed no active-speaker name for one cluster."}
+  ],
+  "provenance": {
+    "runtime_profile": "online",
+    "stt_provider": "openai",
+    "stt_model": "stt-batch-preview",
+    "text_provider": "openai",
+    "text_model": "text-structured-preview",
+    "agent_version": "meeting-agent/0.1.0",
+    "processed_at": "2026-09-02T15:10:22Z"
+  },
+  "audio": {
+    "filename": "audio.enc",
+    "format": "opus",
+    "encryption": "age-x25519",
+    "duration_seconds": 3120.0,
+    "bytes": 2048,
+    "sha256": "sha256:10fc3c51a152e90e5b90319b601d92ccf37290ef53c35ff92507687d8a911a08",
+    "expires_at": "2026-10-02T14:52:00Z"
+  }
+}
