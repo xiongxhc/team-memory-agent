@@ -10,7 +10,7 @@ from pathlib import Path
 
 # Source vaults may use capitalized (Architecture.md) or lowercase names; try
 # capitalized first, fall back to lowercase. Destinations are always lowercase —
-# vault project notes link ../Docs/<slug>/architecture.md and Git web UIs are
+# vault project indexes link ../../Docs/<slug>/architecture.md and Git web UIs are
 # case-sensitive.
 DOC_FILES = ("Architecture.md", "Summary.md")
 

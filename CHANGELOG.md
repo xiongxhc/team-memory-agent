@@ -8,6 +8,10 @@ Notable changes to Team Memory Agent and MemberKit are documented here.
 
 #### Added
 
+- Project vault views now use `Projects/<project>/README.md` landing pages and
+  one `Week <label>.md` file for every event-bearing ledger week. The generated
+  `Projects/README.md` ranks current-week projects by activity and links older
+  project history.
 - GitLab collection turns each human, non-system note on an in-window merge
   request or issue into a `comment` event attributed to its author (summary
   capped at 120 characters; full body kept in the local ledger only). Comments
@@ -30,6 +34,14 @@ Notable changes to Team Memory Agent and MemberKit are documented here.
 
 #### Changed
 
+- Project landing pages show a compact latest-week contributor rollup and
+  evidence cutoff; detailed, project-filtered artifacts live in weekly files.
+  Person-wide daily summaries are no longer reused on project pages because
+  they can contain unrelated projects. Generated project paths change from
+  `Projects/<project>.md` to `Projects/<project>/README.md`; external links and
+  bookmarks must be updated. Evidence cutoffs disclose timestamp precision,
+  future-dated weeks are flagged, and generated project folder names are safe
+  across supported operating systems. No database migration is required.
 - Journal synthesis defaults to two concurrent LLM calls (configurable from one
   through eight) without ranking, capping, truncating, batching, retrying, or
   compacting evidence.

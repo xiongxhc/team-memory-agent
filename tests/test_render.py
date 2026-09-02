@@ -1,4 +1,5 @@
 import json
+import subprocess
 from datetime import date
 from pathlib import Path
 
@@ -40,7 +41,11 @@ def test_render_writes_expected_tree(tmp_path):
     assert (vault / "Person" / "Alex Rivera" / "Week 2026-07-13-17.md").exists()
     assert (vault / "Person" / "Sam Lee" / "README.md").exists()
     assert not (vault / "Person" / "_unmapped").exists()          # no unmapped person pages
-    assert (vault / "Projects" / "project-alpha.md").exists()
+    assert (vault / "Projects" / "README.md").exists()
+    assert (vault / "Projects" / "project-alpha" / "README.md").exists()
+    assert (vault / "Projects" / "project-alpha" /
+            "Week 2026-07-13-17.md").exists()
+    assert not (vault / "Projects" / "project-alpha.md").exists()
     assert (vault / "Work Journal" / "Week 2026-07-13-17.md").exists()
     assert (vault / "README.md").exists()
 
@@ -55,6 +60,7 @@ def test_week_report_content(tmp_path):
     assert "(https://x/a1)" in report                             # every line carries a ref
     assert "[Sam Lee](../Person/Sam%20Lee/README.md)" in report and "no activity this week" in report  # gap flag
     assert "_unmapped/x@y.z" in report                            # unmapped surfaces
+    assert "[project-alpha](../Projects/project-alpha/README.md)" in report
 
 
 def test_person_page_content(tmp_path):
@@ -399,11 +405,11 @@ def test_weekly_appendix_message_only_person_gets_day_headlines(tmp_path):
     headline = "- 2026-07-14 — **Portal** — **nav redesign review**\n"
     sam = page[page.index("### [Sam Lee]"):]
     assert headline in sam                                       # message-only: day headline
-    assert sam.index(headline) < sam.index("💬 1 messages")     # above the count line
+    assert sam.index(headline) < sam.index("💬 1 message")      # above the count line
     assert "Alex fixed the JWT refresh race" not in page        # has work lines: no headline
 
 
-def test_project_page_message_only_person_gets_day_headlines(tmp_path):
+def test_project_week_does_not_reuse_cross_project_daily_summary(tmp_path):
     import json as _json
     conn = _seed(tmp_path)
     insert_events(conn, [Event(
@@ -414,12 +420,15 @@ def test_project_page_message_only_person_gets_day_headlines(tmp_path):
         "INSERT INTO summaries (kind, key, input_hash, text, model, created_ts)"
         " VALUES (?, ?, ?, ?, ?, ?)",
         ("daily-person", "sam|2026-07-14", "h",
-         "- Coordinated portal nav rollout with QA.", "fake", "t"))
+         "- **project-alpha** — Coordinated its rollout with QA.", "fake", "t"))
     conn.commit()
     vault = tmp_path / "vault"
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
-    page = (vault / "Projects" / "project-beta.md").read_text()
-    assert "- 2026-07-14 — Coordinated portal nav rollout with QA.\n" in page
+    page = (vault / "Projects" / "project-beta" /
+            "Week 2026-07-13-17.md").read_text()
+    assert "project-alpha" not in page
+    assert "💬 1 message across 1 channel" in page
+    assert "### [Sam Lee](../../Person/Sam%20Lee/README.md) — 1 event (1 message)" in page
 
 
 def test_project_page_links_docs_when_present(tmp_path):
@@ -429,9 +438,9 @@ def test_project_page_links_docs_when_present(tmp_path):
     docs.mkdir(parents=True)
     (docs / "architecture.md").write_text("# arch")
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
-    page = (vault / "Projects" / "project-alpha.md").read_text()
-    assert "[Architecture](../Docs/project-alpha/architecture.md)" in page
-    assert "](../Docs/project-alpha/summary.md)" not in page          # only existing files
+    page = (vault / "Projects" / "project-alpha" / "README.md").read_text()
+    assert "[Architecture](../../Docs/project-alpha/architecture.md)" in page
+    assert "](../../Docs/project-alpha/summary.md)" not in page       # only existing files
     assert (docs / "architecture.md").exists()                     # Docs/ survives render
 
 
@@ -446,7 +455,7 @@ def test_message_line_names_channels_when_cache_present(tmp_path):
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY,
                  channel_names={"oc_pm": "PM. Share"})
     page = (vault / "Person" / "Alex Rivera" / "README.md").read_text()
-    assert "💬 1 messages across 1 channels (PM. Share)" in page
+    assert "💬 1 message across 1 channel (PM. Share)" in page
 
 
 def test_github_pull_requests_render_as_work_items(tmp_path):
@@ -489,7 +498,8 @@ def test_gitlab_issues_and_repos_render_as_work_items(tmp_path):
     person = (vault / "Person" / "Alex Rivera" / "README.md").read_text()
     assert "[closed] Login rate limit" in person
     assert "[created] team/project-alpha" in person
-    project = (vault / "Projects" / "project-alpha.md").read_text()
+    project = (vault / "Projects" / "project-alpha" /
+               "Week 2026-07-13-17.md").read_text()
     assert "[closed] Login rate limit" in project
 
 
@@ -544,6 +554,254 @@ def test_person_week_files_and_index(tmp_path):
     assert "fix: JWT refresh race" in week
 
 
+def test_project_week_files_and_index_make_history_navigable(tmp_path):
+    """A flat project page or an index without latest-week context breaks this."""
+    conn = _seed(tmp_path)
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    project = vault / "Projects" / "project-alpha"
+    readme = (project / "README.md").read_text()
+    assert "# project-alpha" in readme
+    assert "## [Week 2026-07-13-17](Week%202026-07-13-17.md)" in readme
+    assert "2 events · 1 contributor" in readme
+    assert "Evidence through 2026-07-15T09:00:00+04:00." in readme
+    assert "### Contributors" in readme
+    assert ("- [Alex Rivera](../../Person/Alex%20Rivera/README.md) — "
+            "2 events (1 commit, 1 MR)" in readme)
+    assert "fix: JWT refresh race" not in readme
+    assert "## Weeks" in readme
+    assert ("- [Week 2026-07-13-17](Week%202026-07-13-17.md) — "
+            "2 events, 1 contributor" in readme)
+
+    week = (project / "Week 2026-07-13-17.md").read_text()
+    assert "# project-alpha — Week 2026-07-13-17" in week
+    assert "[project-alpha](README.md)" in week
+    assert ("[Week 2026-07-13-17 — Team]"
+            "(../../Work%20Journal/Week%202026-07-13-17.md)" in week)
+    assert "2 events · 1 contributor" in week
+    assert "evidence_through: 2026-07-15T09:00:00+04:00" in week
+    assert "### [Alex Rivera](../../Person/Alex%20Rivera/README.md)" in week
+    assert "2 events (1 commit, 1 MR)" in week
+    assert "fix: JWT refresh race" in week
+
+
+def test_projects_index_separates_current_from_earlier_activity(tmp_path):
+    """An alphabetical file listing does not answer what is active now."""
+    conn = _seed(tmp_path)
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    page = (vault / "Projects" / "README.md").read_text()
+    assert "# Projects" in page
+    assert "Evidence through 2026-07-15T09:00:00+04:00." in page
+    assert "## Week 2026-07-13-17" in page
+    assert "[project-alpha](project-alpha/README.md)" in page
+    assert "2 events" in page and "1 contributor" in page
+    assert "prev " not in page and "▲" not in page and "▼" not in page
+    assert "## Earlier activity" in page
+    assert "[project-beta](project-beta/README.md)" in page
+    assert "[Week 2026-06-29-03](project-beta/Week%202026-06-29-03.md)" in page
+
+
+def test_project_history_renders_beyond_window(tmp_path):
+    """Managed regeneration must not discard project weeks outside the window."""
+    conn = _seed(tmp_path)
+    insert_events(conn, [Event(
+        person="alex", ts="2026-05-05T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="ancient project work", hash="project-old1",
+        project="project-archive", refs='{"url": "https://x/project-old1"}')])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    old_week = (vault / "Projects" / "project-archive" /
+                "Week 2026-05-04-08.md")
+    assert old_week.exists() and "ancient project work" in old_week.read_text()
+    assert "Work%20Journal" not in old_week.read_text()
+    readme = (vault / "Projects" / "project-archive" / "README.md").read_text()
+    assert "[Week 2026-05-04-08](Week%202026-05-04-08.md)" in readme
+    projects = (vault / "Projects" / "README.md").read_text()
+    assert ("[project-archive](project-archive/README.md) — latest "
+            "[Week 2026-05-04-08]" in projects)
+
+
+def test_projects_index_explains_when_there_is_no_mapped_activity(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="_unmapped/x@y.z", ts="2026-07-14T09:00:00+04:00",
+        source="gitlab", kind="commit", summary="unassigned", hash="u1")])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    page = (vault / "Projects" / "README.md").read_text()
+    assert "- No mapped project activity." in page
+    assert not any(p.is_dir() for p in (vault / "Projects").iterdir())
+
+
+@pytest.mark.parametrize("project", ["README.md", "README.md."])
+def test_project_name_cannot_collide_with_projects_index(tmp_path, project):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="reserved project", hash="reserved-project",
+        project=project)])
+
+    vault = tmp_path / "vault"
+    before = _managed_vault_bytes(vault)
+    with pytest.raises(ValueError, match="filename collision"):
+        render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    assert {relative: (vault / relative).read_bytes()
+            for relative in before} == before
+
+
+def test_project_folder_name_collision_raises(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+              kind="commit", summary="one", hash="project-slash", project="a/b"),
+        Event(person="alex", ts="2026-07-14T10:00:00+04:00", source="gitlab",
+              kind="commit", summary="two", hash="project-dash", project="a-b"),
+    ])
+
+    with pytest.raises(ValueError, match="filename collision"):
+        render_vault(conn, IdentityMaps.load(CONFIG_DIR), tmp_path / "vault", TODAY)
+
+
+def test_project_backslash_is_sanitized_as_a_path_separator(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="portable path", hash="project-backslash",
+        project="a\\b")])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    assert (vault / "Projects" / "a-b" / "README.md").exists()
+    assert not (vault / "Projects" / "a\\b").exists()
+
+
+def test_project_evidence_cutoff_compares_mixed_offsets_as_instants(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T23:30:00+04:00", source="gitlab",
+              kind="commit", summary="earlier instant", hash="offset-earlier",
+              project="project-alpha"),
+        Event(person="alex", ts="2026-07-14T20:00:00Z", source="gitlab",
+              kind="commit", summary="later instant", hash="offset-later",
+              project="project-alpha"),
+    ])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    readme = (vault / "Projects" / "project-alpha" / "README.md").read_text()
+    assert "Evidence through 2026-07-14T20:00:00Z." in readme
+
+
+def test_project_date_precision_cutoff_is_visible(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T20:00:00", source="gitlab",
+        kind="commit", summary="offset unknown", hash="offset-unknown",
+        project="project-alpha")])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    project = vault / "Projects" / "project-alpha"
+    readme = (project / "README.md").read_text()
+    week = (project / "Week 2026-07-13-17.md").read_text()
+    notice = "Evidence through 2026-07-14 (date precision; source offset unavailable)."
+    assert notice in readme and notice in week
+    assert "evidence_through: 2026-07-14" in week
+    assert "cutoff_precision: date" in week
+
+
+def test_future_project_week_is_rendered_and_flagged(tmp_path):
+    conn = _seed(tmp_path)
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-21T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="clock-skewed work", hash="future-project",
+        project="project-future")])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    week = (vault / "Projects" / "project-future" /
+            "Week 2026-07-20-24.md")
+    assert week.exists() and "clock-skewed work" in week.read_text()
+    projects = (vault / "Projects" / "README.md").read_text()
+    assert "## Future-dated activity" in projects
+    assert "[project-future](project-future/README.md)" in projects
+    assert "Check source timestamps" in projects
+
+
+def test_future_only_contributor_does_not_get_a_dead_person_link(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-21T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="future-only work", hash="future-only-person",
+        project="project-future")])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    readme = (vault / "Projects" / "project-future" / "README.md").read_text()
+    week = (vault / "Projects" / "project-future" /
+            "Week 2026-07-20-24.md").read_text()
+    assert "Alex Rivera" in readme and "Alex Rivera" in week
+    assert "../../Person/Alex%20Rivera/README.md" not in readme
+    assert "../../Person/Alex%20Rivera/README.md" not in week
+    assert not (vault / "Person" / "Alex Rivera").exists()
+
+
+@pytest.mark.parametrize(
+    ("project", "folder"),
+    [("CON", "_CON"), ("a:b", "a-b")],
+)
+def test_project_folder_names_are_windows_portable(tmp_path, project, folder):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="portable path", hash=f"portable-{project}",
+        project=project)])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    assert (vault / "Projects" / folder / "README.md").exists()
+
+
+def test_dot_git_project_uses_a_publishable_folder(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="visible in git", hash="dot-git-project",
+        project=".git")])
+    vault = tmp_path / "vault"
+    subprocess.run(["git", "init", "-q", str(vault)], check=True)
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    assert (vault / "Projects" / "_git" / "README.md").exists()
+    status = subprocess.run(
+        ["git", "-C", str(vault), "status", "--short", "--untracked-files=all"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert "Projects/_git/README.md" in status
+
+
+def test_project_unicode_normalization_collision_raises_before_cleanup(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+              kind="commit", summary="one", hash="unicode-one", project="café"),
+        Event(person="alex", ts="2026-07-14T10:00:00+04:00", source="gitlab",
+              kind="commit", summary="two", hash="unicode-two", project="café"),
+    ])
+    vault = tmp_path / "vault"
+    before = _managed_vault_bytes(vault)
+
+    with pytest.raises(ValueError, match="filename collision"):
+        render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    assert {relative: (vault / relative).read_bytes()
+            for relative in before} == before
+
+
 def test_person_history_renders_beyond_window(tmp_path):
     """Week files older than the render window must survive the managed wipe."""
     conn = _seed(tmp_path)
@@ -585,16 +843,22 @@ def test_verify_vault_reports_drift_ignores_unmanaged(tmp_path):
     ids = IdentityMaps.load(CONFIG_DIR)
     vault = tmp_path / "vault"
     render_vault(conn, ids, vault, TODAY)
-    (vault / "Projects" / "project-alpha.md").write_text("tampered")
+    (vault / "Projects" / "project-alpha" / "README.md").write_text("tampered")
+    (vault / "Projects" / "project-alpha" / "Week 2026-07-13-17.md").unlink()
+    (vault / "Projects" / "legacy.md").write_text("stale flat project")
     (vault / "Person" / "Sam Lee" / "README.md").unlink()
     (vault / "Work Journal" / "extra.md").write_text("x")
     (vault / "Docs").mkdir()
     (vault / "Docs" / "note.md").write_text("unmanaged, must be ignored")
     out = verify_vault(conn, ids, vault, TODAY)
-    assert out["differing"] == ["Projects/project-alpha.md"]
-    assert out["missing"] == ["Person/Sam Lee/README.md"]
-    assert out["unexpected"] == ["Work Journal/extra.md"]
-    assert (vault / "Projects" / "project-alpha.md").read_text() == "tampered"  # read-only
+    assert out["differing"] == ["Projects/project-alpha/README.md"]
+    assert out["missing"] == [
+        "Person/Sam Lee/README.md",
+        "Projects/project-alpha/Week 2026-07-13-17.md",
+    ]
+    assert out["unexpected"] == ["Projects/legacy.md", "Work Journal/extra.md"]
+    assert (vault / "Projects" / "project-alpha" /
+            "README.md").read_text() == "tampered"  # read-only
 
 
 def test_comment_events_render_as_work(tmp_path):

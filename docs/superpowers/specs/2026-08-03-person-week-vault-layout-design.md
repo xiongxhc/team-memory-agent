@@ -1,5 +1,10 @@
 # Person Week-File Vault Layout — Design
 
+> Historical scope note: the statement below that Projects remain windowed was
+> superseded by the later generated project-folder layout documented in the
+> Unreleased changelog. Projects now mirror the durable folder/week shape while
+> keeping their README content compact and project-scoped.
+
 ## Problem
 
 A Person page is one file holding every rendered week, and its Activity detail
