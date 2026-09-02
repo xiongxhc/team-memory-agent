@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .events import Event
 from .identity import IdentityMaps
+from .meeting_store import migrate_meetings
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -82,6 +83,7 @@ def open_db(path: Path) -> sqlite3.Connection:
         raise
     else:
         conn.commit()
+    migrate_meetings(conn)
     return conn
 
 
