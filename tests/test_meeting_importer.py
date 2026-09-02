@@ -723,3 +723,78 @@ def test_plaintext_audio_container_is_quarantined(tmp_path):
     assert _outcomes(result) == [("quarantined", "audio_plaintext")]
     assert list_meetings(conn) == []
     assert not tree.audio.exists()
+
+
+def test_a_failed_archive_still_reports_the_committed_import_and_the_scan_continues(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    first = _payload(COMPLETE)
+    second = _payload(MINIMAL, day="2026-09-06")
+    write_meeting_bundle(tree.inbox, first)
+    write_meeting_bundle(tree.inbox, second)
+
+    from teammem import meeting_importer
+
+    real_archive = meeting_importer._archive_bundle
+
+    def failing_archive(bundle, archive):
+        if bundle.occurrence_id == first["occurrence_id"]:
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_archive(bundle, archive)
+
+    monkeypatch.setattr(meeting_importer, "_archive_bundle", failing_archive)
+
+    result = _run(conn, tree)
+
+    # the minimal fixture's occurrence segment sorts first, so it is the "ok" one
+    assert _outcomes(result) == [("accepted", "ok"), ("accepted", "archive_failed")]
+    assert result.accepted == 2                                    # both imports did happen
+    assert get_meeting(conn, first["occurrence_id"])["revision"] == first["revision"]
+    assert get_meeting(conn, second["occurrence_id"]) is not None   # the scan carried on
+    first_archive = tree.archive / occurrence_path_segment(first["occurrence_id"])
+    assert not first_archive.exists()
+    assert (tree.archive / occurrence_path_segment(second["occurrence_id"])
+            / str(second["revision"]) / "meeting.json").is_file()
+    assert not tree.quarantine.exists()               # a stored revision is never quarantined
+
+    monkeypatch.undo()
+    rescan = _run(conn, tree)                                      # the rescan self-heals
+
+    assert _outcomes(rescan) == [("unchanged", "ok")]
+    assert (first_archive / str(first["revision"]) / "meeting.json").is_file()
+    assert (first_archive / str(first["revision"]) / "manifest.json").is_file()
+    assert [r["revision"] for r in list_meeting_revisions(conn, first["occurrence_id"])] == [
+        first["revision"]
+    ]
+    assert not (tree.inbox / occurrence_path_segment(first["occurrence_id"])).exists()
+
+
+def test_audio_swapped_for_a_symlink_after_validation_is_not_copied_through(tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    directory = write_meeting_bundle(tree.inbox, payload)
+    secret = tmp_path / "outside.bin"
+    secret.write_bytes(b"\x11" * payload["audio"]["bytes"])
+
+    from teammem import meeting_importer
+
+    real_load = meeting_importer.load_meeting_bundle
+
+    def load_then_swap(path, inbox):
+        bundle = real_load(path, inbox)                            # validation sees a real file
+        bundle.audio_path.unlink()                                 # ...and then it is swapped
+        bundle.audio_path.symlink_to(secret)
+        return bundle
+
+    monkeypatch.setattr(meeting_importer, "load_meeting_bundle", load_then_swap)
+
+    with pytest.raises(OSError):
+        _run(conn, tree)
+
+    assert list_meetings(conn) == []
+    assert _files(tree.audio) == []                                # nothing was copied through
+    assert secret.read_bytes() == b"\x11" * payload["audio"]["bytes"]
+    assert (directory / "audio.enc").is_symlink()                  # the plant was left as found

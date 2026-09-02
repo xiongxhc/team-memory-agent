@@ -68,6 +68,10 @@ log = logging.getLogger(__name__)
 
 _COPY_CHUNK = 1024 * 1024
 
+# Windows defines no O_NOFOLLOW; 0 there leaves the copy exactly as it was
+# rather than dropping the protection everywhere else.
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
 OUTCOMES = ("accepted", "unchanged", "activated", "quarantined")
 
 REASON_CODES = (
@@ -83,6 +87,7 @@ REASON_CODES = (
     "revision_conflict",        # this revision is stored with a different artifact hash
     "revision_superseded",      # a newer revision of this occurrence is already current
     "store_rejected",           # the store refused the write for any other reason
+    "archive_failed",           # the revision is stored, but its source copy was not filed
 )
 
 
@@ -197,15 +202,27 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _copy_file(source: Path, destination: Path) -> None:
-    """Copy opaque bytes into a new file and fsync it. Never follows a symlink."""
-    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    """Copy opaque bytes into a new file and fsync it.
+
+    The source is opened `O_NOFOLLOW`. `load_meeting_bundle` already refused a
+    symlinked `audio.enc`, but that check ran in an earlier pass over the same
+    directory: without this flag, swapping the file for a symlink in between
+    would make this copy read through it. `O_NOFOLLOW` closes that window on
+    every platform that defines it, so the refusal happens at the moment of the
+    copy rather than resting on a stale check.
+    """
+    source_fd = os.open(source, os.O_RDONLY | _NOFOLLOW)
     try:
-        with open(source, "rb") as handle:
-            while chunk := handle.read(_COPY_CHUNK):
-                _write_all(fd, chunk)
-        os.fsync(fd)
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(source_fd, "rb", closefd=False) as handle:
+                while chunk := handle.read(_COPY_CHUNK):
+                    _write_all(fd, chunk)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(source_fd)
 
 
 def _digest_file(path: Path) -> tuple[str, int]:
@@ -543,7 +560,17 @@ def import_meeting_inbox(
             outcome = "accepted"
         else:
             outcome = "activated"
-        _archive_bundle(bundle, archive)
+        try:
+            _archive_bundle(bundle, archive)
+        except OSError:
+            # The revision is committed. Failing to file the source copy does
+            # not undo that, so report the outcome the store actually produced
+            # with a code saying the archive is incomplete, and carry on with
+            # the rest of the scan. Both halves of archiving are idempotent —
+            # the atomic writes overwrite, and a re-delivered bundle replays
+            # through the store's `unchanged` path — so a rescan self-heals.
+            record(bundle.occurrence_id, outcome, "archive_failed", candidate.label)
+            continue
         record(bundle.occurrence_id, outcome, "ok", candidate.label)
 
     return MeetingImportResult(
