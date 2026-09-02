@@ -2,11 +2,14 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from unicodedata import category
+from urllib.parse import urlsplit
 
 import yaml
 
 
 CONNECTOR_NAMES = ("github", "gitlab", "slack", "feishu", "discord")
+Origin = tuple[str, str, int]
 
 
 @dataclass(frozen=True)
@@ -14,6 +17,49 @@ class ConnectorSettings:
     name: str
     enabled: bool
     options: dict
+
+
+def normalize_http_origin(
+    url: str,
+    *,
+    origin_only: bool = False,
+) -> Origin | None:
+    """Return a comparison key for an HTTP URL, or None when malformed."""
+    if (
+        not isinstance(url, str)
+        or not url
+        or "?" in url
+        or "#" in url
+        or any(
+            char.isspace() or category(char) == "Cc"
+            for char in url
+        )
+    ):
+        return None
+    try:
+        parsed = urlsplit(url)
+        if parsed.netloc.endswith(":"):
+            return None
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    scheme = parsed.scheme.lower()
+    if (
+        scheme not in {"http", "https"}
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    if origin_only and (
+        parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+    ):
+        return None
+    effective_port = (
+        port if port is not None else {"http": 80, "https": 443}[scheme]
+    )
+    return scheme, hostname.lower(), effective_port
 
 
 def _read(path: Path) -> dict:
@@ -52,6 +98,13 @@ def load_connector_settings(config_dir: Path) -> dict[str, ConnectorSettings]:
         if not isinstance(enabled, bool):
             raise ValueError(f"connector enabled flag for {name} must be a boolean")
         options = {key: value for key, value in raw.items() if key != "enabled"}
+        if name == "github" and "count_weeks" in options:
+            count_weeks = options["count_weeks"]
+            if type(count_weeks) is not int or not 1 <= count_weeks <= 52:
+                raise ValueError(
+                    "connector option count_weeks for github must be an integer "
+                    "from 1 to 52"
+                )
         if name == "gitlab":
             collect_mr_commits = options.setdefault("collect_mr_commits", True)
             if not isinstance(collect_mr_commits, bool):
@@ -64,6 +117,21 @@ def load_connector_settings(config_dir: Path) -> dict[str, ConnectorSettings]:
                 raise ValueError(
                     "connector option exclude_note_authors for gitlab must be "
                     "a list of strings"
+                )
+            reclaim_origins = options.setdefault("reclaim_origins", [])
+            if (not isinstance(reclaim_origins, list)
+                    or any(not isinstance(url, str) for url in reclaim_origins)):
+                raise ValueError(
+                    "connector option reclaim_origins for gitlab must be "
+                    "a list of strings"
+                )
+            if any(
+                normalize_http_origin(url, origin_only=True) is None
+                for url in reclaim_origins
+            ):
+                raise ValueError(
+                    "connector option reclaim_origins for gitlab contains an "
+                    "invalid origin"
                 )
         settings[name] = ConnectorSettings(
             name=name,

@@ -272,6 +272,8 @@ file.
 The complete provider table, current official permission links, and all runtime
 paths are in the
 [deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/deployment.md).
+Project and Area classification, count-only collection, and historical GitLab
+origin allowlisting are covered in the [operator guide](docs/operator-guide.md).
 
 ### 3. Check locally, then run once
 

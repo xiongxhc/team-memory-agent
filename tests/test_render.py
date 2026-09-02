@@ -7,8 +7,15 @@ import pytest
 
 from teammem.events import Event
 from teammem.identity import IdentityMaps
+from teammem.metrics import CommitCountScope, WeeklyCommitCount
 from teammem.render import render_vault, verify_vault
-from teammem.store import SummaryRecord, insert_events, open_db, put_summary
+from teammem.store import (
+    SummaryRecord,
+    insert_events,
+    open_db,
+    put_summary,
+    replace_weekly_commit_counts,
+)
 
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
 TODAY = date(2026, 7, 16)
@@ -297,6 +304,7 @@ def _managed_vault_bytes(vault: Path) -> dict[str, bytes]:
     contents = {
         "Person/existing.md": b"person before render\n",
         "Projects/existing.md": b"project before render\n",
+        "Areas/existing.md": b"area before render\n",
         "Work Journal/existing.md": b"journal before render\n",
         "README.md": b"root before render\n",
     }
@@ -415,7 +423,7 @@ def test_project_week_does_not_reuse_cross_project_daily_summary(tmp_path):
     insert_events(conn, [Event(
         person="sam", ts="2026-07-14T11:00:00+04:00", source="feishu-channel",
         kind="message", summary="nav feedback", hash="m1",
-        project="project-beta", refs=_json.dumps({"chat_id": "oc_up"}))])
+        project="project-gamma", refs=_json.dumps({"chat_id": "oc_up"}))])
     conn.execute(
         "INSERT INTO summaries (kind, key, input_hash, text, model, created_ts)"
         " VALUES (?, ?, ?, ?, ?, ?)",
@@ -424,7 +432,7 @@ def test_project_week_does_not_reuse_cross_project_daily_summary(tmp_path):
     conn.commit()
     vault = tmp_path / "vault"
     render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
-    page = (vault / "Projects" / "project-beta" /
+    page = (vault / "Projects" / "project-gamma" /
             "Week 2026-07-13-17.md").read_text()
     assert "project-alpha" not in page
     assert "💬 1 message across 1 channel" in page
@@ -586,6 +594,279 @@ def test_project_week_files_and_index_make_history_navigable(tmp_path):
     assert "fix: JWT refresh race" in week
 
 
+def test_render_classifies_projects_areas_hidden_and_count_only_activity(tmp_path):
+    """Routing every label to Projects or rendering count-only events breaks this."""
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+              kind="commit", summary="full project detail", hash="full-1",
+              project="full"),
+        Event(person="sam", ts="2026-07-14T10:00:00+04:00", source="memberkit",
+              kind="journal-highlight", summary="area coordination detail",
+              hash="area-1", project="coordination"),
+        Event(person="alex", ts="2026-07-14T11:00:00+04:00", source="memberkit",
+              kind="journal-highlight", summary="private MemberKit summary",
+              hash="counts-1", project="counts"),
+        Event(person="sam", ts="2026-07-14T12:00:00+04:00", source="memberkit",
+              kind="journal-highlight", summary="hidden detail", hash="hidden-1",
+              project="IdeaProjects"),
+        Event(person="sam", ts="2026-07-14T12:30:00+04:00", source="memberkit",
+              kind="journal-highlight", summary="escaped hidden detail",
+              hash="hidden-escaped-1", project="hidden [label]"),
+        Event(person="alex", ts="2026-07-14T13:00:00+04:00", source="gitlab",
+              kind="commit", summary="legacy project detail", hash="legacy-1",
+              project="local-agent-team"),
+    ])
+    replace_weekly_commit_counts(
+        conn,
+        (CommitCountScope("counts", "2026-07-13"),),
+        (
+            WeeklyCommitCount("counts", "2026-07-13", "alex", 2),
+            WeeklyCommitCount("counts", "2026-07-13", "sam", 1),
+        ),
+    )
+    ids = IdentityMaps(
+        {"members": {
+            "alex": {"name": "Alex Rivera"},
+            "sam": {"name": "Sam Lee"},
+        }},
+        {
+            "projects": {
+                "full": {"projection": "full"},
+                "counts": {"projection": "count-only"},
+            },
+            "areas": {"coordination": {}},
+            "hidden_projects": ["IdeaProjects", "hidden [label]"],
+        },
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, ids, vault, TODAY)
+
+    assert (vault / "Projects" / "full" / "README.md").exists()
+    assert (vault / "Areas" / "coordination" / "README.md").exists()
+    assert (vault / "Areas" / "coordination" /
+            "Week 2026-07-13-17.md").exists()
+    assert not (vault / "Projects" / "coordination").exists()
+    assert not (vault / "Projects" / "IdeaProjects").exists()
+    assert not (vault / "Areas" / "IdeaProjects").exists()
+
+    count_dir = vault / "Projects" / "counts"
+    count_page = (count_dir / "Week 2026-07-13-17.md").read_text()
+    assert "| Alex Rivera | 2 |" in count_page
+    assert "| Sam Lee | 1 |" in count_page
+    assert "3 commits · 2 contributors" in count_page
+    assert "private MemberKit summary" not in count_page
+    assert "private MemberKit summary" not in (count_dir / "README.md").read_text()
+    projects_index = (vault / "Projects" / "README.md").read_text()
+    assert "[counts](counts/README.md) — 3 commits · 2 contributors" in projects_index
+    assert "private MemberKit summary" not in projects_index
+
+    person = (vault / "Person" / "Alex Rivera" /
+              "Week 2026-07-13-17.md").read_text()
+    journal = (vault / "Work Journal" /
+               "Week 2026-07-13-17.md").read_text()
+    assert "private MemberKit summary" in person
+    assert "private MemberKit summary" in journal
+    assert "[coordination](../Areas/coordination/README.md)" in journal
+    assert "[IdeaProjects]" not in journal
+    assert "- IdeaProjects —" in journal
+    assert r"hidden \[label\]" in journal
+    assert (vault / "Projects" / "local-agent-team" / "README.md").exists()
+    assert "[local-agent-team](../Projects/local-agent-team/README.md)" in journal
+
+    area_readme = vault / "Areas" / "coordination" / "README.md"
+    area_readme.write_text("tampered")
+    assert verify_vault(conn, ids, vault, TODAY)["differing"] == [
+        "Areas/coordination/README.md"
+    ]
+
+
+def test_render_includes_empty_configured_registry_entries(tmp_path):
+    """Waiting for first evidence must not make configured work invisible."""
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="configured project activity", hash="active-1",
+        project="active",
+    )])
+    ids = IdentityMaps(
+        {"members": {"alex": {"name": "Alex Rivera"}}},
+        {
+            "projects": {
+                "coc": {},
+                "dev-agent": {"projection": "full"},
+                "active": {},
+                "github-counts": {"projection": "count-only"},
+                "gitlab-counts": {"projection": "count-only"},
+            },
+            "areas": {"team-operations": {}},
+            "hidden_projects": ["secret"],
+        },
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, ids, vault, TODAY)
+
+    assert (vault / "Projects" / "coc" / "README.md").read_text() == (
+        "---\nproject: coc\ngenerated: 2026-07-16\n---\n"
+        "# coc\n\nNo activity has been collected for this project.\n"
+    )
+    assert (vault / "Projects" / "dev-agent" / "README.md").read_text() == (
+        "---\nproject: dev-agent\ngenerated: 2026-07-16\n---\n"
+        "# dev-agent\n\nNo activity has been collected for this project.\n"
+    )
+    assert sorted(path.name for path in (vault / "Projects" / "coc").iterdir()) == [
+        "README.md"
+    ]
+    assert sorted(
+        path.name for path in (vault / "Projects" / "dev-agent").iterdir()
+    ) == ["README.md"]
+
+    area = vault / "Areas" / "team-operations"
+    assert (area / "README.md").read_text() == (
+        "---\narea: team-operations\ngenerated: 2026-07-16\n---\n"
+        "# team-operations\n\nNo activity has been collected for this area.\n"
+    )
+    assert sorted(path.name for path in area.iterdir()) == ["README.md"]
+
+    current_week = "Week 2026-07-13-17.md"
+    for project in ("github-counts", "gitlab-counts"):
+        project_dir = vault / "Projects" / project
+        assert sorted(path.name for path in project_dir.iterdir()) == [
+            "README.md",
+            current_week,
+        ]
+        assert "No commit count collected for this week." in (
+            project_dir / current_week
+        ).read_text()
+
+    assert (vault / "Projects" / "active" / current_week).exists()
+    assert not (vault / "Projects" / "secret").exists()
+    assert not (vault / "Areas" / "secret").exists()
+
+    projects_index = (vault / "Projects" / "README.md").read_text()
+    assert "## Week 2026-07-13-17" in projects_index
+    assert "## Configured, no collected activity" in projects_index
+    empty_projects = projects_index.split(
+        "## Configured, no collected activity", 1
+    )[1]
+    assert "- [coc](coc/README.md)" in empty_projects
+    assert "- [dev-agent](dev-agent/README.md)" in empty_projects
+    assert "- [github-counts](github-counts/README.md)" in empty_projects
+    assert "- [gitlab-counts](gitlab-counts/README.md)" in empty_projects
+    assert "[active](active/README.md)" not in empty_projects
+
+    areas_index = (vault / "Areas" / "README.md").read_text()
+    assert "## Configured, no collected activity" in areas_index
+    assert "- [team-operations](team-operations/README.md)" in areas_index
+
+
+def test_count_only_event_without_snapshot_renders_explicit_empty_state(tmp_path):
+    """Falling back to event detail when a count snapshot is absent breaks this."""
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T09:00:00+04:00", source="memberkit",
+        kind="journal-highlight", summary="private count-only evidence",
+        hash="count-empty-1", project="counts",
+    )])
+    ids = IdentityMaps(
+        {"members": {"alex": {"name": "Alex Rivera"}}},
+        {"projects": {"counts": {"projection": "count-only"}}},
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, ids, vault, TODAY)
+
+    count_dir = vault / "Projects" / "counts"
+    week = (count_dir / "Week 2026-07-13-17.md").read_text()
+    readme = (count_dir / "README.md").read_text()
+    index = (vault / "Projects" / "README.md").read_text()
+    empty = "No commit count collected for this week."
+    assert empty in week and empty in readme and empty in index
+    assert "private count-only evidence" not in week
+    assert "private count-only evidence" not in readme
+    assert "private count-only evidence" not in index
+    assert "private count-only evidence" in (
+        vault / "Person" / "Alex Rivera" / "Week 2026-07-13-17.md"
+    ).read_text()
+
+
+def test_area_history_renders_beyond_work_journal_window(tmp_path):
+    """Regenerating Areas from only the active journal window would delete this week."""
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-05-05T09:00:00+04:00", source="memberkit",
+        kind="journal-highlight", summary="historic coordination",
+        hash="area-old-1", project="coordination",
+    )])
+    ids = IdentityMaps(
+        {"members": {"alex": {"name": "Alex Rivera"}}},
+        {"areas": {"coordination": {}}},
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, ids, vault, TODAY)
+
+    old_week = vault / "Areas" / "coordination" / "Week 2026-05-04-08.md"
+    assert old_week.exists() and "historic coordination" in old_week.read_text()
+    assert "Work%20Journal" not in old_week.read_text()
+    assert "[Week 2026-05-04-08](Week%202026-05-04-08.md)" in (
+        vault / "Areas" / "coordination" / "README.md"
+    ).read_text()
+    assert "[coordination](coordination/README.md)" in (
+        vault / "Areas" / "README.md"
+    ).read_text()
+
+
+def test_project_and_area_filename_collisions_are_independent(tmp_path):
+    """Using one collision namespace for Projects and Areas would reject valid paths."""
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+              kind="commit", summary="project", hash="independent-project",
+              project="a/b"),
+        Event(person="alex", ts="2026-07-14T10:00:00+04:00", source="memberkit",
+              kind="journal-highlight", summary="area", hash="independent-area",
+              project="a-b"),
+    ])
+    ids = IdentityMaps(
+        {"members": {"alex": {"name": "Alex Rivera"}}},
+        {"projects": {"a/b": {}}, "areas": {"a-b": {}}},
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, ids, vault, TODAY)
+
+    assert (vault / "Projects" / "a-b" / "README.md").exists()
+    assert (vault / "Areas" / "a-b" / "README.md").exists()
+
+
+def test_area_folder_name_collision_raises_before_managed_cleanup(tmp_path):
+    """Two Areas resolving to the same portable path must not overwrite each other."""
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [
+        Event(person="alex", ts="2026-07-14T09:00:00+04:00", source="memberkit",
+              kind="journal-highlight", summary="one", hash="area-slash",
+              project="a/b"),
+        Event(person="alex", ts="2026-07-14T10:00:00+04:00", source="memberkit",
+              kind="journal-highlight", summary="two", hash="area-dash",
+              project="a-b"),
+    ])
+    ids = IdentityMaps(
+        {"members": {"alex": {"name": "Alex Rivera"}}},
+        {"areas": {"a/b": {}, "a-b": {}}},
+    )
+    vault = tmp_path / "vault"
+    before = _managed_vault_bytes(vault)
+
+    with pytest.raises(ValueError, match="filename collision"):
+        render_vault(conn, ids, vault, TODAY)
+
+    assert {relative: (vault / relative).read_bytes()
+            for relative in before} == before
+
+
 def test_projects_index_separates_current_from_earlier_activity(tmp_path):
     """An alphabetical file listing does not answer what is active now."""
     conn = _seed(tmp_path)
@@ -625,7 +906,7 @@ def test_project_history_renders_beyond_window(tmp_path):
             "[Week 2026-05-04-08]" in projects)
 
 
-def test_projects_index_explains_when_there_is_no_mapped_activity(tmp_path):
+def test_projects_index_explains_no_activity_and_keeps_configured_folders(tmp_path):
     conn = open_db(tmp_path / "l.db")
     insert_events(conn, [Event(
         person="_unmapped/x@y.z", ts="2026-07-14T09:00:00+04:00",
@@ -635,7 +916,10 @@ def test_projects_index_explains_when_there_is_no_mapped_activity(tmp_path):
 
     page = (vault / "Projects" / "README.md").read_text()
     assert "- No mapped project activity." in page
-    assert not any(p.is_dir() for p in (vault / "Projects").iterdir())
+    assert {
+        path.name for path in (vault / "Projects").iterdir() if path.is_dir()
+    } == {"project-alpha", "project-beta"}
+    assert "## Configured, no collected activity" in page
 
 
 @pytest.mark.parametrize("project", ["README.md", "README.md."])

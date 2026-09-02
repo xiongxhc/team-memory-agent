@@ -6,7 +6,15 @@ import pytest
 
 from teammem.events import Event, event_hash
 from teammem.identity import IdentityMaps
-from teammem.store import insert_events, open_db, reconcile_gitlab_events, stats
+from teammem.metrics import CommitCountScope, WeeklyCommitCount
+from teammem.store import (
+    insert_events,
+    open_db,
+    reconcile_gitlab_events,
+    replace_weekly_commit_counts,
+    stats,
+    weekly_commit_counts,
+)
 
 
 PROVENANCE = {
@@ -179,6 +187,153 @@ def test_open_db_twice_is_safe(tmp_path):
     open_db(p).close()
     conn = open_db(p)                                  # migrate must be idempotent
     assert stats(conn)["total"] == 0
+
+
+def test_open_db_adds_aggregate_table_without_rewriting_legacy_rows(tmp_path):
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE events (
+          id INTEGER PRIMARY KEY,
+          person TEXT NOT NULL,
+          project TEXT,
+          ts TEXT NOT NULL,
+          source TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          refs TEXT,
+          raw TEXT,
+          hash TEXT NOT NULL,
+          UNIQUE(person, source, hash)
+        );
+        CREATE TABLE summaries (
+          id INTEGER PRIMARY KEY,
+          kind TEXT NOT NULL,
+          key TEXT NOT NULL,
+          input_hash TEXT NOT NULL,
+          text TEXT NOT NULL,
+          model TEXT NOT NULL,
+          created_ts TEXT NOT NULL,
+          UNIQUE(kind, key)
+        );
+        INSERT INTO events(person, project, ts, source, kind, summary, hash)
+        VALUES ('alex', 'project-alpha', '2026-08-31T10:00:00Z', 'gitlab',
+                'commit', 'legacy commit', 'legacy-sha');
+        INSERT INTO summaries(kind, key, input_hash, text, model, created_ts)
+        VALUES ('weekly-team', 'team|2026-08-31', 'input', 'legacy summary',
+                'model', '2026-09-01T10:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    upgraded = open_db(path)
+    assert upgraded.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+    assert upgraded.execute("SELECT COUNT(*) FROM summaries").fetchone()[0] == 1
+    assert upgraded.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'weekly_commit_counts'"
+    ).fetchone() == ("weekly_commit_counts",)
+    upgraded.close()
+
+
+def test_replace_weekly_commit_counts_is_transactional_and_idempotent(tmp_path):
+    conn = open_db(tmp_path / "ledger.db")
+    scopes = (CommitCountScope("team-memory-agent", "2026-08-31"),)
+    first = (
+        WeeklyCommitCount("team-memory-agent", "2026-08-31", "cx", 9),
+        WeeklyCommitCount("team-memory-agent", "2026-08-31", "sam", 3),
+    )
+
+    assert replace_weekly_commit_counts(conn, scopes, first) == 2
+    assert replace_weekly_commit_counts(conn, scopes, first) == 0
+    assert replace_weekly_commit_counts(conn, scopes, ()) == 2
+    assert weekly_commit_counts(conn, "team-memory-agent", "2026-08-31") == []
+
+
+def test_weekly_commit_counts_sort_by_count_then_person(tmp_path):
+    conn = open_db(tmp_path / "ledger.db")
+    scope = CommitCountScope("project-alpha", "2026-08-31")
+    counts = (
+        WeeklyCommitCount("project-alpha", "2026-08-31", "zoe", 4),
+        WeeklyCommitCount("project-alpha", "2026-08-31", "alex", 4),
+        WeeklyCommitCount("project-alpha", "2026-08-31", "sam", 9),
+    )
+    assert replace_weekly_commit_counts(conn, (scope,), counts) == 3
+    assert weekly_commit_counts(conn, "project-alpha", "2026-08-31") == [
+        counts[2], counts[1], counts[0]
+    ]
+
+
+def test_replace_weekly_commit_counts_counts_an_updated_row_once(tmp_path):
+    conn = open_db(tmp_path / "ledger.db")
+    scope = CommitCountScope("project-alpha", "2026-08-31")
+    original = WeeklyCommitCount("project-alpha", "2026-08-31", "cx", 9)
+    replacement = WeeklyCommitCount("project-alpha", "2026-08-31", "cx", 10)
+    assert replace_weekly_commit_counts(conn, (scope,), (original,)) == 1
+    assert replace_weekly_commit_counts(conn, (scope,), (replacement,)) == 1
+
+
+def test_replace_weekly_commit_counts_rolls_back_when_insert_fails(tmp_path):
+    conn = open_db(tmp_path / "ledger.db")
+    scope = CommitCountScope("project-alpha", "2026-08-31")
+    original = WeeklyCommitCount("project-alpha", "2026-08-31", "cx", 9)
+    replacement = WeeklyCommitCount("project-alpha", "2026-08-31", "cx", 10)
+    assert replace_weekly_commit_counts(conn, (scope,), (original,)) == 1
+    conn.execute(
+        "CREATE TRIGGER reject_weekly_count_insert "
+        "BEFORE INSERT ON weekly_commit_counts BEGIN "
+        "SELECT RAISE(ABORT, 'blocked'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="blocked"):
+        replace_weekly_commit_counts(conn, (scope,), (replacement,))
+
+    assert weekly_commit_counts(conn, "project-alpha", "2026-08-31") == [original]
+
+
+def test_replace_weekly_commit_counts_reads_old_rows_inside_transaction(tmp_path):
+    conn = open_db(tmp_path / "ledger.db")
+    scope = CommitCountScope("project-alpha", "2026-08-31")
+    original = WeeklyCommitCount("project-alpha", "2026-08-31", "cx", 9)
+    replacement = WeeklyCommitCount("project-alpha", "2026-08-31", "cx", 10)
+    assert replace_weekly_commit_counts(conn, (scope,), (original,)) == 1
+    transaction_state = []
+
+    def trace(sql):
+        if "SELECT project, week_start, person, commit_count" in sql:
+            transaction_state.append(conn.in_transaction)
+
+    conn.set_trace_callback(trace)
+    try:
+        assert replace_weekly_commit_counts(conn, (scope,), (replacement,)) == 1
+    finally:
+        conn.set_trace_callback(None)
+    assert transaction_state == [True]
+
+
+def test_replace_weekly_commit_counts_rejects_out_of_scope_counts(tmp_path):
+    conn = open_db(tmp_path / "ledger.db")
+    scope = CommitCountScope("project-alpha", "2026-08-31")
+    with pytest.raises(ValueError, match="scope"):
+        replace_weekly_commit_counts(
+            conn,
+            (scope,),
+            (WeeklyCommitCount("project-beta", "2026-08-31", "cx", 1),),
+        )
+    assert weekly_commit_counts(conn, "project-alpha", "2026-08-31") == []
+
+
+@pytest.mark.parametrize("commit_count", [0, -1, True])
+def test_replace_weekly_commit_counts_rejects_non_positive_counts(tmp_path, commit_count):
+    conn = open_db(tmp_path / "ledger.db")
+    with pytest.raises(ValueError, match="positive"):
+        replace_weekly_commit_counts(
+            conn,
+            (CommitCountScope("project-alpha", "2026-08-31"),),
+            (WeeklyCommitCount("project-alpha", "2026-08-31", "cx", commit_count),),
+        )
 
 
 def test_open_db_migrates_legacy_summaries_once(tmp_path):

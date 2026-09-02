@@ -22,6 +22,40 @@ def test_connector_settings_read_options_from_operator_configuration(tmp_path):
     assert settings["gitlab"].enabled is False
 
 
+def test_github_count_weeks_accepts_an_integer_in_the_supported_range(tmp_path):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  github:\n"
+        "    enabled: true\n"
+        "    count_weeks: 2\n"
+    )
+
+    settings = load_connector_settings(tmp_path)
+
+    assert settings["github"].options["count_weeks"] == 2
+
+
+@pytest.mark.parametrize(
+    "configured",
+    ["true", "2.5", '"2"', "0", "53", "null"],
+)
+def test_github_count_weeks_rejects_non_integer_or_out_of_range_config(
+    tmp_path, configured
+):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  github:\n"
+        "    enabled: true\n"
+        f"    count_weeks: {configured}\n"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="connector option count_weeks for github must be an integer from 1 to 52",
+    ):
+        load_connector_settings(tmp_path)
+
+
 def test_unknown_connector_key_is_rejected(tmp_path):
     (tmp_path / "connectors.yaml").write_text(
         "connectors:\n  unknown:\n    enabled: true\n"
@@ -80,6 +114,93 @@ def test_gitlab_exclude_note_authors_defaults_empty(tmp_path):
     )
     settings = load_connector_settings(tmp_path)
     assert settings["gitlab"].options["exclude_note_authors"] == []
+
+
+def test_gitlab_reclaim_origins_defaults_empty(tmp_path):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: true\n"
+    )
+
+    settings = load_connector_settings(tmp_path)
+
+    assert settings["gitlab"].options["reclaim_origins"] == []
+
+
+def test_gitlab_reclaim_origins_accepts_explicit_http_origins(tmp_path):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: true\n"
+        "    reclaim_origins:\n"
+        "      - https://gitlab-history.example\n"
+        "      - http://gitlab-archive.example:8080/\n"
+    )
+
+    settings = load_connector_settings(tmp_path)
+
+    assert settings["gitlab"].options["reclaim_origins"] == [
+        "https://gitlab-history.example",
+        "http://gitlab-archive.example:8080/",
+    ]
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "https://gitlab-history.example",
+        "{origin: https://gitlab-history.example}",
+        "[https://gitlab-history.example, 42]",
+    ],
+)
+def test_gitlab_reclaim_origins_rejects_non_string_lists(tmp_path, configured):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: true\n"
+        f"    reclaim_origins: {configured}\n"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="connector option reclaim_origins for gitlab must be a list of strings",
+    ):
+        load_connector_settings(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "gitlab-history.example",
+        "ftp://gitlab-history.example",
+        "https://gitlab-history.example:invalid",
+        "https://user@gitlab-history.example",
+        "https://gitlab-history.example/group",
+        "https://gitlab-history.example?group=1",
+        "https://gitlab-history.example#group",
+        '"\\u0000https://gitlab-history.example"',
+        '"https://gitlab-history.example:"',
+        '"https://gitlab-history.example?"',
+        '"https://gitlab-history.example#"',
+    ],
+)
+def test_gitlab_reclaim_origins_rejects_values_that_are_not_origins(
+    tmp_path, configured
+):
+    (tmp_path / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: true\n"
+        "    reclaim_origins:\n"
+        f"      - {configured}\n"
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="connector option reclaim_origins for gitlab contains an invalid origin",
+    ):
+        load_connector_settings(tmp_path)
 
 
 @pytest.mark.parametrize("configured", ["fgbot", "true", "{a: 1}", "[1, 2]"])

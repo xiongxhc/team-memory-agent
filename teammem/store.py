@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .events import Event
 from .identity import IdentityMaps
+from .metrics import CommitCountScope, WeeklyCommitCount
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -40,6 +41,13 @@ CREATE TABLE IF NOT EXISTS summaries (
   source_input_hash    TEXT,
   effective_flags_json TEXT,
   UNIQUE(kind, key)
+);
+CREATE TABLE IF NOT EXISTS weekly_commit_counts (
+  project      TEXT NOT NULL,
+  week_start   TEXT NOT NULL,
+  person       TEXT NOT NULL,
+  commit_count INTEGER NOT NULL CHECK (commit_count >= 0),
+  PRIMARY KEY (project, week_start, person)
 );
 """
 
@@ -133,6 +141,88 @@ def insert_events(conn: sqlite3.Connection, events: Iterable[Event]) -> int:
              for e in events],
         )
     return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] - before
+
+
+def replace_weekly_commit_counts(
+    conn: sqlite3.Connection,
+    scopes: Iterable[CommitCountScope],
+    counts: Iterable[WeeklyCommitCount],
+) -> int:
+    """Replace complete weekly count snapshots and return changed row count."""
+    scopes = tuple(scopes)
+    counts = tuple(counts)
+    scope_keys = [(scope.project, scope.week_start) for scope in scopes]
+    scope_key_set = set(scope_keys)
+    if len(set(scope_keys)) != len(scope_keys):
+        raise ValueError("duplicate commit count scope")
+
+    count_keys: set[tuple[str, str, str]] = set()
+    for count in counts:
+        key = (count.project, count.week_start, count.person)
+        if (count.project, count.week_start) not in scope_key_set:
+            raise ValueError("count does not belong to supplied scope")
+        if (
+            isinstance(count.commit_count, bool)
+            or not isinstance(count.commit_count, int)
+            or count.commit_count <= 0
+        ):
+            raise ValueError("commit_count must be a positive integer")
+        if key in count_keys:
+            raise ValueError("duplicate weekly commit count")
+        count_keys.add(key)
+
+    new = {
+        (count.project, count.week_start, count.person): (
+            count.project,
+            count.week_start,
+            count.person,
+            count.commit_count,
+        )
+        for count in counts
+    }
+    old: dict[tuple[str, str, str], tuple[str, str, str, int]] = {}
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for project, week_start in scope_keys:
+            for row in conn.execute(
+                "SELECT project, week_start, person, commit_count "
+                "FROM weekly_commit_counts WHERE project = ? AND week_start = ?",
+                (project, week_start),
+            ):
+                old[(row[0], row[1], row[2])] = tuple(row)
+
+        for project, week_start in scope_keys:
+            conn.execute(
+                "DELETE FROM weekly_commit_counts "
+                "WHERE project = ? AND week_start = ?",
+                (project, week_start),
+            )
+        conn.executemany(
+            "INSERT INTO weekly_commit_counts "
+            "(project, week_start, person, commit_count) VALUES (?, ?, ?, ?)",
+            new.values(),
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+    return sum(old.get(key) != new.get(key) for key in old.keys() | new.keys())
+
+
+def weekly_commit_counts(
+    conn: sqlite3.Connection,
+    project: str,
+    week_start: str,
+) -> list[WeeklyCommitCount]:
+    rows = conn.execute(
+        "SELECT project, week_start, person, commit_count "
+        "FROM weekly_commit_counts WHERE project = ? AND week_start = ? "
+        "ORDER BY commit_count DESC, person ASC",
+        (project, week_start),
+    ).fetchall()
+    return [WeeklyCommitCount(*row) for row in rows]
 
 
 def reconcile_gitlab_events(

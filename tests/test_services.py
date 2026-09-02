@@ -7,6 +7,7 @@ from pathlib import Path
 from teammem.config import Config
 from teammem.events import Event
 from teammem.identity import IdentityMaps
+from teammem.metrics import CommitCountScope, WeeklyCommitCount
 from teammem.services import (
     JournalFailure,
     ReportRunResult,
@@ -25,6 +26,7 @@ from teammem.store import (
     open_db,
     put_summary,
     reconcile_gitlab_events,
+    weekly_commit_counts,
 )
 from teammem.summarize import prepare_daily_journal
 
@@ -600,6 +602,80 @@ class _WarningConnector:
         )
 
 
+class _AggregateConnector:
+    name = "github"
+    provider_commit_detail = "fix: provider payload must stay private"
+
+    def validate(self, cfg, settings):
+        return []
+
+    def collect(self, cfg, ids, settings, now):
+        from teammem.connectors.base import CollectionResult
+
+        return CollectionResult(
+            commit_counts=(
+                WeeklyCommitCount("project-alpha", "2026-07-13", "alex", 3),
+                WeeklyCommitCount("project-alpha", "2026-07-13", "sam", 1),
+            ),
+            commit_count_scopes=(
+                CommitCountScope("project-alpha", "2026-07-13"),
+            ),
+        )
+
+
+def test_collect_connector_persists_aggregate_snapshot_idempotently(tmp_path):
+    from teammem.connectors.config import ConnectorSettings
+
+    cfg = _cfg(tmp_path)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    settings = ConnectorSettings("github", True, {})
+    connector = _AggregateConnector()
+
+    first = collect_connector(
+        "github", cfg, ids, settings, NOW, connector=connector, emit=False
+    )
+    second = collect_connector(
+        "github", cfg, ids, settings, NOW, connector=connector, emit=False
+    )
+
+    assert (first.fetched, first.inserted) == (0, 0)
+    assert (first.aggregate_rows, first.aggregate_changes) == (2, 2)
+    assert (second.aggregate_rows, second.aggregate_changes) == (2, 0)
+    assert weekly_commit_counts(
+        open_db(cfg.db_path), "project-alpha", "2026-07-13"
+    ) == [
+        WeeklyCommitCount("project-alpha", "2026-07-13", "alex", 3),
+        WeeklyCommitCount("project-alpha", "2026-07-13", "sam", 1),
+    ]
+
+
+def test_collect_connector_dry_run_lists_counts_without_writing_or_payload(
+    tmp_path, capsys
+):
+    from teammem.connectors.config import ConnectorSettings
+
+    cfg = _cfg(tmp_path)
+    conn = open_db(cfg.db_path)
+    result = collect_connector(
+        "github",
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        ConnectorSettings("github", True, {}),
+        NOW,
+        dry_run=True,
+        connector=_AggregateConnector(),
+        conn=conn,
+    )
+
+    assert (result.aggregate_rows, result.aggregate_changes) == (2, 0)
+    assert capsys.readouterr().out == (
+        "DRY project-alpha 2026-07-13 alex 3\n"
+        "DRY project-alpha 2026-07-13 sam 1\n"
+        "dry-run: 0 events; 2 aggregate rows, nothing written\n"
+    )
+    assert weekly_commit_counts(conn, "project-alpha", "2026-07-13") == []
+
+
 def test_collect_connector_returns_provider_warnings(tmp_path):
     from teammem.connectors.config import ConnectorSettings
 
@@ -615,6 +691,8 @@ def test_collect_connector_returns_provider_warnings(tmp_path):
 
     assert result.fetched == 1
     assert result.inserted == 1
+    assert result.aggregate_rows == 0
+    assert result.aggregate_changes == 0
     assert result.warnings == ("history may be incomplete",)
 
 

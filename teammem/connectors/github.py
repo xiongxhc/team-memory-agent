@@ -1,12 +1,14 @@
 """GitHub repository connector restricted to configured project mappings."""
 
 import json
+from collections import Counter
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from teammem.config import Config
 from teammem.events import Event, event_hash
 from teammem.identity import IdentityMaps
+from teammem.metrics import CommitCountScope, WeeklyCommitCount
 
 from .base import CollectionResult
 from .config import ConnectorSettings
@@ -51,12 +53,67 @@ class GitHubConnector:
         settings: ConnectorSettings,
         now: datetime,
     ) -> CollectionResult:
+        now = now.astimezone(timezone.utc)
         fetch = self._fetch or self.http_fetch(cfg)
         since = now - timedelta(days=cfg.since_days)
         since_text = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+        repositories = [
+            (repository, project, ids.projection(project))
+            for repository, project in ids.resources("github-repo").items()
+        ]
+        count_projects = {
+            project for _, project, projection in repositories
+            if projection == "count-only"
+        }
+        count_week_starts: tuple[str, ...] = ()
+        count_since_text = ""
+        if count_projects:
+            count_weeks = self._count_weeks(settings.options)
+            current_date = now.date()
+            current_monday = current_date - timedelta(days=current_date.weekday())
+            oldest_monday = current_monday - timedelta(weeks=count_weeks - 1)
+            count_week_starts = tuple(
+                (oldest_monday + timedelta(weeks=offset)).isoformat()
+                for offset in range(count_weeks)
+            )
+            count_since_text = f"{oldest_monday.isoformat()}T00:00:00Z"
+
         events: list[Event] = []
-        for repository, project in ids.resources("github-repo").items():
+        warnings: list[str] = []
+        commit_counts: Counter[tuple[str, str, str]] = Counter()
+        count_scope_keys = {
+            (project, week_start)
+            for project in count_projects
+            for week_start in count_week_starts
+        }
+        for repository, project, projection in repositories:
             base = f"/repos/{repository}"
+            if projection == "count-only":
+                for commit in self._paginate(
+                    fetch,
+                    f"{base}/commits",
+                    {"since": count_since_text},
+                ):
+                    commit_author = (commit.get("commit") or {}).get("author") or {}
+                    commit_date = self._timestamp(commit_author["date"]).astimezone(
+                        timezone.utc
+                    ).date()
+                    week_start = commit_date - timedelta(days=commit_date.weekday())
+                    week_start_text = week_start.isoformat()
+                    if (project, week_start_text) not in count_scope_keys:
+                        warnings.append(
+                            f"github count-only response for {project} has UTC week "
+                            f"{week_start_text} outside requested replacement scopes; "
+                            "ignored"
+                        )
+                        continue
+                    author = commit.get("author") or {}
+                    person = ids.person("github", author.get("login", ""))
+                    if person.startswith("_unmapped/") and commit_author.get("email"):
+                        person = ids.person("email", commit_author["email"])
+                    commit_counts[(project, week_start_text, person)] += 1
+                continue
+
             for commit in self._paginate(fetch, f"{base}/commits", {"since": since_text}):
                 events.append(self._commit_event(commit, ids, project))
             for pull_request in self._pull_requests(
@@ -73,7 +130,27 @@ class GitHubConnector:
                         repository,
                     )
                 )
-        return CollectionResult(events=tuple(events))
+        return CollectionResult(
+            events=tuple(events),
+            warnings=tuple(warnings),
+            commit_counts=tuple(
+                WeeklyCommitCount(project, week_start, person, commit_count)
+                for (project, week_start, person), commit_count
+                in sorted(commit_counts.items())
+            ),
+            commit_count_scopes=tuple(
+                CommitCountScope(project, week_start)
+                for project in sorted(count_projects)
+                for week_start in count_week_starts
+            ),
+        )
+
+    @staticmethod
+    def _count_weeks(options: dict) -> int:
+        raw_count_weeks = options.get("count_weeks", 4)
+        if type(raw_count_weeks) is not int or not 1 <= raw_count_weeks <= 52:
+            raise ValueError("count_weeks must be an integer from 1 to 52")
+        return raw_count_weeks
 
     @staticmethod
     def _paginate(fetch: FetchJson, path: str, params: dict) -> list:
