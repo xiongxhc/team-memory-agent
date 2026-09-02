@@ -24,7 +24,13 @@ from .queries import report_context, week_label, week_monday
 from .reclaim import reclaim, reclaim_channel_projects
 from .render import render_vault, verify_vault
 from .slices import active_person_days
-from .store import get_summary, insert_events, open_db, reconcile_gitlab_events
+from .store import (
+    get_summary,
+    insert_events,
+    open_db,
+    reconcile_gitlab_events,
+    replace_weekly_commit_counts,
+)
 from .summarize import (
     DAILY_SYSTEM,
     LLM,
@@ -51,6 +57,8 @@ from .vaultgit import commit_all, ensure_repo, push
 class CollectionRun:
     fetched: int
     inserted: int
+    aggregate_rows: int
+    aggregate_changes: int
     channel_names: dict[str, str]
     warnings: tuple[str, ...]
 
@@ -177,6 +185,7 @@ def collect_connector(
     selected = connector or get_connector(name)
     result: CollectionResult = selected.collect(cfg, ids, settings, now)
     events = list(result.events)
+    commit_counts = tuple(result.commit_counts)
     if dry_run:
         if emit:
             for event in events:
@@ -184,8 +193,17 @@ def collect_connector(
                     f"DRY {event.ts}  {event.person:<28} {event.kind:<7} "
                     f"{event.project or '-':<18} {event.summary}"
                 )
-            print(f"dry-run: {len(events)} events, nothing written")
+            for count in commit_counts:
+                print(
+                    f"DRY {count.project} {count.week_start} "
+                    f"{count.person} {count.commit_count}"
+                )
+            print(
+                f"dry-run: {len(events)} events; "
+                f"{len(commit_counts)} aggregate rows, nothing written"
+            )
         inserted = 0
+        aggregate_changes = 0
     else:
         connection = conn or open_db(cfg.db_path)
         reclaim(connection, ids)
@@ -193,8 +211,17 @@ def collect_connector(
             inserted = reconcile_gitlab_events(connection, events, ids)
         else:
             inserted = insert_events(connection, events)
+        aggregate_changes = replace_weekly_commit_counts(
+            connection,
+            result.commit_count_scopes,
+            commit_counts,
+        )
         if emit:
-            print(f"ingested: {inserted} new / {len(events)} fetched -> {cfg.db_path}")
+            print(
+                f"ingested: {inserted} new / {len(events)} fetched; "
+                f"{len(commit_counts)} aggregate rows / "
+                f"{aggregate_changes} changed -> {cfg.db_path}"
+            )
             unmapped = sorted({
                 event.person
                 for event in events
@@ -213,6 +240,8 @@ def collect_connector(
     return CollectionRun(
         fetched=len(events),
         inserted=inserted,
+        aggregate_rows=len(commit_counts),
+        aggregate_changes=aggregate_changes,
         channel_names=dict(result.channel_names),
         warnings=tuple(result.warnings),
     )

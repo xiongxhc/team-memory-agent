@@ -68,6 +68,52 @@ and daily-run errors redact configured credentials. Credentials, runtime
 databases, inbox exports, archives, quarantine files, snapshots, and generated
 views must never be committed to this repository.
 
+## Project projections and count-only privacy
+
+Project classification is configured in `projects.yaml`. The top-level shape is:
+
+```yaml
+projects:
+  project-alpha:
+    projection: full             # optional: full (the default) or count-only
+    github_repos: [team/project-alpha]
+    gitlab_repos: [team/project-alpha]
+    slack_channels: [C0123]
+    feishu_channels: [oc_example_alpha]
+    discord_channels: ["9876543210"]
+areas:
+  coordination:
+    slack_channels: [C0124]
+hidden_projects:
+  - IdeaProjects
+```
+
+The resource lists are optional and may be used with any mapped project or area.
+An omitted `projection` is `full`, preserving the behavior of existing project
+configuration. Explicit projects accept `full` or `count-only`; an unknown
+project label is `unclassified` and remains a normal detailed Project. Labels
+under `areas` are rendered under the managed `Areas/` directory, while only
+labels explicitly listed in `hidden_projects` suppress their own project pages.
+The classification controls connector and renderer output; it does not rewrite
+or discard ledger events.
+
+For a GitHub project marked `projection: count-only`, commit responses are
+processed transiently to derive weekly totals. The commit payload, SHA, message,
+timestamps, references, and raw response are not persisted as events. The only
+durable projection produced by that count-only collection is the aggregate
+`weekly_commit_counts` table, whose exact fields are `project`, `week_start`,
+`person`, and `commit_count`; rendered pages show only those contributor/count
+values. GitHub's count-only window is
+controlled by the GitHub connector option `count_weeks` (default `4`, valid range
+`1..52`).
+
+This restriction applies only to count-only GitHub commit collection. MemberKit
+bundles remain ordinary reviewed evidence: bundle validation and conversion do
+not consult project projection, and a pushed MemberKit event is recordable in
+the ledger with its `source`, `summary`, and `project` intact. Such an event
+continues to appear in the member and team journal views; count-only project
+pages still expose only aggregate GitHub counts.
+
 ## Member-owned data
 
 MemberKit opens its configured observations database read-only. It creates a

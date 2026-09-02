@@ -15,6 +15,7 @@ from teammem.cli import main, run_collect
 from teammem.config import Config
 from teammem.gitlab_collector import collect_gitlab
 from teammem.identity import IdentityMaps
+from teammem.metrics import CommitCountScope, WeeklyCommitCount
 from teammem.schedule import ScheduleStatus
 from teammem.store import open_db, stats
 
@@ -134,6 +135,131 @@ def test_main_reclaim_runs_without_credentials(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
     assert main(["reclaim", "--dry-run"]) == 0
     assert "reclaimed 0 rows" in capsys.readouterr().out
+
+
+def test_main_reclaim_reports_repository_rows_separately(
+    tmp_path, monkeypatch, capsys
+):
+    from teammem.events import Event
+    from teammem.store import insert_events
+
+    db = tmp_path / "l.db"
+    insert_events(open_db(db), [Event(
+        person="alex",
+        project="stale-project",
+        ts="2026-07-14T09:00:00+00:00",
+        source="gitlab",
+        kind="commit",
+        summary="fix project attribution",
+        refs=json.dumps({
+            "url": "https://gitlab.example/team/project-alpha/-/commit/abc"
+        }),
+        hash="repo-reclaim",
+    )])
+    monkeypatch.setenv("TEAMMEM_DB", str(db))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    monkeypatch.setenv("TEAMMEM_GITLAB_URL", "https://gitlab.example")
+
+    assert main(["reclaim", "--dry-run"]) == 0
+
+    output = capsys.readouterr().out
+    assert (
+        "DRY reclaim repository team/project-alpha -> project-alpha (1 rows)"
+        in output
+    )
+    assert "DRY reclaimed 1 repository rows across 1 repositories" in output
+    assert "DRY reclaimed 0 channel rows across 0 channels" in output
+    assert open_db(db).execute(
+        "SELECT project FROM events WHERE hash = 'repo-reclaim'"
+    ).fetchone()[0] == "stale-project"
+
+
+def test_main_reclaim_passes_configured_historical_gitlab_origins(
+    tmp_path, monkeypatch, capsys
+):
+    from teammem.events import Event
+    from teammem.store import insert_events
+
+    config = tmp_path / "config"
+    config.mkdir()
+    for name in ("roster.example.yaml", "projects.example.yaml"):
+        (config / name).write_text((CONFIG_DIR / name).read_text())
+    (config / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: false\n"
+        "    reclaim_origins: [https://gitlab-history.example]\n"
+    )
+    db = tmp_path / "l.db"
+    insert_events(open_db(db), [Event(
+        person="alex",
+        project="stale-project",
+        ts="2026-07-14T09:00:00+00:00",
+        source="gitlab",
+        kind="commit",
+        summary="historical attribution",
+        refs=json.dumps({
+            "url": (
+                "https://gitlab-history.example/"
+                "team/project-alpha/-/commit/abc"
+            )
+        }),
+        hash="historical-reclaim",
+    )])
+    monkeypatch.setenv("TEAMMEM_DB", str(db))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(config))
+    monkeypatch.setenv("TEAMMEM_GITLAB_URL", "https://gitlab-current.example")
+
+    assert main(["reclaim", "--dry-run"]) == 0
+
+    output = capsys.readouterr().out
+    assert (
+        "DRY reclaim repository team/project-alpha -> project-alpha (1 rows)"
+        in output
+    )
+    assert open_db(db).execute(
+        "SELECT project FROM events WHERE hash = 'historical-reclaim'"
+    ).fetchone()[0] == "stale-project"
+
+
+def test_main_reclaim_rejects_invalid_historical_origin_before_any_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    from teammem.events import Event
+    from teammem.store import insert_events
+
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "roster.yaml").write_text(
+        "members:\n  alex:\n    gitlab: [alexdev]\n"
+    )
+    (config / "projects.yaml").write_text("projects: {}\n")
+    (config / "connectors.yaml").write_text(
+        "connectors:\n"
+        "  gitlab:\n"
+        "    enabled: false\n"
+        "    reclaim_origins: [https://gitlab-history.example/group]\n"
+    )
+    db = tmp_path / "l.db"
+    insert_events(open_db(db), [Event(
+        person="_unmapped/alexdev",
+        ts="2026-07-14T09:00:00+00:00",
+        source="gitlab",
+        kind="commit",
+        summary="must remain unmapped",
+        hash="invalid-config-no-mutation",
+    )])
+    monkeypatch.setenv("TEAMMEM_DB", str(db))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(config))
+
+    assert main(["reclaim"]) == 2
+
+    captured = capsys.readouterr()
+    assert "invalid origin" in captured.err
+    assert "Traceback" not in captured.err
+    assert open_db(db).execute(
+        "SELECT person FROM events WHERE hash = 'invalid-config-no-mutation'"
+    ).fetchone()[0] == "_unmapped/alexdev"
 
 
 def test_main_render_dry_run(tmp_path, monkeypatch, capsys):
@@ -547,6 +673,56 @@ def test_collect_runtime_failure_never_prints_secret(
     captured = capsys.readouterr()
     assert "github: collection failed" in captured.err
     assert token not in captured.out + captured.err
+
+
+def test_collect_cli_reports_aggregate_changes_without_commit_details(
+    tmp_path, monkeypatch, capsys
+):
+    class AggregateConnector:
+        name = "github"
+        provider_commit_detail = "fix: provider payload must stay private"
+
+        def validate(self, cfg, settings):
+            return []
+
+        def collect(self, cfg, ids, settings, now):
+            from teammem.connectors.base import CollectionResult
+
+            return CollectionResult(
+                commit_counts=(
+                    WeeklyCommitCount(
+                        "project-alpha", "2026-07-13", "alex", 3
+                    ),
+                    WeeklyCommitCount(
+                        "project-alpha", "2026-07-13", "sam", 1
+                    ),
+                ),
+                commit_count_scopes=(
+                    CommitCountScope("project-alpha", "2026-07-13"),
+                ),
+            )
+
+    config = tmp_path / "config"
+    config.mkdir()
+    for name in ("roster.example.yaml", "projects.example.yaml"):
+        (config / name).write_text((CONFIG_DIR / name).read_text())
+    (config / "connectors.yaml").write_text(
+        "connectors:\n  github:\n    enabled: true\n"
+    )
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(config))
+    monkeypatch.setenv("TEAMMEM_DB", str(tmp_path / "ledger.db"))
+    monkeypatch.setattr(
+        "teammem.cli.get_connector", lambda name: AggregateConnector()
+    )
+
+    assert main(["collect", "github"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "ingested: 0 new / 0 fetched; 2 aggregate rows / 2 changed "
+        f"-> {tmp_path / 'ledger.db'}\n"
+    )
+    assert captured.err == ""
 
 
 def test_run_daily_prints_step_warnings_and_returns_result_exit_code(

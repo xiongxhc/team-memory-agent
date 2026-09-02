@@ -45,6 +45,8 @@ _ALLOWED_STAGES = frozenset(
 _COUNT_FIELDS = frozenset(
     {
         "accepted",
+        "aggregate_changes",
+        "aggregate_rows",
         "cached",
         "channel_rows",
         "completed",
@@ -57,6 +59,7 @@ _COUNT_FIELDS = frozenset(
         "migrated",
         "pairs",
         "quarantined",
+        "repository_rows",
         "total",
         "warning_count",
     }

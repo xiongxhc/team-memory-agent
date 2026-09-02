@@ -14,7 +14,11 @@ from .connectors.config import load_connector_settings
 from .connectors.registry import connector_names, get_connector
 from .daily import run_daily
 from .identity import IdentityMaps
-from .reclaim import reclaim, reclaim_channel_projects
+from .reclaim import (
+    reclaim,
+    reclaim_channel_projects,
+    reclaim_repository_projects,
+)
 from .services import (
     collect_connector,
     resolve_llm_backend,
@@ -308,6 +312,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "reclaim":
+        try:
+            settings = load_connector_settings(cfg.config_dir)
+        except OSError:
+            print("error: unable to load connector configuration", file=sys.stderr)
+            return 2
+        except ValueError as failure:
+            print(f"error: {failure}", file=sys.stderr)
+            return 2
         ids = IdentityMaps.load(cfg.config_dir)
         conn = open_db(cfg.db_path)
         results = reclaim(conn, ids, dry_run=args.dry_run)
@@ -326,6 +338,23 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"{prefix}reclaimed {sum(count for _, _, count in channels)} channel rows"
             f" across {len(channels)} channels"
+        )
+        repositories = reclaim_repository_projects(
+            conn,
+            ids,
+            dry_run=args.dry_run,
+            gitlab_url=cfg.gitlab_url,
+            reclaim_origins=settings["gitlab"].options["reclaim_origins"],
+        )
+        for repository, project, count in repositories:
+            print(
+                f"{prefix}reclaim repository {repository} -> {project} "
+                f"({count} rows)"
+            )
+        print(
+            f"{prefix}reclaimed "
+            f"{sum(count for _, _, count in repositories)} repository rows"
+            f" across {len(repositories)} repositories"
         )
         return 0
 

@@ -18,7 +18,11 @@ from .connectors.config import ConnectorSettings
 from .connectors.registry import get_connector
 from .identity import IdentityMaps
 from .importer import import_inbox
-from .reclaim import reclaim, reclaim_channel_projects
+from .reclaim import (
+    reclaim,
+    reclaim_channel_projects,
+    reclaim_repository_projects,
+)
 from .run_lock import acquire_run_lock
 from .services import (
     collect_connector,
@@ -379,6 +383,7 @@ def _run_locked_stages(
     conn: sqlite3.Connection,
     connectors: dict[str, Connector] | None,
     capture_only: bool,
+    gitlab_reclaim_origins: Iterable[str],
 ) -> None:
     collection_now = now.astimezone(timezone.utc)
 
@@ -410,7 +415,11 @@ def _run_locked_stages(
             )
         except Exception as error:
             return StepResult(name, "failed", redact_secrets(error, cfg))
-        detail = f"{result.inserted} new / {result.fetched} fetched"
+        detail = (
+            f"{result.inserted} new / {result.fetched} fetched; "
+            f"{result.aggregate_rows} aggregate rows / "
+            f"{result.aggregate_changes} changed"
+        )
         if result.warnings:
             detail += "; " + "; ".join(
                 f"warning: {warning}" for warning in result.warnings
@@ -420,6 +429,8 @@ def _run_locked_stages(
             (
                 ("fetched", result.fetched),
                 ("inserted", result.inserted),
+                ("aggregate_rows", result.aggregate_rows),
+                ("aggregate_changes", result.aggregate_changes),
                 ("warning_count", len(result.warnings)),
             ),
         )
@@ -473,22 +484,31 @@ def _run_locked_stages(
         try:
             identities = reclaim(conn, ids)
             channels = reclaim_channel_projects(conn, ids)
+            repositories = reclaim_repository_projects(
+                conn,
+                ids,
+                gitlab_url=cfg.gitlab_url,
+                reclaim_origins=gitlab_reclaim_origins,
+            )
         except Exception as error:
             return StepResult(
                 "reclaim", "failed", redact_secrets(error, cfg)
             )
         identity_rows = sum(item[2] for item in identities)
         channel_rows = sum(item[2] for item in channels)
+        repository_rows = sum(item[2] for item in repositories)
         return (
             StepResult(
                 "reclaim",
                 "ok",
                 f"{identity_rows} identity rows; "
-                f"{channel_rows} channel rows",
+                f"{channel_rows} channel rows; "
+                f"{repository_rows} repository rows",
             ),
             (
                 ("identity_rows", identity_rows),
                 ("channel_rows", channel_rows),
+                ("repository_rows", repository_rows),
             ),
         )
 
@@ -620,6 +640,7 @@ def run_daily(
                         conn,
                         connectors,
                         capture_only,
+                        settings["gitlab"].options.get("reclaim_origins", ()),
                     )
                 finally:
                     conn.close()

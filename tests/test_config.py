@@ -21,13 +21,13 @@ def test_defaults(empty_env_file):
 def test_env_overrides(empty_env_file):
     cfg = Config.load(env={
         "TEAMMEM_DB": "/tmp/x.db",
-        "TEAMMEM_GITLAB_URL": "https://gitlab.internal",
+        "TEAMMEM_GITLAB_URL": "https://gitlab.example",
         "TEAMMEM_GITLAB_TOKEN": "tok",
         "TEAMMEM_GITLAB_GROUP": "42",
         "TEAMMEM_SINCE_DAYS": "14",
     }, env_file=empty_env_file)
     assert cfg.db_path == Path("/tmp/x.db")
-    assert cfg.gitlab_url == "https://gitlab.internal"
+    assert cfg.gitlab_url == "https://gitlab.example"
     assert cfg.gitlab_token == "tok"
     assert cfg.gitlab_group == "42"
     assert cfg.since_days == 14
@@ -35,10 +35,10 @@ def test_env_overrides(empty_env_file):
 
 def test_gitlab_url_trailing_slash_stripped_and_config_dir_override(empty_env_file):
     cfg = Config.load(env={
-        "TEAMMEM_GITLAB_URL": "https://gitlab.internal/",
+        "TEAMMEM_GITLAB_URL": "https://gitlab.example/",
         "TEAMMEM_CONFIG_DIR": "/etc/teammem",
     }, env_file=empty_env_file)
-    assert cfg.gitlab_url == "https://gitlab.internal"
+    assert cfg.gitlab_url == "https://gitlab.example"
     assert cfg.config_dir == Path("/etc/teammem")
     assert Config.load(env={}, env_file=empty_env_file).config_dir == Path("config")
 
