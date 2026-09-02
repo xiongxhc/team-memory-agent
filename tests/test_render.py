@@ -838,6 +838,21 @@ def test_verify_vault_clean_after_render(tmp_path):
         "missing": [], "unexpected": [], "differing": []}
 
 
+def test_verify_vault_uses_unmanaged_docs_as_render_context(tmp_path):
+    conn = _seed(tmp_path)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    vault = tmp_path / "vault"
+    docs = vault / "Docs" / "project-alpha"
+    docs.mkdir(parents=True)
+    (docs / "architecture.md").write_text("# Architecture\n")
+    render_vault(conn, ids, vault, TODAY)
+
+    project = vault / "Projects" / "project-alpha" / "README.md"
+    assert "[Architecture](../../Docs/project-alpha/architecture.md)" in project.read_text()
+    assert verify_vault(conn, ids, vault, TODAY) == {
+        "missing": [], "unexpected": [], "differing": []}
+
+
 def test_verify_vault_reports_drift_ignores_unmanaged(tmp_path):
     conn = _seed(tmp_path)
     ids = IdentityMaps.load(CONFIG_DIR)

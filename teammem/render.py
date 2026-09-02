@@ -595,6 +595,9 @@ def verify_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     renderer nondeterminism."""
     with tempfile.TemporaryDirectory() as td:
         expected_dir = Path(td) / "vault"
+        docs_dir = vault_dir / "Docs"
+        if docs_dir.is_dir():
+            shutil.copytree(docs_dir, expected_dir / "Docs", symlinks=True)
         render_vault(conn, ids, expected_dir, today, weeks=weeks,
                      channel_names=channel_names)
         expected, actual = _managed_files(expected_dir), _managed_files(vault_dir)
