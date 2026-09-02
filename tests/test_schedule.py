@@ -1610,3 +1610,271 @@ def test_unsupported_platform_has_no_side_effects(tmp_path):
 
     assert runner.calls == []
     assert list(tmp_path.iterdir()) == []
+
+
+# --- meeting units ------------------------------------------------------------
+# The daily pair is generated exactly as it always was; the meeting pairs appear
+# beside it only when the hub is configured for meetings. The two definitions
+# below are the pre-change bytes, captured before this feature existed, so a
+# drift in the daily units fails here rather than on an operator's machine.
+
+DAILY_SERVICE = (
+    "[Unit]\n"
+    "Description=Run Team Memory Agent daily workflow\n"
+    "\n"
+    "[Service]\n"
+    "Type=oneshot\n"
+    'ExecStart="/opt/pipx/bin/teammem" "--env-file" "{env_file}" "run-daily"\n'
+)
+DAILY_TIMER = (
+    "[Unit]\n"
+    "Description=Run Team Memory Agent daily\n"
+    "\n"
+    "[Timer]\n"
+    "OnCalendar=*-*-* 18:20:00\n"
+    "Persistent=true\n"
+    "Unit=teammem-daily.service\n"
+    "\n"
+    "[Install]\n"
+    "WantedBy=timers.target\n"
+)
+DAILY_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>Label</key>
+\t<string>org.teammem.hub-daily</string>
+\t<key>ProgramArguments</key>
+\t<array>
+\t\t<string>/opt/pipx/bin/teammem</string>
+\t\t<string>--env-file</string>
+\t\t<string>{env_file}</string>
+\t\t<string>run-daily</string>
+\t</array>
+\t<key>RunAtLoad</key>
+\t<false/>
+\t<key>StandardErrorPath</key>
+\t<string>{state}/schedule.err</string>
+\t<key>StandardOutPath</key>
+\t<string>{state}/schedule.log</string>
+\t<key>StartCalendarInterval</key>
+\t<dict>
+\t\t<key>Hour</key>
+\t\t<integer>18</integer>
+\t\t<key>Minute</key>
+\t\t<integer>20</integer>
+\t</dict>
+</dict>
+</plist>
+"""
+
+MEETING_UNITS = (
+    "teammem-meetings.service",
+    "teammem-meetings.timer",
+    "teammem-meeting-retention.service",
+    "teammem-meeting-retention.timer",
+)
+MEETING_PLISTS = ("org.teammem.meetings.plist",
+                  "org.teammem.meeting-retention.plist")
+
+
+def _meeting_cfg(tmp_path):
+    """A hub configured for meetings. Only enablement matters to the generator."""
+    return Config(
+        env_file=tmp_path / "hub.env",
+        meeting_inbox=tmp_path / "meeting-inbox",
+        meeting_archive=tmp_path / "meeting-archive",
+        meeting_quarantine=tmp_path / "meeting-quarantine",
+        meeting_audio_store=tmp_path / "meeting-audio",
+        meeting_receipts=tmp_path / "meeting-receipts",
+        meeting_alerts=tmp_path / "meeting-alerts",
+        vault_web_base="https://git.example.com/team/team-vault",
+    )
+
+
+def _daily_text(tmp_path):
+    return (DAILY_SERVICE.format(env_file=tmp_path / "hub.env"),
+            DAILY_TIMER)
+
+
+def test_the_daily_systemd_units_are_byte_identical_with_and_without_meetings(
+    tmp_path,
+):
+    service_text, timer_text = _daily_text(tmp_path)
+    plain = tmp_path / "plain" / "user"
+    _install_systemd(tmp_path, plain, RecordingRunner())
+    assert (plain / "teammem-daily.service").read_bytes() == service_text.encode()
+    assert (plain / "teammem-daily.timer").read_bytes() == timer_text.encode()
+
+    with_meetings = tmp_path / "meetings" / "user"
+    install_schedule(
+        _meeting_cfg(tmp_path), platform="linux", systemd_dir=with_meetings,
+        executable="/opt/pipx/bin/teammem", runner=RecordingRunner(),
+    )
+    for name in ("teammem-daily.service", "teammem-daily.timer"):
+        assert (with_meetings / name).read_bytes() == (plain / name).read_bytes()
+
+
+def test_the_daily_launchd_definition_is_byte_identical_with_and_without_meetings(
+    tmp_path,
+):
+    state = Path.home() / ".local" / "state" / "teammem"
+    plain = tmp_path / "plain-agents"
+    _install_launchd(tmp_path, plain, RecordingRunner(
+        returncodes={tuple(_launchctl_print()): 1}))
+    expected = DAILY_PLIST.format(env_file=tmp_path / "hub.env", state=state)
+    assert (plain / f"{LABEL}.plist").read_text() == expected
+
+    with_meetings = tmp_path / "meeting-agents"
+    install_schedule(
+        _meeting_cfg(tmp_path), platform="darwin", agents_dir=with_meetings,
+        executable="/opt/pipx/bin/teammem",
+        runner=RecordingRunner(handler=lambda command: 1
+                               if command[:2] == ["launchctl", "print"] else 0),
+    )
+    assert (with_meetings / f"{LABEL}.plist").read_text() == expected
+
+
+def test_systemd_meeting_units_are_generated_only_when_meetings_are_enabled(
+    tmp_path,
+):
+    disabled = tmp_path / "disabled" / "user"
+    _install_systemd(tmp_path, disabled, RecordingRunner())
+    assert sorted(p.name for p in disabled.iterdir()) == [
+        "teammem-daily.service", "teammem-daily.timer"]
+
+    enabled = tmp_path / "enabled" / "user"
+    install_schedule(
+        _meeting_cfg(tmp_path), platform="linux", systemd_dir=enabled,
+        executable="/opt/pipx/bin/teammem", runner=RecordingRunner(),
+    )
+    assert sorted(p.name for p in enabled.iterdir()) == sorted(
+        ["teammem-daily.service", "teammem-daily.timer", *MEETING_UNITS])
+
+
+def test_launchd_meeting_jobs_are_generated_only_when_meetings_are_enabled(
+    tmp_path,
+):
+    runner = RecordingRunner(handler=lambda command: 1
+                             if command[:2] == ["launchctl", "print"] else 0)
+    disabled = tmp_path / "disabled-agents"
+    _install_launchd(tmp_path, disabled, RecordingRunner(
+        returncodes={tuple(_launchctl_print()): 1}))
+    assert [p.name for p in disabled.iterdir()] == [f"{LABEL}.plist"]
+
+    enabled = tmp_path / "enabled-agents"
+    install_schedule(
+        _meeting_cfg(tmp_path), platform="darwin", agents_dir=enabled,
+        executable="/opt/pipx/bin/teammem", runner=runner,
+    )
+    assert sorted(p.name for p in enabled.iterdir()) == sorted(
+        [f"{LABEL}.plist", *MEETING_PLISTS])
+    # every job is bootstrapped, not merely written
+    bootstrapped = [call[0][-1] for call in runner.calls
+                    if call[0][:2] == ["launchctl", "bootstrap"]]
+    assert sorted(Path(path).name for path in bootstrapped) == sorted(
+        [f"{LABEL}.plist", *MEETING_PLISTS])
+
+
+def test_the_generated_meeting_units_run_the_unattended_commands(tmp_path):
+    directory = tmp_path / "systemd" / "user"
+    install_schedule(
+        _meeting_cfg(tmp_path), time="18:20", platform="linux",
+        systemd_dir=directory, executable="/opt/pipx/bin/teammem",
+        runner=RecordingRunner(),
+    )
+    env_file = tmp_path / "hub.env"
+    process = (directory / "teammem-meetings.service").read_text()
+    assert process.endswith(
+        f'ExecStart="/opt/pipx/bin/teammem" "--env-file" "{env_file}"'
+        ' "process-meetings"\n')
+    retention = (directory / "teammem-meeting-retention.service").read_text()
+    assert retention.endswith(
+        f'ExecStart="/opt/pipx/bin/teammem" "--env-file" "{env_file}"'
+        ' "expire-meeting-audio"\n')
+
+    timer = (directory / "teammem-meetings.timer").read_text()
+    assert "OnCalendar=*-*-* *:00/15:00" in timer      # every quarter hour
+    assert "Unit=teammem-meetings.service" in timer
+    assert "WantedBy=timers.target" in timer
+    # retention runs an hour after the daily job, so the two never contend
+    retention_timer = (directory / "teammem-meeting-retention.timer").read_text()
+    assert "OnCalendar=*-*-* 19:20:00" in retention_timer
+    assert "Unit=teammem-meeting-retention.service" in retention_timer
+
+
+def test_the_generated_launchd_meeting_jobs_run_the_unattended_commands(tmp_path):
+    directory = tmp_path / "LaunchAgents"
+    install_schedule(
+        _meeting_cfg(tmp_path), time="18:20", platform="darwin",
+        agents_dir=directory, executable="/opt/pipx/bin/teammem",
+        runner=RecordingRunner(handler=lambda command: 1
+                               if command[:2] == ["launchctl", "print"] else 0),
+    )
+    process = plistlib.loads((directory / "org.teammem.meetings.plist").read_bytes())
+    assert process["Label"] == "org.teammem.meetings"
+    assert process["ProgramArguments"] == [
+        "/opt/pipx/bin/teammem", "--env-file", str(tmp_path / "hub.env"),
+        "process-meetings"]
+    assert process["StartInterval"] == 900
+    assert process["RunAtLoad"] is False
+
+    retention = plistlib.loads(
+        (directory / "org.teammem.meeting-retention.plist").read_bytes())
+    assert retention["Label"] == "org.teammem.meeting-retention"
+    assert retention["ProgramArguments"][-1] == "expire-meeting-audio"
+    assert retention["StartCalendarInterval"] == {"Hour": 19, "Minute": 20}
+
+
+def test_a_failed_meeting_timer_start_restores_every_previous_definition(tmp_path):
+    directory = tmp_path / "systemd" / "user"
+    _install_systemd(tmp_path, directory, RecordingRunner())
+    before = {path.name: path.read_bytes() for path in directory.iterdir()}
+
+    failing = RecordingRunner(handler=lambda command: 1 if command[:4] == [
+        "systemctl", "--user", "enable", "--now"] and command[-1] ==
+        "teammem-meetings.timer" else 0)
+    with pytest.raises(RuntimeError):
+        install_schedule(
+            _meeting_cfg(tmp_path), platform="linux", systemd_dir=directory,
+            executable="/opt/pipx/bin/teammem", runner=failing,
+        )
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
+
+
+def test_disabling_meetings_removes_previously_generated_meeting_units(tmp_path):
+    directory = tmp_path / "systemd" / "user"
+    install_schedule(
+        _meeting_cfg(tmp_path), platform="linux", systemd_dir=directory,
+        executable="/opt/pipx/bin/teammem", runner=RecordingRunner(),
+    )
+    runner = RecordingRunner()
+    _install_systemd(tmp_path, directory, runner)
+
+    assert sorted(p.name for p in directory.iterdir()) == [
+        "teammem-daily.service", "teammem-daily.timer"]
+    assert _systemctl("disable", "--now", "teammem-meetings.timer") in runner.commands
+
+
+def test_remove_schedule_removes_the_meeting_units_too(tmp_path):
+    directory = tmp_path / "systemd" / "user"
+    install_schedule(
+        _meeting_cfg(tmp_path), platform="linux", systemd_dir=directory,
+        executable="/opt/pipx/bin/teammem", runner=RecordingRunner(),
+    )
+    assert remove_schedule(platform="linux", systemd_dir=directory,
+                           runner=RecordingRunner()) is True
+    assert list(directory.iterdir()) == []
+
+
+def test_remove_schedule_removes_the_launchd_meeting_jobs_too(tmp_path):
+    directory = tmp_path / "LaunchAgents"
+    install_schedule(
+        _meeting_cfg(tmp_path), platform="darwin", agents_dir=directory,
+        executable="/opt/pipx/bin/teammem",
+        runner=RecordingRunner(handler=lambda command: 1
+                               if command[:2] == ["launchctl", "print"] else 0),
+    )
+    assert remove_schedule(platform="darwin", agents_dir=directory,
+                           runner=RecordingRunner()) is True
+    assert list(directory.iterdir()) == []

@@ -267,7 +267,8 @@ Edit the user-only `hub.env` and set actual values for
 `TEAMMEM_GITHUB_TOKEN`, `TEAMMEM_SLACK_BOT_TOKEN`, `TEAMMEM_CONFIG_DIR`,
 `TEAMMEM_DB`, and `TEAMMEM_VAULT`. Values are literal, so use absolute paths
 rather than `~` or shell variables. Process environment values override this
-file.
+file. `teammem.env.example` in the repository root lists every supported
+variable with placeholder values.
 
 The complete provider table, current official permission links, and all runtime
 paths are in the
@@ -381,6 +382,53 @@ ledger only. GitLab group/project access-token bot accounts
 automated reviewer posts through gets its own bot identity, so a name list
 cannot keep up. List additional bot accounts with human-registerable names
 under `exclude_note_authors` under `gitlab` in `connectors.yaml`.
+
+### Meetings
+
+Meeting support is off until it is configured, and it is configured as one
+complete set: `TEAMMEM_MEETING_INBOX`, `TEAMMEM_MEETING_ARCHIVE`,
+`TEAMMEM_MEETING_QUARANTINE`, `TEAMMEM_MEETING_AUDIO_STORE`,
+`TEAMMEM_MEETING_RECEIPTS`, `TEAMMEM_MEETING_ALERTS`, and
+`TEAMMEM_VAULT_WEB_BASE`. Setting one makes all of them required; setting none
+leaves a hub that collects, renders, and publishes exactly as before. Every
+directory must be absolute, must not be nested inside another or inside the
+vault, and is created at mode 0700 — an existing group- or world-accessible one
+is refused, because bundles carry transcripts and the store carries encrypted
+recordings.
+
+```bash
+teammem process-meetings --now 2026-09-02T16:00:00Z
+teammem process-meetings --dry-run
+```
+
+One run imports every ready bundle from the meeting inbox, renders the vault,
+verifies it against the ledger, pushes, confirms the configured remote holds the
+commit, and only then writes that occurrence's receipt. It asks for no approval
+at any step. A receipt therefore means the note is published: rendered locally
+and committed locally are not receipts, and a failed run writes none.
+
+Occurrences are processed independently. A malformed bundle is quarantined with
+its reason and the next one still publishes; a refused publication leaves that
+occurrence without a receipt and retryable on the next run, without holding up
+any other meeting. The command exits `0` when everything published, `1` when a
+bundle was quarantined or a publication was refused, and `2` when the
+configuration itself is wrong. `--dry-run` reports what a real run would import
+and publish and writes nothing at all: no ledger row, no audio file, no vault
+file, no commit, no push, no receipt.
+
+`TEAMMEM_VAULT_REMOTE` and `TEAMMEM_VAULT_REF` (default `origin` and
+`refs/heads/main`) declare where receipts point. The run refuses before touching
+anything if the vault publishes somewhere else, so a receipt cannot name a
+commit on a remote nobody reads.
+
+Configuring meetings adds `teammem-meetings` and `teammem-meeting-retention`
+beside the daily job the next time the schedule is installed — publication every
+quarter hour, audio expiry an hour after the daily run. Removing the meeting
+settings and reinstalling takes both away again. The daily job's own definition
+is byte-for-byte what it always was, and `teammem run-daily` neither reads nor
+requires any meeting setting. This repository holds the generator; the
+operator's deployment overlay holds the exact deployed copy of each generated
+unit.
 
 ### Reviewed bundle inbox
 

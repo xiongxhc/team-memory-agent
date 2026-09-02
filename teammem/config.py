@@ -120,6 +120,11 @@ def read_env_file(
     return _parse_env_lines(lines, path)
 
 
+def _path(values: Mapping[str, Any], key: str) -> Path | None:
+    """An optional path setting; an empty value is unset, as everywhere else."""
+    return Path(values[key]) if values.get(key) else None
+
+
 def _integer(values: dict, key: str, default: int) -> int:
     try:
         return int(values.get(key, default))
@@ -147,6 +152,75 @@ def _bounded_integer(
     return value
 
 
+MEETING_PATH_SETTINGS = (
+    ("meeting_inbox", "TEAMMEM_MEETING_INBOX"),
+    ("meeting_archive", "TEAMMEM_MEETING_ARCHIVE"),
+    ("meeting_quarantine", "TEAMMEM_MEETING_QUARANTINE"),
+    ("meeting_audio_store", "TEAMMEM_MEETING_AUDIO_STORE"),
+    ("meeting_receipts", "TEAMMEM_MEETING_RECEIPTS"),
+    ("meeting_alerts", "TEAMMEM_MEETING_ALERTS"),
+)
+_GIT_REF = re.compile(r"refs/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+")
+_GIT_REMOTE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _nested(inner: Path, outer: Path) -> bool:
+    return inner != outer and outer in inner.parents
+
+
+def validate_meeting_settings(cfg: "Config") -> None:
+    """Meetings are one complete set of directories, or nothing at all.
+
+    A hub that never sees a meeting configures none of these and is validated as
+    it always was. Configure any one of them and every one is required, because
+    a half-configured set is how an importer ends up archiving into its own
+    inbox: the inbox is walked recursively, so an archive inside it would be
+    re-read on the next scan, and a receipt or a bundle inside the vault would be
+    published. Distinctness therefore means neither equal nor nested.
+
+    Shape only — no filesystem is touched here, so a `Config.load` on a machine
+    that has not created the directories yet still succeeds, and the daily
+    pipeline never fails on a meeting directory's permissions.
+    """
+    from .meeting_publish import validate_web_base
+
+    configured = [getattr(cfg, field) for field, _ in MEETING_PATH_SETTINGS]
+    if not any(configured) and not cfg.vault_web_base:
+        return
+
+    for field, key in MEETING_PATH_SETTINGS:
+        value = getattr(cfg, field)
+        if value is None:
+            raise ValueError(f"{key} is required once any meeting setting is set")
+        if not value.is_absolute():
+            raise ValueError(f"{key} must be an absolute path")
+        if ".." in value.parts:
+            raise ValueError(f"{key} must not contain a relative path segment")
+    if not cfg.vault_web_base:
+        raise ValueError(
+            "TEAMMEM_VAULT_WEB_BASE is required once any meeting setting is set"
+        )
+    validate_web_base(cfg.vault_web_base)
+    if not _GIT_REMOTE.fullmatch(cfg.vault_remote):
+        raise ValueError("TEAMMEM_VAULT_REMOTE must be a plain git remote name")
+    if not _GIT_REF.fullmatch(cfg.vault_ref):
+        raise ValueError("TEAMMEM_VAULT_REF must be a full ref, e.g. refs/heads/main")
+
+    named = [(key, getattr(cfg, field)) for field, key in MEETING_PATH_SETTINGS]
+    if cfg.vault_dir.is_absolute():
+        named.append(("TEAMMEM_VAULT", cfg.vault_dir))
+    for position, (key, path) in enumerate(named):
+        for other_key, other in named[position + 1:]:
+            if path == other:
+                raise ValueError(
+                    f"{key} and {other_key} name the same directory"
+                )
+            if _nested(path, other) or _nested(other, path):
+                raise ValueError(
+                    f"{key} and {other_key} must not be nested in one another"
+                )
+
+
 @dataclass
 class Config:
     db_path: Path = Path("ledger.db")
@@ -172,6 +246,21 @@ class Config:
     archive: Path | None = None
     quarantine: Path | None = None
     snapshots: Path | None = None
+    meeting_inbox: Path | None = None       # meetings: one complete set or none
+    meeting_archive: Path | None = None
+    meeting_quarantine: Path | None = None
+    meeting_audio_store: Path | None = None  # encrypted bytes only; never decrypted
+    meeting_receipts: Path | None = None     # one receipt file per occurrence
+    meeting_alerts: Path | None = None       # one operator alert file per occurrence
+    vault_web_base: str = ""     # https root of the published vault; no default
+    vault_remote: str = "origin"          # the remote a receipt's commit must reach
+    vault_ref: str = "refs/heads/main"    # and the ref on it
+
+    @property
+    def meetings_enabled(self) -> bool:
+        """`Config.load` accepts the meeting settings only as a complete set, so
+        one configured directory is the whole feature being switched on."""
+        return self.meeting_inbox is not None
 
     @classmethod
     def load(
@@ -196,7 +285,7 @@ class Config:
             windows_api=windows_api,
         )
         values.update(os.environ if env is None else env)
-        return cls(
+        cfg = cls(
             db_path=Path(values.get("TEAMMEM_DB", str(cls.db_path))),
             config_dir=Path(values.get("TEAMMEM_CONFIG_DIR", str(cls.config_dir))),
             gitlab_url=values.get("TEAMMEM_GITLAB_URL", cls.gitlab_url).rstrip("/"),
@@ -227,4 +316,16 @@ class Config:
             archive=Path(values["TEAMMEM_ARCHIVE"]) if values.get("TEAMMEM_ARCHIVE") else None,
             quarantine=Path(values["TEAMMEM_QUARANTINE"]) if values.get("TEAMMEM_QUARANTINE") else None,
             snapshots=Path(values["TEAMMEM_SNAPSHOTS"]) if values.get("TEAMMEM_SNAPSHOTS") else None,
+            meeting_inbox=_path(values, "TEAMMEM_MEETING_INBOX"),
+            meeting_archive=_path(values, "TEAMMEM_MEETING_ARCHIVE"),
+            meeting_quarantine=_path(values, "TEAMMEM_MEETING_QUARANTINE"),
+            meeting_audio_store=_path(values, "TEAMMEM_MEETING_AUDIO_STORE"),
+            meeting_receipts=_path(values, "TEAMMEM_MEETING_RECEIPTS"),
+            meeting_alerts=_path(values, "TEAMMEM_MEETING_ALERTS"),
+            vault_web_base=values.get(
+                "TEAMMEM_VAULT_WEB_BASE", cls.vault_web_base).rstrip("/"),
+            vault_remote=values.get("TEAMMEM_VAULT_REMOTE", cls.vault_remote),
+            vault_ref=values.get("TEAMMEM_VAULT_REF", cls.vault_ref),
         )
+        validate_meeting_settings(cfg)
+        return cfg

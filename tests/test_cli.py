@@ -1279,3 +1279,99 @@ def test_main_render_verify_flag(tmp_path, monkeypatch, capsys):
     assert "vault matches" in capsys.readouterr().out
     (tmp_path / "vault" / "README.md").write_text("tampered")
     assert main(["render", "--today", "2026-07-16", "--verify"]) == 1
+
+
+# --- process-meetings --------------------------------------------------------
+# The unattended command: import ready bundles, render, verify, publish strictly,
+# emit receipts. No prompt, no approval, no human in the loop.
+
+MEETING_NOW = "2026-09-02T16:00:00Z"
+MEETING_WEB_BASE = "https://git.example.com/team/team-vault"
+
+
+def _meeting_hub(tmp_path, monkeypatch):
+    """Configure a hub with a meeting inbox and a vault with a bare remote."""
+    from tests.test_meeting_publish import _vault
+    from tests.test_meeting_render import CONFIG_DIR as MEETING_CONFIG_DIR
+
+    vault, bare, branch = _vault(tmp_path)
+    inbox = tmp_path / "meeting-inbox"
+    inbox.mkdir(mode=0o700)      # the producer's drop point is private, as deployed
+    values = {
+        "TEAMMEM_DB": str(tmp_path / "ledger.db"),
+        "TEAMMEM_CONFIG_DIR": str(MEETING_CONFIG_DIR),
+        "TEAMMEM_VAULT": str(vault),
+        "TEAMMEM_MEETING_INBOX": str(inbox),
+        "TEAMMEM_MEETING_ARCHIVE": str(tmp_path / "meeting-archive"),
+        "TEAMMEM_MEETING_QUARANTINE": str(tmp_path / "meeting-quarantine"),
+        "TEAMMEM_MEETING_AUDIO_STORE": str(tmp_path / "meeting-audio"),
+        "TEAMMEM_MEETING_RECEIPTS": str(tmp_path / "meeting-receipts"),
+        "TEAMMEM_MEETING_ALERTS": str(tmp_path / "meeting-alerts"),
+        "TEAMMEM_VAULT_WEB_BASE": MEETING_WEB_BASE,
+        "TEAMMEM_VAULT_REF": f"refs/heads/{branch}",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    return vault, bare, branch, inbox
+
+
+def _drop_meeting(inbox, **kw):
+    from tests.test_meeting_bundles import write_meeting_bundle
+    from tests.test_meeting_render import _payload
+
+    payload = _payload(**kw)
+    write_meeting_bundle(inbox, payload)
+    return payload
+
+
+def test_main_process_meetings_publishes_and_prints_the_receipt_url(
+    tmp_path, monkeypatch, capsys
+):
+    _vault_dir, _bare, _branch, inbox = _meeting_hub(tmp_path, monkeypatch)
+    payload = _drop_meeting(inbox)
+
+    assert main(["process-meetings", "--now", MEETING_NOW]) == 0
+
+    out = capsys.readouterr().out
+    receipt = tmp_path / "meeting-receipts"
+    published = json.loads(next(receipt.glob("*.json")).read_text())
+    assert published["occurrence_id"] == payload["occurrence_id"]
+    assert published["markdown_url"] in out
+
+
+def test_main_process_meetings_dry_run_writes_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    _vault_dir, _bare, _branch, inbox = _meeting_hub(tmp_path, monkeypatch)
+    _drop_meeting(inbox)
+
+    assert main(["process-meetings", "--now", MEETING_NOW, "--dry-run"]) == 0
+
+    assert "dry-run" in capsys.readouterr().out
+    assert not (tmp_path / "ledger.db").exists()
+    assert not (tmp_path / "meeting-receipts").exists()
+    assert not (tmp_path / "meeting-audio").exists()
+
+
+def test_main_process_meetings_without_configuration_exits_2(
+    tmp_path, monkeypatch, capsys
+):
+    for key in ("TEAMMEM_MEETING_INBOX", "TEAMMEM_MEETING_ARCHIVE",
+                "TEAMMEM_MEETING_QUARANTINE", "TEAMMEM_MEETING_AUDIO_STORE",
+                "TEAMMEM_MEETING_RECEIPTS", "TEAMMEM_MEETING_ALERTS",
+                "TEAMMEM_VAULT_WEB_BASE"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TEAMMEM_DB", str(tmp_path / "ledger.db"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+
+    assert main(["process-meetings", "--now", MEETING_NOW]) == 2
+    assert "TEAMMEM_MEETING_INBOX" in capsys.readouterr().err
+
+
+def test_main_process_meetings_rejects_a_now_without_a_utc_offset(
+    tmp_path, monkeypatch, capsys
+):
+    _meeting_hub(tmp_path, monkeypatch)
+    assert main(["process-meetings", "--now", "2026-09-02 16:00"]) == 2
+    assert "--now" in capsys.readouterr().err
+    assert not (tmp_path / "ledger.db").exists()

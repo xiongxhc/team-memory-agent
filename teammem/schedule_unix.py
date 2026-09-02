@@ -18,6 +18,31 @@ from .schedule import ScheduleStatus
 LABEL = "org.teammem.hub-daily"
 SYSTEMD_SERVICE = "teammem-daily.service"
 SYSTEMD_TIMER = "teammem-daily.timer"
+
+# Meetings are scheduled beside the daily job, never inside it: publication is a
+# minutes-scale loop and the daily run is a once-a-day synthesis. Both backends
+# generate them, because `schedule_unix` serves macOS and Linux alike and a
+# meeting hub on macOS would otherwise be silently unscheduled.
+MEETINGS_LABEL = "org.teammem.meetings"
+RETENTION_LABEL = "org.teammem.meeting-retention"
+SYSTEMD_MEETINGS_SERVICE = "teammem-meetings.service"
+SYSTEMD_MEETINGS_TIMER = "teammem-meetings.timer"
+SYSTEMD_RETENTION_SERVICE = "teammem-meeting-retention.service"
+SYSTEMD_RETENTION_TIMER = "teammem-meeting-retention.timer"
+SYSTEMD_MEETING_UNITS = (
+    SYSTEMD_MEETINGS_SERVICE,
+    SYSTEMD_MEETINGS_TIMER,
+    SYSTEMD_RETENTION_SERVICE,
+    SYSTEMD_RETENTION_TIMER,
+)
+SYSTEMD_MEETING_TIMERS = (SYSTEMD_MEETINGS_TIMER, SYSTEMD_RETENTION_TIMER)
+MEETING_LABELS = (MEETINGS_LABEL, RETENTION_LABEL)
+# Every quarter hour: a note published within a quarter hour of the meeting is
+# still the same conversation to the people who were in it.
+MEETING_INTERVAL_MINUTES = 15
+# Audio expiry is a once-a-day boundary. An hour after the daily run keeps the
+# two off each other's vault lock without inventing an unrelated clock time.
+RETENTION_HOUR_OFFSET = 1
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -172,13 +197,53 @@ def _launchd_domain() -> str:
     return f"gui/{os.getuid()}"
 
 
-def _launchd_target() -> str:
-    return f"{_launchd_domain()}/{LABEL}"
+def _launchd_target(label: str = LABEL) -> str:
+    return f"{_launchd_domain()}/{label}"
 
 
-def _launchd_loaded(runner: Runner | None) -> bool:
-    result = _launchctl(runner, "print", _launchd_target(), check=False)
+def _launchd_loaded(runner: Runner | None, label: str = LABEL) -> bool:
+    result = _launchctl(runner, "print", _launchd_target(label), check=False)
     return result.returncode == 0
+
+
+def _retention_hour(hour: int) -> int:
+    return (hour + RETENTION_HOUR_OFFSET) % 24
+
+
+def _launchd_jobs(
+    cfg: Config, hour: int, minute: int, executable: str, state_dir: Path
+) -> list[tuple[str, bytes]]:
+    """The launchd definitions this configuration asks for, daily first.
+
+    The daily payload is spelled exactly as it always was; the meeting jobs are
+    additions beside it, each with its own log pair so one job's output never
+    explains another's.
+    """
+    def arguments(command: str) -> list[str]:
+        return [executable, "--env-file", str(cfg.env_file), command]
+
+    def payload(label: str, command: str, log: str, schedule: dict) -> dict:
+        return {
+            "Label": label,
+            "ProgramArguments": arguments(command),
+            "RunAtLoad": False,
+            "StandardErrorPath": str(state_dir / f"{log}.err"),
+            "StandardOutPath": str(state_dir / f"{log}.log"),
+            **schedule,
+        }
+
+    jobs = [(LABEL, payload(
+        LABEL, "run-daily", "schedule",
+        {"StartCalendarInterval": {"Hour": hour, "Minute": minute}}))]
+    if cfg.meetings_enabled:
+        jobs.append((MEETINGS_LABEL, payload(
+            MEETINGS_LABEL, "process-meetings", "schedule-meetings",
+            {"StartInterval": MEETING_INTERVAL_MINUTES * 60})))
+        jobs.append((RETENTION_LABEL, payload(
+            RETENTION_LABEL, "expire-meeting-audio", "schedule-meeting-retention",
+            {"StartCalendarInterval": {"Hour": _retention_hour(hour),
+                                       "Minute": minute}})))
+    return [(label, plistlib.dumps(data, sort_keys=True)) for label, data in jobs]
 
 
 def _install_launchd(
@@ -195,46 +260,52 @@ def _install_launchd(
         state_fd = _open_directory(state_dir, create=True, private=True)
         assert state_fd is not None
         os.close(state_fd)
+    jobs = _launchd_jobs(cfg, hour, minute, executable, state_dir)
+    wanted = {label for label, _ in jobs}
     with _locked_directory(path.parent, True) as directory_fd:
         assert directory_fd is not None
-        previous = _read_definition(directory_fd, path.name)
-        payload = {
-            "Label": LABEL,
-            "ProgramArguments": [
-                executable, "--env-file", str(cfg.env_file), "run-daily"
-            ],
-            "RunAtLoad": False,
-            "StandardErrorPath": str(state_dir / "schedule.err"),
-            "StandardOutPath": str(state_dir / "schedule.log"),
-            "StartCalendarInterval": {"Hour": hour, "Minute": minute},
-        }
-        definition = plistlib.dumps(payload, sort_keys=True)
-        was_loaded = _launchd_loaded(runner)
-        if was_loaded and previous is None:
-            raise RuntimeError(
-                "cannot replace loaded launchd schedule without its definition"
-            )
-        if was_loaded:
-            _launchctl(runner, "bootout", _launchd_target(), check=True)
+        names = [f"{label}.plist" for label in (LABEL, *MEETING_LABELS)]
+        previous = _snapshot_files(directory_fd, names)
+        # A meeting job that this configuration no longer wants but that a
+        # previous install left behind is removed here: a timer still firing a
+        # command the hub now refuses is worse than no timer.
+        stale = [label for label in MEETING_LABELS
+                 if label not in wanted and previous[f"{label}.plist"] is not None]
+        loaded: dict[str, bool] = {}
+        for label, _definition in jobs:
+            was_loaded = _launchd_loaded(runner, label)
+            loaded[label] = was_loaded
+            if was_loaded and previous[f"{label}.plist"] is None:
+                raise RuntimeError(
+                    "cannot replace loaded launchd schedule without its definition"
+                )
+            if was_loaded:
+                _launchctl(runner, "bootout", _launchd_target(label), check=True)
         try:
-            _write_atomic(directory_fd, path.name, definition)
-            _launchctl(runner, "bootstrap", _launchd_domain(), str(path), check=True)
+            for label, definition in jobs:
+                name = f"{label}.plist"
+                _write_atomic(directory_fd, name, definition)
+                _launchctl(runner, "bootstrap", _launchd_domain(),
+                           str(path.parent / name), check=True)
+            for label in stale:
+                if _launchd_loaded(runner, label):
+                    _launchctl(runner, "bootout", _launchd_target(label), check=True)
+                _unlink_durable(directory_fd, f"{label}.plist")
         except Exception as failure:
             try:
-                if previous is None:
-                    _unlink_durable(directory_fd, path.name)
-                else:
-                    _write_atomic(directory_fd, path.name, previous)
-                if was_loaded:
-                    _launchctl(
-                        runner, "bootstrap", _launchd_domain(), str(path),
-                        check=True
-                    )
+                _restore_files(directory_fd, previous)
+                for label, was_loaded in loaded.items():
+                    if was_loaded:
+                        _launchctl(
+                            runner, "bootstrap", _launchd_domain(),
+                            str(path.parent / f"{label}.plist"), check=True
+                        )
             except Exception as rollback_failure:
                 raise RuntimeError(
                     "launchd schedule installation failed and rollback failed"
                 ) from rollback_failure
-            restored = "previous schedule" if previous is not None else "previous state"
+            restored = ("previous schedule" if previous[path.name] is not None
+                        else "previous state")
             raise RuntimeError(
                 f"launchd schedule installation failed; {restored} restored"
             ) from failure
@@ -257,19 +328,29 @@ def _systemd_quote(argument: str) -> str:
     return f'"{escaped}"'
 
 
-def _systemd_state(runner: Runner | None) -> tuple[bool, bool]:
+def _timer_state(runner: Runner | None, timer: str) -> tuple[bool, bool]:
     return (
-        _systemctl(runner, "is-enabled", SYSTEMD_TIMER, check=False).returncode == 0,
-        _systemctl(runner, "is-active", SYSTEMD_TIMER, check=False).returncode == 0,
+        _systemctl(runner, "is-enabled", timer, check=False).returncode == 0,
+        _systemctl(runner, "is-active", timer, check=False).returncode == 0,
     )
 
 
-def _restore_systemd_state(runner: Runner | None, state: tuple[bool, bool]) -> None:
+def _restore_timer_state(
+    runner: Runner | None, timer: str, state: tuple[bool, bool]
+) -> None:
     actions = (("enable", "disable"), ("start", "stop"))
     for current, (yes, no) in zip(state, actions):
-        _systemctl(runner, yes if current else no, SYSTEMD_TIMER, check=True)
-    if _systemd_state(runner) != state:
+        _systemctl(runner, yes if current else no, timer, check=True)
+    if _timer_state(runner, timer) != state:
         raise RuntimeError("restored systemd manager state could not be verified")
+
+
+def _systemd_state(runner: Runner | None) -> tuple[bool, bool]:
+    return _timer_state(runner, SYSTEMD_TIMER)
+
+
+def _restore_systemd_state(runner: Runner | None, state: tuple[bool, bool]) -> None:
+    _restore_timer_state(runner, SYSTEMD_TIMER, state)
 
 
 def _reload_systemd(runner: Runner | None) -> None:
@@ -286,6 +367,49 @@ def _restore_files(directory_fd: int, snapshot: dict[str, bytes | None]) -> None
             _unlink_durable(directory_fd, name)
         else:
             _write_atomic(directory_fd, name, previous)
+
+
+def _meeting_unit_text(
+    cfg: Config, hour: int, minute: int, executable: str
+) -> dict[str, bytes]:
+    """The four meeting units, or nothing when the hub processes no meetings."""
+    if not cfg.meetings_enabled:
+        return {}
+
+    def service(description: str, command: str) -> bytes:
+        return f"""[Unit]
+Description={description}
+
+[Service]
+Type=oneshot
+ExecStart={_systemd_exec([executable, "--env-file", str(cfg.env_file), command])}
+""".encode()
+
+    def timer(description: str, calendar: str, unit: str) -> bytes:
+        return f"""[Unit]
+Description={description}
+
+[Timer]
+OnCalendar={calendar}
+Persistent=true
+Unit={unit}
+
+[Install]
+WantedBy=timers.target
+""".encode()
+
+    publish = "Publish Team Memory Agent meeting notes"
+    expire = "Expire Team Memory Agent meeting audio"
+    return {
+        SYSTEMD_MEETINGS_SERVICE: service(publish, "process-meetings"),
+        SYSTEMD_MEETINGS_TIMER: timer(
+            publish, f"*-*-* *:00/{MEETING_INTERVAL_MINUTES:02d}:00",
+            SYSTEMD_MEETINGS_SERVICE),
+        SYSTEMD_RETENTION_SERVICE: service(expire, "expire-meeting-audio"),
+        SYSTEMD_RETENTION_TIMER: timer(
+            expire, f"*-*-* {_retention_hour(hour):02d}:{minute:02d}:00",
+            SYSTEMD_RETENTION_SERVICE),
+    }
 
 
 def _install_systemd(
@@ -318,20 +442,43 @@ Unit={SYSTEMD_SERVICE}
 [Install]
 WantedBy=timers.target
 """
+    meetings = _meeting_unit_text(cfg, hour, minute, executable)
     with _locked_directory(service_path.parent, True) as directory_fd:
         assert directory_fd is not None
-        previous = _snapshot_files(directory_fd, [SYSTEMD_SERVICE, SYSTEMD_TIMER])
+        previous = _snapshot_files(
+            directory_fd, [SYSTEMD_SERVICE, SYSTEMD_TIMER, *SYSTEMD_MEETING_UNITS])
         previous_state = _systemd_state(runner)
+        # Meeting timer state is read only when there is a meeting unit to write
+        # or an abandoned one to take away, so a hub without meetings issues
+        # exactly the systemctl calls it always did.
+        stale = [name for name in SYSTEMD_MEETING_UNITS
+                 if not meetings and previous[name] is not None]
+        meeting_state = (
+            {name: _timer_state(runner, name) for name in SYSTEMD_MEETING_TIMERS}
+            if meetings or stale else {}
+        )
         try:
             _write_atomic(directory_fd, SYSTEMD_SERVICE, service.encode())
             _write_atomic(directory_fd, SYSTEMD_TIMER, timer.encode())
+            for name, definition in meetings.items():
+                _write_atomic(directory_fd, name, definition)
+            for name in SYSTEMD_MEETING_TIMERS:
+                if name in stale:
+                    _systemctl(runner, "disable", "--now", name, check=False)
+            for name in stale:
+                _unlink_durable(directory_fd, name)
             _reload_systemd(runner)
             _systemctl(runner, "enable", "--now", SYSTEMD_TIMER, check=True)
+            for name in SYSTEMD_MEETING_TIMERS:
+                if name in meetings:
+                    _systemctl(runner, "enable", "--now", name, check=True)
         except Exception as failure:
             try:
                 _restore_files(directory_fd, previous)
                 _reload_systemd(runner)
                 _restore_systemd_state(runner, previous_state)
+                for name, state in meeting_state.items():
+                    _restore_timer_state(runner, name, state)
             except Exception as rollback_failure:
                 raise RuntimeError(
                     "systemd schedule installation failed and rollback failed"
@@ -570,28 +717,43 @@ def remove_schedule(
         path = _launchd_path(agents_dir)
         with _locked_directory(path.parent, True) as directory_fd:
             assert directory_fd is not None
-            previous = _read_definition(directory_fd, path.name)
+            names = [f"{label}.plist" for label in (LABEL, *MEETING_LABELS)]
+            snapshot = _snapshot_files(directory_fd, names)
+            previous = snapshot[path.name]
             was_loaded = _launchd_loaded(runner)
-            if previous is None:
+            # Removing the schedule removes the meeting jobs with it; leaving a
+            # meeting timer behind would keep firing after the operator was told
+            # the schedule was gone.
+            extras = [label for label in MEETING_LABELS
+                      if snapshot[f"{label}.plist"] is not None]
+            if previous is None and not extras:
                 if not was_loaded:
                     return False
                 _launchctl(runner, "bootout", _launchd_target(), check=True)
                 return True
+            loaded = {LABEL: was_loaded}
             try:
                 if was_loaded:
                     _launchctl(runner, "bootout", _launchd_target(), check=True)
                 _unlink_durable(directory_fd, path.name)
+                for label in extras:
+                    loaded[label] = _launchd_loaded(runner, label)
+                    if loaded[label]:
+                        _launchctl(runner, "bootout", _launchd_target(label),
+                                   check=True)
+                    _unlink_durable(directory_fd, f"{label}.plist")
             except Exception as failure:
                 try:
-                    _write_atomic(directory_fd, path.name, previous)
-                    if was_loaded:
-                        _launchctl(
-                            runner,
-                            "bootstrap",
-                            _launchd_domain(),
-                            str(path),
-                            check=True,
-                        )
+                    _restore_files(directory_fd, snapshot)
+                    for label, active in loaded.items():
+                        if active:
+                            _launchctl(
+                                runner,
+                                "bootstrap",
+                                _launchd_domain(),
+                                str(path.parent / f"{label}.plist"),
+                                check=True,
+                            )
                 except Exception as rollback_failure:
                     rollback_failure.__context__ = failure
                     raise RuntimeError(
@@ -607,8 +769,17 @@ def remove_schedule(
     service_path, timer_path = _systemd_paths(systemd_dir)
     with _locked_directory(service_path.parent, True) as directory_fd:
         assert directory_fd is not None
-        previous = _snapshot_files(directory_fd, [SYSTEMD_SERVICE, SYSTEMD_TIMER])
+        previous = _snapshot_files(
+            directory_fd, [SYSTEMD_SERVICE, SYSTEMD_TIMER, *SYSTEMD_MEETING_UNITS])
         previous_state = _systemd_state(runner)
+        # Removing the schedule removes the meeting units with it; a meeting
+        # timer left enabled would keep firing after the operator was told the
+        # schedule was gone.
+        extras = [name for name in SYSTEMD_MEETING_UNITS if previous[name] is not None]
+        meeting_state = (
+            {name: _timer_state(runner, name) for name in SYSTEMD_MEETING_TIMERS}
+            if extras else {}
+        )
         if all(value is None for value in previous.values()) and not any(previous_state):
             return False
         try:
@@ -617,14 +788,21 @@ def remove_schedule(
                 _systemctl(runner, "disable", SYSTEMD_TIMER, check=True)
             if active:
                 _systemctl(runner, "stop", SYSTEMD_TIMER, check=True)
+            for name in SYSTEMD_MEETING_TIMERS:
+                if name in extras:
+                    _systemctl(runner, "disable", "--now", name, check=False)
             _unlink_durable(directory_fd, SYSTEMD_TIMER)
             _unlink_durable(directory_fd, SYSTEMD_SERVICE)
+            for name in extras:
+                _unlink_durable(directory_fd, name)
             _reload_systemd(runner)
         except Exception as failure:
             try:
                 _restore_files(directory_fd, previous)
                 _reload_systemd(runner)
                 _restore_systemd_state(runner, previous_state)
+                for name, state in meeting_state.items():
+                    _restore_timer_state(runner, name, state)
             except Exception as rollback_failure:
                 raise RuntimeError(
                     "systemd schedule removal failed and rollback failed"

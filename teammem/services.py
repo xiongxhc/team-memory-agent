@@ -2,7 +2,9 @@
 
 import json
 import os
+import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -10,19 +12,28 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import Config
+from .config import MEETING_PATH_SETTINGS, Config, validate_meeting_settings
 from .connectors.base import CollectionResult, Connector
 from .connectors.config import ConnectorSettings
 from .connectors.registry import get_connector
 from .docs_sync import sync_docs
 from .events import Event
 from .identity import IdentityMaps, _read
+from .meeting_bundles import occurrence_path_segment
+from .meeting_importer import MeetingImportResult, import_meeting_inbox
+from .meeting_publish import PublishRefused, publish_meeting
+from .meeting_store import list_meetings
 from .queries import report_context, week_label, week_monday
 from .reclaim import reclaim, reclaim_channel_projects
-from .render import render_vault, verify_vault
+# `_managed_files` is the one definition of what the renderer owns and
+# `_upstream` the one definition of where a vault publishes. Spelling either a
+# second time here is how two answers to one question drift apart; Task 6 imports
+# `render._meeting_facts` across the same boundary for the same reason.
+from .render import MANAGED, render_vault, verify_vault
+from .render import _managed_files as managed_vault_files
 from .slices import active_person_days
 from .store import get_summary, insert_events, open_db, reconcile_gitlab_events
 from .summarize import (
@@ -44,7 +55,9 @@ from .telemetry import (
     distribution,
     noop_reporter,
 )
-from .vaultgit import commit_all, ensure_repo, push
+from .vaultgit import (PushNotVerified, commit_all, ensure_repo,
+                       head_commit, push)
+from .vaultgit import _upstream as vault_upstream
 
 
 @dataclass(frozen=True)
@@ -710,3 +723,258 @@ def run_report(
         f" from {len(dailies)} dailies (model {cfg.llm_report_model})"
     )
     return 0
+
+
+# --- meetings ----------------------------------------------------------------
+# `process-meetings` is the unattended path: ready bundles in, receipts out, no
+# approval anywhere in it. Every occurrence is processed on its own, so one bad
+# bundle and one refused publication cost exactly one meeting.
+
+@dataclass(frozen=True)
+class MeetingFailure:
+    occurrence_id: str
+    stage: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class MeetingRunResult:
+    imported: MeetingImportResult
+    receipts: tuple[dict, ...] = ()
+    refused: tuple[MeetingFailure, ...] = ()
+    pending: tuple[str, ...] = ()      # dry run: what a real run would publish
+
+    @property
+    def published(self) -> tuple[str, ...]:
+        return tuple(receipt["occurrence_id"] for receipt in self.receipts)
+
+    @property
+    def exit_code(self) -> int:
+        """A quarantined bundle is a failure too: the producer must see it."""
+        return int(bool(self.refused or self.imported.quarantined))
+
+
+def meeting_receipt_path(cfg: Config, occurrence_id: str) -> Path:
+    """The one receipt file for an occurrence. Its presence is the publication."""
+    return cfg.meeting_receipts / f"{occurrence_path_segment(occurrence_id)}.json"
+
+
+def meeting_alert_path(cfg: Config, occurrence_id: str) -> Path:
+    """The one operator-alert file for an occurrence, for retention warnings."""
+    return cfg.meeting_alerts / f"{occurrence_path_segment(occurrence_id)}.json"
+
+
+def prepare_meeting_dirs(cfg: Config, *, create: bool = True) -> None:
+    """Create the meeting directories privately, or refuse an exposed one.
+
+    Meeting bundles carry transcripts and the audio store carries recordings, so
+    none of these may be group- or world-accessible. They are created here at
+    0700 rather than left to the importer, which would otherwise make them with
+    the process umask and fail this check on the next run.
+    """
+    for field, key in MEETING_PATH_SETTINGS:
+        path = getattr(cfg, field)
+        if path.is_symlink():
+            raise ValueError(f"{key} must not be a symlink: {path}")
+        if not path.exists():
+            if not create:
+                continue
+            path.mkdir(parents=True, exist_ok=True)
+            os.chmod(path, 0o700)
+        if not path.is_dir():
+            raise ValueError(f"{key} must be a directory: {path}")
+        if stat.S_IMODE(path.stat().st_mode) & 0o077:
+            raise ValueError(
+                f"{key} must not be group- or world-accessible: {path}"
+            )
+
+
+def _check_publication_target(cfg: Config) -> None:
+    """The vault must publish to the remote and ref the receipts will name.
+
+    A receipt says "this commit is on the Team Vault". A vault quietly tracking
+    some other remote would make that sentence false while every git command
+    still succeeded, so the declared target is checked once per run.
+    """
+    try:
+        remote, ref, _branch = vault_upstream(cfg.vault_dir)
+    except (PushNotVerified, subprocess.CalledProcessError) as failure:
+        raise ValueError(
+            f"the vault at {cfg.vault_dir} has no publication target: {failure}"
+        ) from failure
+    if (remote, ref) != (cfg.vault_remote, cfg.vault_ref):
+        raise ValueError(
+            f"the vault publishes to {remote} {ref}, but TEAMMEM_VAULT_REMOTE and "
+            f"TEAMMEM_VAULT_REF declare {cfg.vault_remote} {cfg.vault_ref}"
+        )
+
+
+def _utc_day(now: str) -> date:
+    moment = datetime.fromisoformat(now.replace("Z", "+00:00"))
+    if moment.tzinfo is None:
+        raise ValueError("--now must carry a UTC offset, e.g. 2026-09-02T16:00:00Z")
+    return moment.astimezone(timezone.utc).date()
+
+
+def _receipt_is_current(path: Path, meeting: dict) -> bool:
+    """Has this exact revision already been published? Anything unreadable,
+    unparseable or stale is republished rather than trusted."""
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(receipt, dict)
+        and receipt.get("status") == "published"
+        and receipt.get("revision") == meeting["current_revision"]
+        and receipt.get("artifact_hash") == meeting["artifact_hash"]
+    )
+
+
+def _vault_head(vault_dir: Path) -> str | None:
+    """HEAD, or None for a repository that has never committed."""
+    try:
+        return head_commit(vault_dir)
+    except subprocess.CalledProcessError:
+        return None
+
+
+def _managed_snapshot(vault_dir: Path) -> dict[str, bytes]:
+    return {rel: (vault_dir / rel).read_bytes()
+            for rel in managed_vault_files(vault_dir)}
+
+
+def _restore_managed(vault_dir: Path, snapshot: dict[str, bytes]) -> None:
+    """Put the vault's managed projection back exactly as it was.
+
+    `publish_meeting` renders before it verifies, so a refusal at the verify gate
+    leaves the rejected content in the working tree, where the next `commit_all`
+    — this command's or the daily run's — would commit and push exactly what the
+    gate rejected. Restoring the snapshot is the same wipe-and-rewrite
+    `render_vault` performs, so it touches only what the renderer owns and leaves
+    `Docs/` and every other operator input alone.
+
+    The caller restores only when HEAD did not move, so this never runs against
+    content a refused attempt had already committed, where deleting the working
+    copy would stage a deletion instead of undoing a write.
+    """
+    for name in MANAGED:
+        path = vault_dir / name
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    for rel, blob in snapshot.items():
+        path = vault_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(blob)
+
+
+def execute_process_meetings(
+    cfg: Config,
+    ids: IdentityMaps,
+    *,
+    now: str,
+    conn: sqlite3.Connection,
+    dry_run: bool = False,
+    weeks: int = 4,
+    channel_names: dict | None = None,
+) -> MeetingRunResult:
+    """Import every ready bundle, then publish every occurrence without a receipt.
+
+    Each occurrence is independent: a refusal is recorded and the loop continues,
+    so one malformed bundle or one unreachable remote cannot keep another
+    meeting's note out of the vault.
+    """
+    today = _utc_day(now)
+    imported = import_meeting_inbox(
+        conn, cfg.meeting_inbox, cfg.meeting_archive, cfg.meeting_quarantine,
+        cfg.meeting_audio_store, now=now, dry_run=dry_run,
+    )
+    unpublished = [
+        meeting["occurrence_id"] for meeting in list_meetings(conn)
+        if not _receipt_is_current(
+            meeting_receipt_path(cfg, meeting["occurrence_id"]), meeting)
+    ]
+    if dry_run:
+        return MeetingRunResult(imported=imported, pending=tuple(unpublished))
+
+    receipts: list[dict] = []
+    refused: list[MeetingFailure] = []
+    for occurrence_id in unpublished:
+        head = _vault_head(cfg.vault_dir)
+        snapshot = _managed_snapshot(cfg.vault_dir)
+        try:
+            receipts.append(publish_meeting(
+                conn, ids, cfg.vault_dir, today,
+                occurrence_id=occurrence_id,
+                receipt_path=meeting_receipt_path(cfg, occurrence_id),
+                web_base=cfg.vault_web_base, weeks=weeks,
+                channel_names=channel_names,
+            ))
+        except PublishRefused as refusal:
+            # An unmoved HEAD is the proof that nothing this attempt rendered was
+            # committed, whatever stage it stopped at, so the working tree — and
+            # only the working tree — has to be put back.
+            if _vault_head(cfg.vault_dir) == head:
+                _restore_managed(cfg.vault_dir, snapshot)
+            refused.append(MeetingFailure(
+                occurrence_id, refusal.stage, redact_secrets(refusal, cfg)))
+    return MeetingRunResult(
+        imported=imported, receipts=tuple(receipts), refused=tuple(refused))
+
+
+def run_process_meetings(
+    cfg: Config,
+    ids: IdentityMaps,
+    *,
+    now: str,
+    dry_run: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """CLI entry: 0 clean, 1 something failed and is retryable, 2 misconfigured."""
+    try:
+        _utc_day(now)
+        validate_meeting_settings(cfg)
+        if not cfg.meetings_enabled:
+            raise ValueError(
+                "TEAMMEM_MEETING_INBOX is not set; this hub processes no meetings"
+            )
+        prepare_meeting_dirs(cfg, create=not dry_run)
+        if not dry_run:
+            ensure_repo(cfg.vault_dir)
+        if (cfg.vault_dir / ".git").is_dir():
+            _check_publication_target(cfg)
+    except ValueError as failure:
+        print(f"error: {redact_secrets(failure, cfg)}", file=sys.stderr)
+        return 2
+
+    prefix = "dry-run: " if dry_run else ""
+    if conn is not None:
+        connection = conn
+    elif dry_run and not cfg.db_path.exists():
+        connection = open_db(Path(":memory:"))   # classify without creating a ledger
+    else:
+        connection = open_db(cfg.db_path)
+    result = execute_process_meetings(
+        cfg, ids, now=now, conn=connection, dry_run=dry_run)
+
+    imported = result.imported
+    print(
+        f"{prefix}meetings: accepted={imported.accepted} "
+        f"unchanged={imported.unchanged} activated={imported.activated} "
+        f"quarantined={imported.quarantined}"
+    )
+    for name, outcome, reason in imported.details:
+        if outcome == "quarantined":
+            print(f"{prefix}quarantined {name}: {reason}", file=sys.stderr)
+    for occurrence_id in result.pending:
+        print(f"{prefix}would publish {occurrence_id}")
+    for receipt in result.receipts:
+        print(f"published {receipt['occurrence_id']} -> {receipt['markdown_url']}")
+    for failure in result.refused:
+        print(
+            f"REFUSED {failure.occurrence_id} at {failure.stage}: {failure.detail}",
+            file=sys.stderr,
+        )
+    return result.exit_code

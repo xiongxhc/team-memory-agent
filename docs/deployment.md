@@ -122,6 +122,8 @@ Process environment values override file values for one run.
 | `TEAMMEM_SINCE_DAYS` | Optional | Connector lookback; default is 7 |
 | `TEAMMEM_INBOX`, `TEAMMEM_ARCHIVE`, `TEAMMEM_QUARANTINE` | Optional as one complete set | Import an already-exported MemberKit inbox and retain accepted/rejected files |
 | `TEAMMEM_SNAPSHOTS` | Optional | Daily SQLite backup directory; newest 14 are retained |
+| `TEAMMEM_MEETING_INBOX`, `TEAMMEM_MEETING_ARCHIVE`, `TEAMMEM_MEETING_QUARANTINE`, `TEAMMEM_MEETING_AUDIO_STORE`, `TEAMMEM_MEETING_RECEIPTS`, `TEAMMEM_MEETING_ALERTS`, `TEAMMEM_VAULT_WEB_BASE` | Optional as one complete set | Enable meetings: import `teammem-meeting/v1` bundles, hold encrypted audio, and emit one receipt per published occurrence. Absolute, distinct, non-nested directories, outside the vault, created at 0700; a group- or world-accessible one is refused. `TEAMMEM_VAULT_WEB_BASE` is the vault's absolute `https` repository root, with no view path, query, fragment, or credentials |
+| `TEAMMEM_VAULT_REMOTE`, `TEAMMEM_VAULT_REF` | Optional | Remote and ref a meeting receipt's commit must reach; default `origin` and `refs/heads/main`. A vault publishing elsewhere is refused before anything is rendered |
 | `TEAMMEM_OBSIDIAN_PROJECTS` | Optional | Source directory for project-document synchronization |
 | `TEAMMEM_PUSH` | Optional | Best-effort Git push of the rendered vault when true |
 | `ANTHROPIC_API_KEY` | Optional | Enables journal and weekly-report synthesis |
@@ -283,10 +285,24 @@ The schedule's invocation contains only the resolved `teammem` executable,
 remain in the separately protected environment file and are never copied into a
 launchd, systemd, or Windows Task Scheduler definition.
 
-The built-in definition always invokes the full `run-daily` command and installs
-only one daily job. Extra intraday capture triggers are optional, explicit
-operator-owned scheduler entries whose action includes `run-daily
---capture-only`; rerunning `teammem schedule install` does not create them.
+The daily definition always invokes the full `run-daily` command, and a hub with
+no meeting configuration installs that one job and nothing else. Extra intraday
+capture triggers are optional, explicit operator-owned scheduler entries whose
+action includes `run-daily --capture-only`; rerunning `teammem schedule install`
+does not create them.
+
+A hub configured for meetings gets two further jobs beside the daily one:
+`teammem-meetings` runs `process-meetings` every fifteen minutes, and
+`teammem-meeting-retention` runs `expire-meeting-audio` one hour after the daily
+run. They are generated only while the meeting settings are present — remove the
+settings and reinstall and both are disabled and deleted. The daily unit's own
+bytes do not change either way, so an existing daily schedule keeps running
+exactly as it was.
+
+This repository holds the generator, not the deployed artifact. The operator's
+deployment overlay keeps the exact deployed copy of every generated unit, so the
+file on the host and the file under version control can be diffed against each
+other.
 
 Polling needs outbound provider HTTPS access and Git access when the operator
 performs inbox or vault transport. It opens no inbound public port.
@@ -297,6 +313,8 @@ On an always-on Mac mini, installation writes and loads this user LaunchAgent:
 
 ```text
 ~/Library/LaunchAgents/org.teammem.hub-daily.plist
+~/Library/LaunchAgents/org.teammem.meetings.plist          # meetings configured only
+~/Library/LaunchAgents/org.teammem.meeting-retention.plist
 ```
 
 Its output files are:
@@ -343,6 +361,10 @@ Installation writes and enables these user units:
 ```text
 ~/.config/systemd/user/teammem-daily.service
 ~/.config/systemd/user/teammem-daily.timer
+~/.config/systemd/user/teammem-meetings.service        # meetings configured only
+~/.config/systemd/user/teammem-meetings.timer
+~/.config/systemd/user/teammem-meeting-retention.service
+~/.config/systemd/user/teammem-meeting-retention.timer
 ```
 
 On an unattended server or VPS, an administrator must enable lingering for the

@@ -707,3 +707,357 @@ def test_render_service_verify_rejects_push_and_dry_run(tmp_path, capsys):
                       push_requested=True) == 2
     assert run_render(cfg, ids, today=date(2026, 7, 16), verify=True,
                       dry_run=True) == 2
+
+
+# --- meetings: import, publish, receipt --------------------------------------
+# One `teammem process-meetings` run takes ready bundles from the meeting inbox
+# to a receipt without a human in the loop. Every remote here is a local bare
+# repository under tmp_path, pushed to for real.
+
+import hashlib
+import os
+import shutil
+import sqlite3
+
+import pytest
+
+from teammem import render as render_module
+from teammem import services as services_module
+from teammem.meeting_bundles import occurrence_path_segment
+from teammem.meeting_publish import PublishRefused
+from teammem.meeting_store import get_meeting, list_meetings
+from teammem.services import (
+    MeetingRunResult,
+    execute_process_meetings,
+    meeting_alert_path,
+    meeting_receipt_path,
+    run_process_meetings,
+)
+from teammem.vaultgit import commit_all
+from tests.test_meeting_bundles import write_meeting_bundle
+from tests.test_meeting_publish import _git, _remote_ref, _vault
+from tests.test_meeting_render import CONFIG_DIR as MEETING_CONFIG_DIR
+from tests.test_meeting_render import _payload
+
+MEETING_NOW = "2026-09-02T16:00:00Z"
+MEETING_WEB_BASE = "https://git.example.com/team/team-vault"
+OTHER_DAY = "2026-09-01"
+
+
+class _Bench:
+    """A configured hub with a meeting inbox and a vault with a bare remote."""
+
+    def __init__(self, tmp_path, branch, vault, bare, cfg):
+        self.tmp_path = tmp_path
+        self.branch = branch
+        self.vault = vault
+        self.bare = bare
+        self.cfg = cfg
+        self.ids = IdentityMaps.load(MEETING_CONFIG_DIR)
+
+    def drop(self, payload, **kw):
+        return write_meeting_bundle(self.cfg.meeting_inbox, payload, **kw)
+
+    def receipt(self, occurrence_id):
+        return meeting_receipt_path(self.cfg, occurrence_id)
+
+    def run(self, *, now=MEETING_NOW, dry_run=False):
+        return run_process_meetings(self.cfg, self.ids, now=now, dry_run=dry_run)
+
+    def managed(self):
+        """Every managed vault file and its bytes — the projection render owns."""
+        found = {}
+        for name in render_module.MANAGED:
+            path = self.vault / name
+            if path.is_dir():
+                found.update({
+                    child.relative_to(self.vault).as_posix(): child.read_bytes()
+                    for child in path.rglob("*") if child.is_file()
+                })
+            elif path.is_file():
+                found[name] = path.read_bytes()
+        return found
+
+
+@pytest.fixture
+def bench(tmp_path):
+    vault, bare, branch = _vault(tmp_path)
+    inbox = tmp_path / "meeting-inbox"
+    inbox.mkdir(mode=0o700)      # the producer's drop point is private, as deployed
+    cfg = Config.load(env={
+        "TEAMMEM_DB": str(tmp_path / "ledger.db"),
+        "TEAMMEM_CONFIG_DIR": str(MEETING_CONFIG_DIR),
+        "TEAMMEM_VAULT": str(vault),
+        "TEAMMEM_MEETING_INBOX": str(inbox),
+        "TEAMMEM_MEETING_ARCHIVE": str(tmp_path / "meeting-archive"),
+        "TEAMMEM_MEETING_QUARANTINE": str(tmp_path / "meeting-quarantine"),
+        "TEAMMEM_MEETING_AUDIO_STORE": str(tmp_path / "meeting-audio"),
+        "TEAMMEM_MEETING_RECEIPTS": str(tmp_path / "meeting-receipts"),
+        "TEAMMEM_MEETING_ALERTS": str(tmp_path / "meeting-alerts"),
+        "TEAMMEM_VAULT_WEB_BASE": MEETING_WEB_BASE,
+        "TEAMMEM_VAULT_REF": f"refs/heads/{branch}",
+    })
+    return _Bench(tmp_path, branch, vault, bare, cfg)
+
+
+def test_process_meetings_imports_renders_and_publishes_without_approval(bench):
+    payload = _payload()
+    bench.drop(payload)
+
+    assert bench.run() == 0
+
+    receipt = json.loads(bench.receipt(payload["occurrence_id"]).read_text())
+    assert receipt["status"] == "published"
+    assert receipt["occurrence_id"] == payload["occurrence_id"]
+    assert receipt["markdown_url"].startswith(MEETING_WEB_BASE + "/-/blob/")
+    # the receipt is a claim about the remote, so ask the remote
+    assert _remote_ref(bench.bare, bench.branch) == receipt["vault_commit"]
+    assert subprocess.run(
+        ["git", "-C", str(bench.bare), "cat-file", "-e",
+         f"{receipt['vault_commit']}:{receipt['markdown_path']}"],
+    ).returncode == 0
+    # and the ledger and the audio store hold the imported revision
+    assert list_meetings(open_db(bench.cfg.db_path))[0]["occurrence_id"] == (
+        payload["occurrence_id"])
+    assert list(bench.cfg.meeting_audio_store.rglob("audio.enc"))
+    assert not list(bench.cfg.meeting_inbox.rglob("meeting.json"))   # consumed
+
+
+def test_a_second_run_republishes_nothing_and_reissues_no_commit(
+    bench, monkeypatch
+):
+    """A current receipt is the record of publication, so the second run does no
+    work at all: `publish_meeting` re-renders and re-sweeps the whole vault, and
+    that cost grows with every meeting the ledger has ever held."""
+    payload = _payload()
+    bench.drop(payload)
+    assert bench.run() == 0
+    first = bench.receipt(payload["occurrence_id"]).read_bytes()
+    commits = _git(bench.vault, "rev-list", "--count", "HEAD")
+
+    calls = []
+    published = services_module.publish_meeting
+    monkeypatch.setattr(services_module, "publish_meeting",
+                        lambda *a, **kw: calls.append(kw["occurrence_id"])
+                        or published(*a, **kw))
+
+    assert bench.run() == 0
+    assert calls == []                             # nothing was re-rendered
+    assert bench.receipt(payload["occurrence_id"]).read_bytes() == first
+    assert _git(bench.vault, "rev-list", "--count", "HEAD") == commits
+
+
+def test_a_malformed_bundle_does_not_block_a_valid_occurrence(bench):
+    good = _payload()
+    bad = _payload(day=OTHER_DAY)
+    bench.drop(good)
+    broken = bench.drop(bad)
+    (broken / "meeting.json").write_text("{not json", encoding="utf-8")
+
+    assert bench.run() == 1                       # the run reports the bad bundle
+
+    assert bench.receipt(good["occurrence_id"]).exists()
+    assert not bench.receipt(bad["occurrence_id"]).exists()
+    assert list(bench.cfg.meeting_quarantine.rglob("*.reason.json"))
+
+
+def test_one_failed_receipt_leaves_it_retryable_and_publishes_the_other(bench):
+    first = _payload(day=OTHER_DAY)               # earlier: published first
+    second = _payload()
+    bench.drop(first)
+    bench.drop(second)
+    # a real receipt-stage failure: the destination path is already a directory
+    blocked = bench.receipt(first["occurrence_id"])
+    blocked.parent.mkdir(mode=0o700)
+    blocked.mkdir()
+
+    assert bench.run() == 1
+    assert blocked.is_dir()                       # no receipt for the first
+    assert json.loads(bench.receipt(second["occurrence_id"]).read_text())[
+        "occurrence_id"] == second["occurrence_id"]
+
+    blocked.rmdir()
+    assert bench.run() == 0                       # still retryable, no new bundle
+    assert json.loads(blocked.read_text())["occurrence_id"] == first["occurrence_id"]
+
+
+def test_a_refused_verify_leaves_nothing_a_later_run_could_commit(bench, monkeypatch):
+    """The carried finding: publish renders before it verifies, so a refusal used
+    to leave the rejected render in the working tree for the next `commit_all`."""
+    published = _payload(day=OTHER_DAY)
+    bench.drop(published)
+    assert bench.run() == 0
+    before = bench.managed()
+    head = _git(bench.vault, "rev-parse", "HEAD")
+
+    finding = [{"invariant": "meeting.project.backlinks", "path": "Meetings/x.md"}]
+    monkeypatch.setattr(render_module, "verify_meeting_semantics",
+                        lambda *a, **kw: finding)
+    refused = _payload()
+    bench.drop(refused)
+
+    assert bench.run() == 1
+    assert not bench.receipt(refused["occurrence_id"]).exists()
+    assert bench.managed() == before               # the rejected render is gone
+    assert commit_all(bench.vault, "a later daily run") is False
+    assert _git(bench.vault, "rev-parse", "HEAD") == head
+    assert _remote_ref(bench.bare, bench.branch) == head
+
+    monkeypatch.undo()
+    assert bench.run() == 0                        # the occurrence is still retryable
+    assert bench.receipt(refused["occurrence_id"]).exists()
+
+
+def test_dry_run_writes_no_database_vault_audio_receipt_or_commit(bench):
+    bench.drop(_payload())
+    open_db(bench.cfg.db_path).close()             # an existing ledger to compare
+
+    def snapshot():
+        conn = sqlite3.connect(bench.cfg.db_path)
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        rows = {name: conn.execute(f"SELECT * FROM {name}").fetchall()
+                for name in tables}
+        conn.close()
+        files = {}
+        for root in (bench.vault, bench.cfg.meeting_audio_store,
+                     bench.cfg.meeting_receipts, bench.cfg.meeting_alerts,
+                     bench.cfg.meeting_inbox, bench.cfg.meeting_archive,
+                     bench.cfg.meeting_quarantine):
+            for path in sorted(root.rglob("*")) if root.exists() else ():
+                if path.is_file() and ".git/" not in path.as_posix():
+                    files[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return rows, files, _git(bench.vault, "log", "--format=%H %T"), \
+            _remote_ref(bench.bare, bench.branch)
+
+    before = snapshot()
+    assert bench.run(dry_run=True) == 0
+    assert snapshot() == before
+
+
+def test_a_vault_publishing_to_another_ref_refuses_before_rendering(bench):
+    bench.drop(_payload())
+    bench.cfg.vault_ref = "refs/heads/somewhere-else"
+
+    assert bench.run() == 2
+    assert not any(bench.cfg.meeting_receipts.rglob("*.json")) \
+        if bench.cfg.meeting_receipts.exists() else True
+    assert bench.managed() == {}                   # nothing rendered
+
+
+def test_meeting_directories_are_created_private(bench):
+    bench.drop(_payload())
+    assert bench.run() == 0
+    for path in (bench.cfg.meeting_archive, bench.cfg.meeting_quarantine,
+                 bench.cfg.meeting_audio_store, bench.cfg.meeting_receipts,
+                 bench.cfg.meeting_alerts):
+        assert path.stat().st_mode & 0o077 == 0, path
+
+
+def test_a_group_readable_meeting_directory_is_refused(bench):
+    bench.drop(_payload())
+    bench.cfg.meeting_audio_store.mkdir(parents=True)
+    bench.cfg.meeting_audio_store.chmod(0o755)
+
+    assert bench.run() == 2
+    assert not bench.cfg.meeting_receipts.exists()
+    assert bench.managed() == {}
+
+
+def test_the_result_names_every_occurrence_and_why_it_failed(bench, monkeypatch):
+    bench.drop(_payload())
+    monkeypatch.setattr(
+        services_module, "publish_meeting",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            PublishRefused("push", "the note was not published: git push exited 1")))
+    conn = open_db(bench.cfg.db_path)
+
+    result = execute_process_meetings(bench.cfg, bench.ids, now=MEETING_NOW, conn=conn)
+
+    assert isinstance(result, MeetingRunResult)
+    assert result.published == ()
+    assert [(f.occurrence_id, f.stage) for f in result.refused] == [
+        (_payload()["occurrence_id"], "push")]
+    assert result.exit_code == 1
+
+
+def test_process_meetings_is_refused_when_meetings_are_not_configured(
+    tmp_path, capsys
+):
+    cfg = _cfg(tmp_path)
+    assert cfg.meetings_enabled is False
+    assert run_process_meetings(cfg, IdentityMaps.load(CONFIG_DIR),
+                                now=MEETING_NOW) == 2
+    assert "TEAMMEM_MEETING_INBOX" in capsys.readouterr().err
+
+
+def test_the_daily_render_is_unaffected_by_the_meeting_settings(tmp_path):
+    """The daily pipeline neither requires nor reads meeting configuration."""
+    cfg = _cfg(tmp_path)
+    _seed(cfg)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    assert run_render(cfg, ids, today=date(2026, 7, 16)) == 0
+    without = {p.relative_to(cfg.vault_dir).as_posix(): p.read_bytes()
+               for p in cfg.vault_dir.rglob("*")
+               if p.is_file() and ".git/" not in p.as_posix()}
+
+    other = tmp_path / "second"
+    other.mkdir()
+    meeting_cfg = _cfg(other, **{
+        "TEAMMEM_DB": str(cfg.db_path),
+        "TEAMMEM_VAULT": str(other / "vault"),
+        "TEAMMEM_MEETING_INBOX": str(other / "meeting-inbox"),
+        "TEAMMEM_MEETING_ARCHIVE": str(other / "meeting-archive"),
+        "TEAMMEM_MEETING_QUARANTINE": str(other / "meeting-quarantine"),
+        "TEAMMEM_MEETING_AUDIO_STORE": str(other / "meeting-audio"),
+        "TEAMMEM_MEETING_RECEIPTS": str(other / "meeting-receipts"),
+        "TEAMMEM_MEETING_ALERTS": str(other / "meeting-alerts"),
+        "TEAMMEM_VAULT_WEB_BASE": MEETING_WEB_BASE,
+    })
+    assert run_render(meeting_cfg, ids, today=date(2026, 7, 16)) == 0
+    with_meetings = {p.relative_to(meeting_cfg.vault_dir).as_posix(): p.read_bytes()
+                     for p in meeting_cfg.vault_dir.rglob("*")
+                     if p.is_file() and ".git/" not in p.as_posix()}
+    assert with_meetings == without
+
+
+def test_the_alert_path_is_one_file_per_occurrence(bench):
+    occurrence = _payload()["occurrence_id"]
+    path = meeting_alert_path(bench.cfg, occurrence)
+    assert path.parent == bench.cfg.meeting_alerts
+    assert path.name == f"{occurrence_path_segment(occurrence)}.json"
+    assert ":" not in path.name and "@" not in path.name
+
+
+def test_a_refused_commit_also_leaves_nothing_a_later_run_could_commit(bench):
+    """The same guarantee one stage earlier, driven by a real failing hook: the
+    render is on disk, git refused it, and nothing may carry it forward."""
+    published = _payload(day=OTHER_DAY)
+    bench.drop(published)
+    assert bench.run() == 0
+    before = bench.managed()
+    head = _git(bench.vault, "rev-parse", "HEAD")
+
+    hook = bench.vault / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o700)
+    bench.drop(_payload())
+
+    assert bench.run() == 1
+    hook.unlink()
+    assert bench.managed() == before
+    assert commit_all(bench.vault, "a later daily run") is False
+    assert _git(bench.vault, "rev-parse", "HEAD") == head
+
+
+def test_a_commit_that_landed_is_never_rolled_back_by_a_later_refusal(bench):
+    """The other half of the rule: once HEAD moves the content is committed, and
+    restoring the working tree would stage a deletion rather than undo a write."""
+    bench.drop(_payload())
+    receipts = bench.cfg.meeting_receipts
+    receipts.mkdir(mode=0o700)
+    (receipts / f"{occurrence_path_segment(_payload()['occurrence_id'])}.json").mkdir()
+
+    assert bench.run() == 1                        # refused at the receipt stage
+    assert _git(bench.vault, "status", "--porcelain") == ""
+    assert (bench.vault / "Meetings").is_dir()     # the published note is still there

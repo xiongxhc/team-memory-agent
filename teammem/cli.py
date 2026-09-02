@@ -21,6 +21,7 @@ from .services import (
     run_collect,
     run_docs_sync,
     run_journal,
+    run_process_meetings,
     run_render,
     run_report,
 )
@@ -113,6 +114,14 @@ def _parser() -> argparse.ArgumentParser:
     p_import.add_argument("--archive", required=True)
     p_import.add_argument("--quarantine", required=True)
     p_import.add_argument("--dry-run", action="store_true")
+
+    p_meetings = sub.add_parser(
+        "process-meetings",
+        help="import ready meeting bundles, publish their notes, emit receipts",
+    )
+    p_meetings.add_argument("--now", type=str, default=None, metavar="ISO",
+                            help="UTC instant of this run (default: now)")
+    p_meetings.add_argument("--dry-run", action="store_true")
 
     p_schedule = sub.add_parser(
         "schedule", help="manage the explicit daily hub schedule"
@@ -289,6 +298,11 @@ def main(argv: list[str] | None = None) -> int:
             f"events={result.events} inserted={result.inserted}"
         )
         return 0
+
+    if args.cmd == "process-meetings":
+        ids = IdentityMaps.load(cfg.config_dir)
+        now = args.now or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return run_process_meetings(cfg, ids, now=now, dry_run=args.dry_run)
 
     if args.cmd == "connectors":
         settings = load_connector_settings(cfg.config_dir)
