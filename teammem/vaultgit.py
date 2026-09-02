@@ -85,15 +85,18 @@ def remote_reaches(path: Path, commit: str) -> bool:
     return done.returncode == 0
 
 
-def push_verified(path: Path) -> str:
-    """`git push`, then prove the remote ref holds the pushed commit. Returns it.
+def push_verified(path: Path, commit: str) -> str:
+    """`git push`, then prove the remote ref holds `commit`. Returns it.
 
     `push` above is the daily run's hand: it succeeds whenever git exits 0, and a
     push that lands on another ref exits 0 too. This one is for callers that go on
     to tell a human the commit is published. Raises `PushNotVerified`, or
     `CalledProcessError` when git itself fails.
+
+    The caller names the commit rather than the helper reading HEAD again: another
+    hand committing to the same vault between the two reads would otherwise slip
+    an unchecked commit into whatever the caller goes on to claim.
     """
-    commit = head_commit(path)
     _git(path, "push")
     if not remote_reaches(path, commit):
         remote, ref, _ = _upstream(path)

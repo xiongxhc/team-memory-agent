@@ -9,6 +9,7 @@ impossible, so most cases here assert the *absence* of a receipt.
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from urllib.parse import quote
@@ -94,6 +95,9 @@ def bench(tmp_path):
     "https:///team/vault",                        # no host
     "https://git.example.com/team/vault?ref=main",
     "https://git.example.com/team/vault#readme",
+    "https://git.example.com/team/vault/-/blob/main",      # already a blob page
+    "https://git.example.com/team/vault/-/tree/main/Meetings",
+    "https://git.example.com/team/vault/-",
     "https://user:token@git.example.com/team/vault",   # credentials
     "https://git.example.com/team/vault ",             # stray whitespace
     "https://git.example.com/team/../vault",
@@ -306,7 +310,7 @@ def test_a_note_kept_out_of_the_commit_by_gitignore_is_not_published(bench):
 
 def test_a_push_that_cannot_reach_the_remote_leaves_no_receipt(bench):
     conn, vault, bare, branch, receipt = bench
-    subprocess.run(["rm", "-rf", str(bare)], check=True)
+    shutil.rmtree(bare)
 
     with pytest.raises(PublishRefused) as caught:
         _publish(conn, vault, receipt)
@@ -346,20 +350,61 @@ def test_a_push_that_lands_on_another_ref_is_not_a_publication(bench):
     assert _remote_ref(bare, "somewhere-else") == vaultgit.head_commit(vault)
 
 
-def test_a_remote_branch_reset_behind_the_commit_refuses_a_second_receipt(bench):
+def test_a_remote_reset_behind_the_commit_is_repaired_by_a_clean_republish(bench):
+    # The commit is already in local history, so sending it again is a repair,
+    # not a new claim: the receipt may be issued once the remote holds it.
     conn, vault, bare, branch, receipt = bench
     first = _publish(conn, vault, receipt)
     receipt.unlink()
-    seed = _git(vault, "rev-parse", f"{first['vault_commit']}^")
-    _git(bare, "update-ref", f"refs/heads/{branch}", seed)
+    commits = _git(vault, "rev-list", "--count", "HEAD")
+    _git(bare, "update-ref", f"refs/heads/{branch}",
+         _git(vault, "rev-parse", f"{first['vault_commit']}^"))
+
+    second = _publish(conn, vault, receipt)
+
+    assert second == first
+    assert _remote_ref(bare, branch) == first["vault_commit"]
+    assert _git(vault, "rev-list", "--count", "HEAD") == commits   # no empty commit
+
+
+def test_a_diverged_remote_that_cannot_be_pushed_to_refuses_a_receipt(bench):
+    # The remote branch now carries an unrelated commit, so the push is rejected
+    # and nothing can make the receipt true.
+    conn, vault, bare, branch, receipt = bench
+    first = _publish(conn, vault, receipt)
+    receipt.unlink()
+    _git(bare, "config", "user.name", "someone")
+    _git(bare, "config", "user.email", "someone@local")
+    empty_tree = _git(bare, "hash-object", "-t", "tree", "-w", os.devnull)
+    stranger = _git(bare, "commit-tree", "-m", "unrelated", empty_tree)
+    _git(bare, "update-ref", f"refs/heads/{branch}", stranger)
 
     with pytest.raises(PublishRefused) as caught:
         _publish(conn, vault, receipt)
 
     assert caught.value.stage == "push"
-    assert first["vault_commit"] in str(caught.value)
     assert not receipt.exists()
-    assert _remote_ref(bare, branch) == seed     # the remote was not repaired
+    assert _remote_ref(bare, branch) == stranger     # the remote was not rewritten
+    assert first["vault_commit"] != stranger
+
+
+def test_a_same_day_retry_after_a_failed_push_publishes(bench):
+    # No date changes between the two attempts: the retry must stand on its own
+    # rather than on tomorrow's re-render dirtying the tree.
+    conn, vault, bare, branch, receipt = bench
+    shutil.rmtree(bare)
+    with pytest.raises(PublishRefused) as caught:
+        _publish(conn, vault, receipt)
+    assert caught.value.stage == "push"
+    assert not receipt.exists()
+    committed = vaultgit.head_commit(vault)
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+
+    out = _publish(conn, vault, receipt)
+
+    assert out["vault_commit"] == committed          # the same commit, same day
+    assert _remote_ref(bare, branch) == committed
+    assert json.loads(receipt.read_text(encoding="utf-8")) == out
 
 
 def test_a_crash_between_fsync_and_rename_leaves_no_receipt_at_all(bench, monkeypatch):
@@ -459,7 +504,7 @@ def test_push_verified_returns_the_commit_the_remote_ends_up_holding(tmp_path):
     (vault / "Docs" / "next.md").write_text("more\n", encoding="utf-8")
     commit_all(vault, "more")
 
-    commit = vaultgit.push_verified(vault)
+    commit = vaultgit.push_verified(vault, vaultgit.head_commit(vault))
 
     assert commit == vaultgit.head_commit(vault)
     assert commit == _remote_ref(bare, branch)
@@ -473,7 +518,7 @@ def test_push_verified_refuses_when_the_remote_ref_did_not_move(tmp_path):
     before = _remote_ref(bare, branch)
 
     with pytest.raises(vaultgit.PushNotVerified):
-        vaultgit.push_verified(vault)
+        vaultgit.push_verified(vault, vaultgit.head_commit(vault))
 
     assert _remote_ref(bare, branch) == before
 
@@ -487,9 +532,24 @@ def test_remote_reaches_is_true_only_for_commits_the_remote_holds(tmp_path):
 
     assert vaultgit.remote_reaches(vault, seed) is True
     assert vaultgit.remote_reaches(vault, ahead) is False
-    vaultgit.push_verified(vault)
+    vaultgit.push_verified(vault, ahead)
     assert vaultgit.remote_reaches(vault, ahead) is True
     assert vaultgit.remote_reaches(vault, seed) is True   # still reachable
+
+
+def test_push_verified_vouches_for_the_commit_it_was_given_not_for_head(tmp_path):
+    # A second hand committing to the same vault between the tree check and the
+    # push must not put an unchecked commit into anyone's receipt.
+    vault, bare, branch = _vault(tmp_path)
+    (vault / "Docs" / "checked.md").write_text("checked\n", encoding="utf-8")
+    commit_all(vault, "checked")
+    checked = vaultgit.head_commit(vault)
+    (vault / "Docs" / "later.md").write_text("later\n", encoding="utf-8")
+    commit_all(vault, "a concurrent hand")
+
+    assert vaultgit.push_verified(vault, checked) == checked
+    assert vaultgit.head_commit(vault) != checked
+    assert _remote_ref(bare, branch) == vaultgit.head_commit(vault)
 
 
 def test_commit_contains_sees_the_tree_and_not_the_working_copy(tmp_path):

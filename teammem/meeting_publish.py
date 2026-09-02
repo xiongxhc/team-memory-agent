@@ -58,9 +58,12 @@ def validate_web_base(value: str | None) -> str:
         raise ValueError(f"{WEB_BASE_ENV} names no host")
     if "@" in parts.netloc:
         raise ValueError(f"{WEB_BASE_ENV} must not carry credentials")
-    if parts.query or parts.fragment or parts.path.endswith("/-"):
+    if parts.query or parts.fragment or "-" in parts.path.split("/"):
+        # `-` opens every forge's view namespace (`/-/blob/…`, `/-/tree/…`), so a
+        # base carrying one is already a page, and appending to it yields a link
+        # that resolves to nothing.
         raise ValueError(f"{WEB_BASE_ENV} must be a bare repository root: no query, "
-                         "no fragment, no blob path")
+                         "no fragment, no view path")
     if any(segment in (".", "..") for segment in parts.path.split("/")):
         raise ValueError(f"{WEB_BASE_ENV} must not contain relative path segments")
     return value.rstrip("/")
@@ -175,10 +178,12 @@ def publish_meeting(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path
         raise PublishRefused("commit", f"{commit} does not carry {rel}")
 
     try:
-        if committed:
-            commit = push_verified(vault_dir)
-        elif not remote_reaches(vault_dir, commit):
-            raise PushNotVerified(f"the remote does not hold {commit}")
+        # A clean tree whose commit the remote is missing is repaired, not
+        # refused: the commit is already in local history, so sending it makes no
+        # new claim, and it is what the daily run would do anyway. Refuse only if
+        # the push cannot land, or lands and still does not reach the commit.
+        if committed or not remote_reaches(vault_dir, commit):
+            push_verified(vault_dir, commit)
     except (PushNotVerified, subprocess.CalledProcessError) as error:
         raise PublishRefused(
             "push", f"the note was not published: {_git_detail(error)}") from error
