@@ -7,6 +7,7 @@ never the transcript or the audio.
 """
 
 import copy
+import dataclasses
 import json
 import os
 import re
@@ -855,3 +856,35 @@ def test_a_missing_project_page_is_reported_as_a_backlink_failure(tmp_path):
     assert {"invariant": PROJECT_BACKLINKS,
             "path": "Projects/project-cygnus/README.md",
             "detail": "no page at all for a meeting backlink"} in _findings(conn, vault)
+
+
+def test_the_expected_note_path_comes_from_the_ledger_not_from_the_renderer(tmp_path):
+    """`NOTE_FILE_NAME` is shared; its arguments are not.
+
+    The renderer files the note under a name of its own invention and stays
+    entirely self-consistent — index, backlinks and re-render all agree. The
+    verifier rebuilds the canonical name from `meeting_store` facts, so it still
+    knows where the note belonged.
+    """
+    conn = _seeded(tmp_path)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    real = meeting_render.collect_notes
+
+    def _misfiles(conn, *, naming, today):
+        return [dataclasses.replace(note, file_name="wrong-name.md")
+                for note in real(conn, naming=naming, today=today)]
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(meeting_render, "collect_notes", _misfiles)
+    try:
+        vault = _render(tmp_path, conn)
+        assert (vault / "Meetings" / WEEK / "wrong-name.md").is_file()
+        out = verify_vault(conn, ids, vault, TODAY, semantic=True)
+    finally:
+        monkeypatch.undo()
+    assert (out["missing"], out["unexpected"], out["differing"]) == ([], [], [])
+    assert out["semantic"] == [{
+        "invariant": ONE_PER_OCCURRENCE,
+        "path": f"Meetings/{WEEK}/wrong-name.md",
+        "detail": f"the note is not at its canonical path Meetings/{WEEK}/{NOTE}",
+    }]

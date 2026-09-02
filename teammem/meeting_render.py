@@ -35,6 +35,12 @@ DISPLAY_TZ = timezone.utc
 MEETINGS_DIR = "Meetings"
 ORGANIZER_UNAVAILABLE = "Not available (instant meeting)"
 NONE_LINE = "- none\n"
+# The one spelling of a canonical note filename. `render.py` builds the same
+# string from ledger facts when it verifies the vault
+# (`render._meeting_facts`), deliberately without going through a MeetingNote —
+# sharing the format keeps the two from drifting; sharing the arguments would
+# make the verification tautological. Change one call site, check the other.
+NOTE_FILE_NAME = "{start:%Y-%m-%d %H-%M} {topic} [{short}].md"
 NOTE_HEADINGS = (
     "Meeting details",
     "Summary",
@@ -325,7 +331,7 @@ def collect_notes(conn, *, naming: VaultNaming, today: date) -> list[MeetingNote
         attendees = _attendees(meeting, naming)
         topic = naming.safe_filename(meeting["title"])
         short = short_occurrence_id(meeting["occurrence_id"])
-        started = _moment(meeting["started_at"]).strftime("%Y-%m-%d %H-%M")
+        started = _moment(meeting["started_at"])
         notes.append(MeetingNote(
             occurrence_id=meeting["occurrence_id"],
             revision=meeting["revision"],
@@ -334,7 +340,7 @@ def collect_notes(conn, *, naming: VaultNaming, today: date) -> list[MeetingNote
             ended_at=meeting["ended_at"],
             monday=monday,
             week=week,
-            file_name=f"{started} {topic} [{short}].md",
+            file_name=NOTE_FILE_NAME.format(start=started, topic=topic, short=short),
             body=_note_body(meeting, attendees, week, monday, naming, today),
             projects=tuple(project["name"] for project in meeting["projects"]),
             attendees=attendees,

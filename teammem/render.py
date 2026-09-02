@@ -775,10 +775,15 @@ def _meeting_facts(meeting: dict, ids: IdentityMaps) -> dict:
         "title": meeting["title"],
         "revision": meeting["revision"],
         "week": week,
+        # Same format as `meeting_render.collect_notes`, different arguments:
+        # these come from the ledger, never from a rendered MeetingNote, so a
+        # renderer that files a note under the wrong name is still caught.
         "rel": PurePosixPath(
             meeting_render.MEETINGS_DIR, week,
-            f"{start:%Y-%m-%d %H-%M} {_project_fname(meeting['title'])} "
-            f"[{short_occurrence_id(meeting['occurrence_id'])}].md"),
+            meeting_render.NOTE_FILE_NAME.format(
+                start=start,
+                topic=_project_fname(meeting["title"]),
+                short=short_occurrence_id(meeting["occurrence_id"]))),
         "person_folders": {_fname(name[pid]) for pid in attended},
         "project_folders": {_project_fname(project["name"])
                             for project in meeting["projects"]},
