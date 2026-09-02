@@ -1,7 +1,8 @@
 """Regenerate the team vault from the ledger.
 The vault is a projection:
-managed dirs (Person/, Projects/, Work Journal/, README.md) are deleted and
-rewritten on every render; anything else in the vault is never touched.
+managed dirs (Person/, Projects/, Work Journal/, Meetings/, README.md) are
+deleted and rewritten on every render; anything else in the vault is never
+touched.
 Deterministic for a fixed (ledger, today): no wall-clock, no randomness.
 Links are relative markdown links (GitLab web UI renders [[wikilinks]] as
 empty repo-wiki pages; Obsidian handles relative links fine)."""
@@ -17,12 +18,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+from . import meeting_render
 from .identity import IdentityMaps
 from .queries import (by_key, events_between, flags, ref_url,
                       week_label, week_monday, week_range)
 from .store import get_summary
 
-MANAGED = ("Person", "Projects", "Work Journal", "README.md")
+MANAGED = ("Person", "Projects", "Work Journal", "Meetings", "README.md")
 MAX_WORK_LINES = 12   # work bullets per person per week (project and person week files)
 WORK_KINDS = ("commit", "pr", "mr", "issue", "repo", "comment", "journal-highlight")
 _FLAG_KEYS = frozenset({"gaps", "unmapped", "unmapped_channels", "concentration"})
@@ -60,12 +62,28 @@ def _project_fname(name: str) -> str:
     return cleaned
 
 
+def _meeting_person(ids: IdentityMaps, person_id: str,
+                    provider_name: str) -> tuple[str, str]:
+    """(vault key, display name) for one meeting participant.
+
+    A roster-mapped identity resolves to its slug and roster name, so a meeting
+    backlink lands on the person page the ledger already renders. An identity
+    the roster does not know keeps the provider's own id and name: a meeting
+    carries a real display name, unlike the raw handles the event path files
+    under `_unmapped/`, and every actual participant must be linkable.
+    """
+    slug = ids.person("feishu", person_id)
+    if slug.startswith("_unmapped/"):
+        return person_id, provider_name
+    return slug, ids.display_name(slug)
+
+
 def _person_link(name: str, up: int = 1) -> str:
     return f"[{name}]({'../' * up}Person/{quote(name)}/README.md)"
 
 
-def _project_link(proj: str) -> str:
-    return f"[{proj}](../Projects/{quote(_project_fname(proj))}/README.md)"
+def _project_link(proj: str, up: int = 1) -> str:
+    return f"[{proj}]({'../' * up}Projects/{quote(_project_fname(proj))}/README.md)"
 
 
 def _week_link(label: str, up: int = 1) -> str:
@@ -110,12 +128,14 @@ def _evidence_notice(cutoff: tuple[str | None, str, str | None]) -> str:
     return f"Evidence through {value}{detail}."
 
 
-def _validate_project_filenames(conn: sqlite3.Connection) -> None:
+def _validate_project_filenames(conn: sqlite3.Connection,
+                                extra: set[str] = frozenset()) -> None:
     seen = {"readme.md": "project index"}
     projects = conn.execute(
         "SELECT DISTINCT project FROM events WHERE project IS NOT NULL ORDER BY project"
     )
-    for (project,) in projects:
+    names = sorted({row[0] for row in projects} | set(extra))
+    for project in names:
         if not project or project == "(no project)":
             continue
         folder = _project_fname(project)
@@ -220,7 +240,21 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         m: _stored_effective_flags(summary)
         for m, summary in weekly_summaries.items()
     }
-    _validate_project_filenames(conn)
+    naming = meeting_render.VaultNaming(
+        person=lambda person_id, provider_name: _meeting_person(ids, person_id,
+                                                                provider_name),
+        person_folder=_fname,
+        person_link=_person_link,
+        project_link=_project_link,
+        safe_filename=_project_fname,
+    )
+    # Every current occurrence, no window: Meetings/ is wiped on every render,
+    # so a window would delete already-published notes from the live vault.
+    notes = meeting_render.collect_notes(conn, naming=naming, today=today)
+    person_meetings = meeting_render.person_backlinks(notes)
+    project_meetings = meeting_render.project_backlinks(notes)
+    meeting_projects = sorted(project_meetings)
+    _validate_project_filenames(conn, set(meeting_projects))
     vault_dir.mkdir(parents=True, exist_ok=True)
     for m in MANAGED:
         p = vault_dir / m
@@ -228,6 +262,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     (vault_dir / "Person").mkdir()
     (vault_dir / "Projects").mkdir()
     (vault_dir / "Work Journal").mkdir()
+    (vault_dir / "Meetings").mkdir()
 
     written: set = set()
 
@@ -410,6 +445,13 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         for m, mine in weeks_mine:
             lbl = week_label(m)
             md.append(f"- [{lbl}]({quote(lbl)}.md) — {len(mine)} events\n")
+        backlinks = person_meetings.pop(name, None)
+        if backlinks is not None:
+            if backlinks.key != person:
+                raise ValueError(
+                    "filename collision in vault render: "
+                    f"Person/{name} claimed by both {person!r} and {backlinks.key!r}")
+            md.append(meeting_render.meetings_section(backlinks.bullets))
         _write(pdir / "README.md", "".join(md))
         rendered_people.add(person)
         files += 1
@@ -423,6 +465,14 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             wmd += _person_week_body(person, mine)
             _write(pdir / f"{lbl}.md", "".join(wmd))
             files += 1
+
+    for name, backlinks in sorted(person_meetings.items()):
+        pdir = vault_dir / "Person" / name
+        if pdir.exists():
+            raise ValueError(f"filename collision in vault render: {pdir}")
+        pdir.mkdir()
+        _write(pdir / "README.md", meeting_render.person_page(backlinks, today))
+        files += 1
 
     # ---- Project pages: one folder per project, one file per active week -----
     # Match Person/: full-ledger history survives the managed-dir wipe, while
@@ -503,6 +553,9 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             lbl = week_label(m)
             md.append(f"- [{lbl}]({quote(lbl)}.md) — "
                       f"{_activity_summary(mine, separator=', ')}\n")
+        bullets = project_meetings.pop(proj, None)
+        if bullets is not None:
+            md.append(meeting_render.meetings_section(bullets))
         _write(pdir / "README.md", "".join(md))
         files += 1
 
@@ -524,6 +577,14 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             wmd += _project_week_body(mine)
             _write(pdir / f"{_fname(lbl)}.md", "".join(wmd))
             files += 1
+
+    for proj, bullets in sorted(project_meetings.items()):
+        pdir = vault_dir / "Projects" / _project_fname(proj)
+        if pdir.name == "README.md" or pdir.exists():
+            raise ValueError(f"filename collision in vault render: {pdir}")
+        pdir.mkdir()
+        _write(pdir / "README.md", meeting_render.project_page(proj, bullets, today))
+        files += 1
 
     current_m = mondays[0]
     current = {
@@ -562,15 +623,26 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             pmd.append(f"- [{proj}]({folder}/README.md) — latest "
                        f"[{lbl}]({folder}/{quote(lbl)}.md) · "
                        f"{_activity_summary(latest_rows)}\n")
+    if meeting_projects:
+        pmd.append("\n## Discussed in meetings\n")
+        for proj in meeting_projects:
+            pmd.append(f"- [{proj}]({quote(_project_fname(proj))}/README.md)\n")
     _write(vault_dir / "Projects" / "README.md", "".join(pmd))
     files += 1
 
+    for relative, content in meeting_render.meeting_files(notes, today).items():
+        path = vault_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write(path, content)
+        files += 1
+
     label = week_label(mondays[0])
     (vault_dir / "README.md").write_text(
-        f"# Team Vault\n\nGENERATED — do not edit Person/, Projects/, or "
-        f"Work Journal/ by hand; every render regenerates them from the ledger.\n\n"
+        f"# Team Vault\n\nGENERATED — do not edit Person/, Projects/, Work Journal/, "
+        f"or Meetings/ by hand; every render regenerates them from the ledger.\n\n"
         f"- generated: {today.isoformat()}\n- weeks rendered: {weeks}\n"
         f"- events in window: {len(all_rows)}\n"
+        f"- meetings: {len(notes)} — [Meetings](Meetings/README.md)\n"
         f"- current: [{label}](Work%20Journal/{quote(label)}.md)\n")
     return {"files": files + 1, "week_label": label}
 
