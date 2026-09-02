@@ -15,11 +15,13 @@ import sqlite3
 import tempfile
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
-from urllib.parse import quote
+from pathlib import Path, PurePosixPath
+from urllib.parse import quote, unquote
 
 from . import meeting_render
 from .identity import IdentityMaps
+from .meeting_bundles import short_occurrence_id
+from .meeting_store import get_meeting, list_meeting_revisions, list_meetings
 from .queries import (by_key, events_between, flags, ref_url,
                       week_label, week_monday, week_range)
 from .store import get_summary
@@ -661,10 +663,18 @@ def _managed_files(root: Path) -> set[str]:
 
 def verify_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                  today: date, weeks: int = 4,
-                 channel_names: dict | None = None) -> dict:
+                 channel_names: dict | None = None, *,
+                 semantic: bool = False) -> dict:
     """Re-render into a temp tree and diff managed paths against vault_dir.
     Never writes to vault_dir; detects hand-edits under managed paths and
-    renderer nondeterminism."""
+    renderer nondeterminism.
+
+    The diff is syntactic: it proves the vault matches what the renderer would
+    write right now, and so it cannot see a renderer that is consistently
+    wrong. `semantic=True` also runs `verify_meeting_semantics` and returns its
+    findings under a fourth `"semantic"` key. The default is off so the
+    three-key return shape every existing caller reads stays exactly as it was.
+    """
     with tempfile.TemporaryDirectory() as td:
         expected_dir = Path(td) / "vault"
         docs_dir = vault_dir / "Docs"
@@ -673,7 +683,7 @@ def verify_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         render_vault(conn, ids, expected_dir, today, weeks=weeks,
                      channel_names=channel_names)
         expected, actual = _managed_files(expected_dir), _managed_files(vault_dir)
-        return {
+        out = {
             "missing": sorted(expected - actual),
             "unexpected": sorted(actual - expected),
             "differing": sorted(
@@ -681,3 +691,309 @@ def verify_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                 if (expected_dir / rel).read_bytes()
                 != (vault_dir / rel).read_bytes()),
         }
+    if semantic:
+        out["semantic"] = verify_meeting_semantics(conn, ids, vault_dir)
+    return out
+
+
+# ---- Semantic verification of the meetings projection -----------------------
+# `verify_vault` re-renders and diffs, which proves the vault matches what the
+# renderer would write right now. It cannot see a renderer that is consistently
+# wrong: a bug that always omits a project backlink survives the diff. These
+# checks read the vault on disk and hold it against the ledger through
+# `meeting_store`, so the renderer is never its own witness.
+#
+# Findings name a path and an invariant. They never carry transcript text, an
+# audio path or a digest — not even when reporting that one of those leaked.
+
+MEETING_INVARIANTS = (
+    "meeting.leakage.forbidden-content",
+    "meeting.link.resolves",
+    "meeting.note.heading-order",
+    "meeting.note.one-per-occurrence",
+    "meeting.note.per-person-summaries",
+    "meeting.note.revision-current",
+    "meeting.person.backlinks",
+    "meeting.project.backlinks",
+    "meeting.week-index.membership",
+)
+# Shorter transcript lines ("Yes.") legitimately recur in a summary; matching
+# them would make every vault look like a leak.
+_MIN_LEAKED_TEXT = 24
+# CommonMark inline links, tolerating one level of balanced parens in a target.
+_MD_LINK = re.compile(r"\[[^\]]*\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)")
+
+
+def _unyaml(value: str) -> str:
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return value
+
+
+def _front_matter(text: str) -> dict[str, str]:
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---\n", 3)
+    if end < 0:
+        return {}
+    out = {}
+    for line in text[4:end + 1].splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            out[key.strip()] = _unyaml(value.strip())
+    return out
+
+
+def _instant(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(meeting_render.DISPLAY_TZ)
+
+
+def _meeting_facts(meeting: dict, ids: IdentityMaps) -> dict:
+    """What the vault must say about one meeting, read from the ledger alone.
+
+    Derived here rather than taken from `meeting_render.collect_notes`, so a
+    renderer that drops a participant or a project is caught instead of
+    confirmed.
+    """
+    start = _instant(meeting["started_at"])
+    monday = week_monday(start.date())
+    week = week_label(monday)
+    name = {}
+    attended = []
+    for participant in meeting["participants"]:
+        key = _meeting_person(ids, participant["person_id"],
+                              participant["display_name"])[1]
+        name[participant["person_id"]] = key
+        if participant["attendance"]:
+            attended.append(participant["person_id"])
+    spoke = {segment["speaker"]["person_id"] for segment in meeting["transcript"]
+             if segment["speaker"]["kind"] == "person"}
+    return {
+        "title": meeting["title"],
+        "revision": meeting["revision"],
+        "week": week,
+        "rel": PurePosixPath(
+            meeting_render.MEETINGS_DIR, week,
+            f"{start:%Y-%m-%d %H-%M} {_project_fname(meeting['title'])} "
+            f"[{short_occurrence_id(meeting['occurrence_id'])}].md"),
+        "person_folders": {_fname(name[pid]) for pid in attended},
+        "project_folders": {_project_fname(project["name"])
+                            for project in meeting["projects"]},
+        "speakers": [name[entry["person_id"]] for entry in meeting["person_summaries"]
+                     if entry["person_id"] in spoke and entry["person_id"] in attended],
+    }
+
+
+def _forbidden_values(conn: sqlite3.Connection, occurrence_ids) -> list[tuple[str, str]]:
+    """(kind, value) for everything that must never reach the vault.
+
+    Every stored revision, not only the current one: a superseded revision's
+    transcript is exactly as confidential as the one being rendered.
+    """
+    values: list[tuple[str, str]] = []
+    for occurrence_id in occurrence_ids:
+        for entry in list_meeting_revisions(conn, occurrence_id):
+            meeting = get_meeting(conn, occurrence_id, revision=entry["revision"])
+            if meeting is None:
+                continue
+            values += [("transcript text", segment["text"])
+                       for segment in meeting["transcript"]
+                       if len(segment["text"]) >= _MIN_LEAKED_TEXT]
+            audio = meeting["audio"]
+            if audio:
+                values.append(("audio store path", audio["stored_path"]))
+                values.append(("audio digest", audio["sha256"]))
+                if len(audio["filename"]) >= 5:
+                    values.append(("audio file name", audio["filename"]))
+    return values
+
+
+def _vault_pages(vault_dir: Path, top: str) -> list[tuple[str, str, str]]:
+    """(folder, relative path, text) for every `<top>/<folder>/README.md` page."""
+    base = vault_dir / top
+    pages = []
+    for path in sorted(base.rglob("README.md")) if base.is_dir() else []:
+        rel = path.relative_to(vault_dir).as_posix()
+        folder = path.parent.relative_to(base).as_posix()
+        if folder == ".":                      # the section index, not a page
+            continue
+        pages.append((folder, rel, path.read_text(encoding="utf-8")))
+    return pages
+
+
+def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
+                             vault_dir: Path) -> list[dict]:
+    """Check the rendered vault against the meeting invariants.
+
+    Returns a sorted list of `{"invariant", "path", "detail"}` findings; an
+    empty list means the vault satisfies every invariant in
+    `MEETING_INVARIANTS`. Reads the vault and the ledger and writes nothing.
+    """
+    findings: list[dict] = []
+
+    def report(invariant: str, path, detail: str) -> None:
+        findings.append({"invariant": invariant, "path": str(path), "detail": detail})
+
+    expected = {}
+    for row in list_meetings(conn):
+        meeting = get_meeting(conn, row["occurrence_id"])
+        if meeting is not None:                # deleted between the two reads
+            expected[meeting["occurrence_id"]] = _meeting_facts(meeting, ids)
+
+    # ---- one canonical file per current occurrence --------------------------
+    one = "meeting.note.one-per-occurrence"
+    root = vault_dir / meeting_render.MEETINGS_DIR
+    on_disk: dict[str, list[tuple[PurePosixPath, str, dict]]] = {}
+    for path in sorted(root.rglob("*.md")) if root.is_dir() else []:
+        if path.name == "README.md":
+            continue
+        rel = PurePosixPath(path.relative_to(vault_dir).as_posix())
+        text = path.read_text(encoding="utf-8")
+        front = _front_matter(text)
+        occurrence_id = front.get("occurrence_id")
+        if not occurrence_id:
+            report(one, rel, "the note declares no occurrence_id in its front matter")
+            continue
+        on_disk.setdefault(occurrence_id, []).append((rel, text, front))
+
+    canonical: dict[str, tuple[PurePosixPath, str, dict]] = {}
+    for occurrence_id, entries in sorted(on_disk.items()):
+        facts = expected.get(occurrence_id)
+        if facts is None:
+            for rel, _, _ in entries:
+                report(one, rel,
+                       "a note for an occurrence the ledger does not hold as current")
+            continue
+        chosen = next((e for e in entries if e[0] == facts["rel"]), None)
+        if chosen is None:
+            chosen = entries[0]
+            report(one, chosen[0], f"the note is not at its canonical path {facts['rel']}")
+        for rel, _, _ in entries:
+            if rel != chosen[0]:
+                report(one, rel, "a duplicate of a note already rendered for this occurrence")
+        canonical[occurrence_id] = chosen
+    for occurrence_id, facts in sorted(expected.items()):
+        if occurrence_id not in canonical:
+            report(one, facts["rel"], "no canonical note for a current occurrence")
+
+    # ---- per-note structure -------------------------------------------------
+    for occurrence_id, (rel, text, front) in sorted(canonical.items()):
+        facts = expected[occurrence_id]
+        lines = text.splitlines()
+        if [l for l in lines if l.startswith("# ")] != [f"# {facts['title']}"]:
+            report("meeting.note.heading-order", rel,
+                   "the title heading is not the meeting topic")
+        sections = tuple(l[3:].strip() for l in lines if l.startswith("## "))
+        if sections != meeting_render.NOTE_HEADINGS:
+            report("meeting.note.heading-order", rel,
+                   "the sections are not the nine canonical headings in order")
+
+        summaries = [l[4:].strip() for l in lines if l.startswith("### ")]
+        for who in [w for w in summaries if w not in facts["speakers"]]:
+            report("meeting.note.per-person-summaries", rel,
+                   f"a per-person summary for a participant with no reconciled speech: {who}")
+        for who in [w for w in facts["speakers"] if w not in summaries]:
+            report("meeting.note.per-person-summaries", rel,
+                   f"no per-person summary for a participant who spoke: {who}")
+        if sorted(summaries) == sorted(facts["speakers"]) and summaries != facts["speakers"]:
+            report("meeting.note.per-person-summaries", rel,
+                   "the per-person summaries are not in the meeting's own order")
+
+        if front.get("revision") != str(facts["revision"]):
+            report("meeting.note.revision-current", rel,
+                   f"the note renders revision {front.get('revision')}; "
+                   f"the current revision is {facts['revision']}")
+
+    # ---- weekly index membership -------------------------------------------
+    index_invariant = "meeting.week-index.membership"
+    by_week: dict[PurePosixPath, set[str]] = {}
+    for rel, _, _ in canonical.values():
+        by_week.setdefault(rel.parent, set()).add(rel.name)
+    for parent, names in sorted(by_week.items()):
+        rel = parent / "README.md"
+        page = vault_dir / rel
+        if not page.is_file():
+            report(index_invariant, rel, "the week has notes but no index")
+            continue
+        listed = {unquote(t) for t in _MD_LINK.findall(page.read_text(encoding="utf-8"))
+                  if not t.startswith("../")}
+        for name in sorted(names - listed):
+            report(index_invariant, rel, f"the week index omits a canonical note: {name}")
+        for name in sorted(listed - names):
+            report(index_invariant, rel,
+                   f"the week index lists a file that is not a canonical note: {name}")
+
+    top_rel = PurePosixPath(meeting_render.MEETINGS_DIR, "README.md")
+    if not (vault_dir / top_rel).is_file():
+        if by_week:
+            report(index_invariant, top_rel, "the meetings index is missing")
+    else:
+        text = (vault_dir / top_rel).read_text(encoding="utf-8")
+        listed = {unquote(t).split("/")[0] for t in _MD_LINK.findall(text)
+                  if t.endswith("/README.md") and not t.startswith("../")}
+        weeks = {parent.name for parent in by_week}
+        for week in sorted(weeks - listed):
+            report(index_invariant, top_rel, f"the meetings index omits a week: {week}")
+        for week in sorted(listed - weeks):
+            report(index_invariant, top_rel,
+                   f"the meetings index lists a week with no canonical note: {week}")
+
+    # ---- all-and-only backlinks --------------------------------------------
+    for top, key, invariant, absent, present in (
+        ("Person", "person_folders", "meeting.person.backlinks",
+         "the page of an actual participant does not link the meeting",
+         "the page of someone who did not attend links the meeting"),
+        ("Projects", "project_folders", "meeting.project.backlinks",
+         "the page of a discussed project does not link the meeting",
+         "the page of a project the meeting did not discuss links it"),
+    ):
+        pages = _vault_pages(vault_dir, top)
+        folders = {folder for folder, _, _ in pages}
+        for occurrence_id, (rel, _, _) in sorted(canonical.items()):
+            tail = f"{quote(rel.parent.name)}/{quote(rel.name)}"
+            wanted = expected[occurrence_id][key]
+            for folder, page_rel, text in pages:
+                links = tail in text
+                if folder in wanted and not links:
+                    report(invariant, page_rel, absent)
+                elif folder not in wanted and links:
+                    report(invariant, page_rel, present)
+            for folder in sorted(wanted - folders):
+                report(invariant, PurePosixPath(top, folder, "README.md"),
+                       "no page at all for a meeting backlink")
+
+    # ---- every relative link resolves inside the vault ----------------------
+    root_dir = vault_dir.resolve()
+    for name in sorted(_managed_files(vault_dir)):
+        if not name.endswith(".md"):
+            continue
+        path = vault_dir / name
+        seen: set[str] = set()
+        for target in _MD_LINK.findall(path.read_text(encoding="utf-8")):
+            target = target.split("#", 1)[0]
+            if not target or target in seen or "://" in target:
+                continue
+            if target.startswith(("mailto:", "/", "#")):
+                continue
+            seen.add(target)
+            resolved = (path.parent / unquote(target)).resolve()
+            if not resolved.is_relative_to(root_dir) or not resolved.exists():
+                report("meeting.link.resolves", name,
+                       f"a relative link does not resolve inside the vault: {target}")
+
+    # ---- nothing forbidden anywhere under the vault -------------------------
+    forbidden = _forbidden_values(conn, sorted(expected))
+    if forbidden:
+        for path in sorted(vault_dir.rglob("*")):
+            rel_parts = path.relative_to(vault_dir).parts
+            if not path.is_file() or ".git" in rel_parts:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for kind in sorted({k for k, value in forbidden if value and value in text}):
+                report("meeting.leakage.forbidden-content", "/".join(rel_parts),
+                       f"{kind} from the ledger appears in this file")
+
+    return sorted(findings, key=lambda f: (f["invariant"], f["path"], f["detail"]))

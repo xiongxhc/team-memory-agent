@@ -10,9 +10,11 @@ import copy
 import json
 import os
 import re
+import shutil
 import time
 from datetime import date
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -20,7 +22,9 @@ from teammem.events import Event
 from teammem.identity import IdentityMaps
 from teammem.meeting_bundles import canonical_artifact_hash, short_occurrence_id
 from teammem.meeting_store import StagedAudio, import_meeting_revision
-from teammem.render import MANAGED, render_vault, verify_vault
+from teammem import meeting_render
+from teammem.render import (MANAGED, MEETING_INVARIANTS, render_vault,
+                            verify_meeting_semantics, verify_vault)
 from teammem.store import insert_events, open_db
 
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
@@ -487,3 +491,367 @@ def test_an_unrostered_participant_cannot_take_over_a_rostered_person_page(tmp_p
                                hash="a1", project="project-alpha")])
     with pytest.raises(ValueError, match="filename collision in vault render"):
         render_vault(conn, IdentityMaps.load(CONFIG_DIR), tmp_path / "vault", TODAY)
+
+
+# --- semantic verification --------------------------------------------------
+#
+# `verify_vault` re-renders and diffs: it proves the vault matches what the
+# renderer would write right now. These tests cover the other half — that what
+# the renderer wrote satisfies the meeting invariants at all. Every negative
+# fixture is a one-line corruption of a known-good rendered tree, and every one
+# of them asserts the exact set of invariants it broke, so the checks are proven
+# independent rather than one blanket failure.
+
+
+ONE_PER_OCCURRENCE = "meeting.note.one-per-occurrence"
+HEADING_ORDER = "meeting.note.heading-order"
+PER_PERSON = "meeting.note.per-person-summaries"
+REVISION_CURRENT = "meeting.note.revision-current"
+WEEK_INDEX = "meeting.week-index.membership"
+PERSON_BACKLINKS = "meeting.person.backlinks"
+PROJECT_BACKLINKS = "meeting.project.backlinks"
+LINK_RESOLVES = "meeting.link.resolves"
+LEAKAGE = "meeting.leakage.forbidden-content"
+
+
+def _findings(conn, vault: Path) -> list[dict]:
+    return verify_meeting_semantics(conn, IdentityMaps.load(CONFIG_DIR), vault)
+
+
+def _broken(conn, vault: Path) -> set[str]:
+    return {f["invariant"] for f in _findings(conn, vault)}
+
+
+def _edit(path: Path, old: str, new: str) -> None:
+    text = path.read_text()
+    assert old in text, f"fixture drifted: {old!r} not in {path}"
+    path.write_text(text.replace(old, new, 1))
+
+
+def _tail(week: str = WEEK, note: str = NOTE) -> str:
+    return f"{quote(week)}/{quote(note)}"
+
+
+def test_a_clean_vault_satisfies_every_meeting_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    assert _findings(conn, _render(tmp_path, conn)) == []
+
+
+def test_a_clean_multi_meeting_vault_with_a_ledger_is_also_clean(tmp_path):
+    """The checks must be quiet on a vault that also carries event activity."""
+    conn = _seeded(tmp_path, _payload(), _renumber(_payload(day="2026-06-30"), "vc:9f3b/x"))
+    insert_events(conn, [Event(person="alex", ts="2026-09-02T09:00:00+04:00",
+                               source="gitlab", kind="commit", summary="fix: a thing",
+                               hash="a1", project="project-alpha")])
+    assert _findings(conn, _render(tmp_path, conn)) == []
+
+
+def test_verification_never_writes_to_the_vault(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    before = {p: p.read_bytes() for p in sorted(vault.rglob("*")) if p.is_file()}
+    _edit(vault / "Projects" / "project-cygnus" / "README.md", "- [2026-09-02", "- [x](y) [2026-09-02")
+    after_edit = {p: p.read_bytes() for p in sorted(vault.rglob("*")) if p.is_file()}
+    _findings(conn, vault)
+    assert {p: p.read_bytes() for p in sorted(vault.rglob("*")) if p.is_file()} == after_edit
+    assert before != after_edit          # the snapshot really is byte-sensitive
+
+
+def test_verify_vault_keeps_its_three_key_contract_and_adds_semantics_on_request(tmp_path):
+    conn = _seeded(tmp_path)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    vault = _render(tmp_path, conn)
+    assert verify_vault(conn, ids, vault, TODAY) == {
+        "missing": [], "unexpected": [], "differing": []}
+    assert verify_vault(conn, ids, vault, TODAY, semantic=True) == {
+        "missing": [], "unexpected": [], "differing": [], "semantic": []}
+
+
+def test_a_renderer_bug_the_diff_cannot_see_fails_the_semantic_check(tmp_path, monkeypatch):
+    """The whole point of the task: re-rendering agrees with a broken renderer."""
+    conn = _seeded(tmp_path)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    real = meeting_render.project_backlinks
+
+    def _forgets_cygnus(notes):
+        out = dict(real(notes))
+        out["project-cygnus"] = ()
+        return out
+
+    monkeypatch.setattr(meeting_render, "project_backlinks", _forgets_cygnus)
+    vault = _render(tmp_path, conn)
+    assert _tail() not in (vault / "Projects" / "project-cygnus" / "README.md").read_text()
+    out = verify_vault(conn, ids, vault, TODAY, semantic=True)
+    assert (out["missing"], out["unexpected"], out["differing"]) == ([], [], [])
+    assert [f["invariant"] for f in out["semantic"]] == [PROJECT_BACKLINKS]
+    assert out["semantic"][0]["path"] == "Projects/project-cygnus/README.md"
+
+
+def test_a_missing_project_backlink_fails_only_the_project_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    page = vault / "Projects" / "project-cygnus" / "README.md"
+    page.write_text("".join(line for line in page.read_text().splitlines(keepends=True)
+                            if _tail() not in line))
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [PROJECT_BACKLINKS]
+    assert found[0]["path"] == "Projects/project-cygnus/README.md"
+
+
+def test_a_backlink_on_a_project_the_meeting_never_discussed_is_reported(tmp_path):
+    conn = _seeded(tmp_path)
+    insert_events(conn, [Event(person="alex", ts="2026-09-02T09:00:00+04:00",
+                               source="gitlab", kind="commit", summary="fix: a thing",
+                               hash="a1", project="project-alpha")])
+    vault = _render(tmp_path, conn)
+    page = vault / "Projects" / "project-alpha" / "README.md"
+    page.write_text(page.read_text() + f"\n- [meeting](../../Meetings/{_tail()})\n")
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [PROJECT_BACKLINKS]
+    assert found[0]["path"] == "Projects/project-alpha/README.md"
+
+
+def test_a_missing_participant_backlink_fails_only_the_person_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    page = vault / "Person" / "Hana Suzuki" / "README.md"
+    page.write_text("".join(line for line in page.read_text().splitlines(keepends=True)
+                            if _tail() not in line))
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [PERSON_BACKLINKS]
+    assert found[0]["path"] == "Person/Hana Suzuki/README.md"
+
+
+def test_a_backlink_on_a_non_participant_page_is_reported(tmp_path):
+    conn = _seeded(tmp_path)
+    insert_events(conn, [Event(person="alex", ts="2026-09-02T09:00:00+04:00",
+                               source="gitlab", kind="commit", summary="fix: a thing",
+                               hash="a1", project="project-alpha")])
+    vault = _render(tmp_path, conn)
+    page = vault / "Person" / "Alex Rivera" / "README.md"
+    page.write_text(page.read_text() + f"\n- [meeting](../../Meetings/{_tail()})\n")
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [PERSON_BACKLINKS]
+    assert found[0]["path"] == "Person/Alex Rivera/README.md"
+
+
+def test_a_per_person_section_for_a_silent_participant_fails_only_that_invariant(tmp_path):
+    """Hana joined at 14:04 and never spoke: section 7 yes, section 9 never."""
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    note = vault / "Meetings" / WEEK / NOTE
+    note.write_text(note.read_text() + "\n### Hana Suzuki\n\nJoined and listened.\n")
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [PER_PERSON]
+    assert found[0]["path"] == f"Meetings/{WEEK}/{NOTE}"
+    assert "Hana Suzuki" in found[0]["detail"]
+
+
+def test_a_duplicate_note_fails_only_the_one_note_per_occurrence_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    note = vault / "Meetings" / WEEK / NOTE
+    copy_name = f"2026-09-02 14-00 Atlas Launch Readiness [{SHORT}] (1).md"
+    (note.parent / copy_name).write_text(note.read_text())
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [ONE_PER_OCCURRENCE]
+    assert found[0]["path"] == f"Meetings/{WEEK}/{copy_name}"
+
+
+def test_a_missing_note_for_a_current_occurrence_is_reported(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    (vault / "Meetings" / WEEK / NOTE).unlink()
+    assert ONE_PER_OCCURRENCE in _broken(conn, vault)
+
+
+def test_a_note_for_an_occurrence_the_ledger_does_not_hold_is_reported(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    note = vault / "Meetings" / WEEK / NOTE
+    stray = note.parent / "2026-09-02 15-00 Ghost [deadbeef].md"
+    stray.write_text(note.read_text().replace('board-sync@', 'ghost-sync@'))
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [ONE_PER_OCCURRENCE]
+    assert found[0]["path"] == f"Meetings/{WEEK}/{stray.name}"
+
+
+def test_a_stale_revision_on_disk_fails_only_the_revision_invariant(tmp_path):
+    """Import a higher revision, restore the old bytes: the vault is behind."""
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    stale = (vault / "Meetings" / WEEK / NOTE).read_text()
+    assert "revision: 3\n" in stale
+    newer = _payload()
+    newer["revision"] = 4
+    _import(conn, newer)
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    note = vault / "Meetings" / WEEK / NOTE
+    assert "revision: 4\n" in note.read_text()
+    note.write_text(stale)
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [REVISION_CURRENT]
+    assert found[0]["path"] == f"Meetings/{WEEK}/{NOTE}"
+    assert "3" in found[0]["detail"] and "4" in found[0]["detail"]
+
+
+def test_a_broken_relative_link_fails_only_the_link_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    _edit(vault / "Meetings" / WEEK / NOTE, "[Meetings](../README.md)",
+          "[Meetings](../READMEE.md)")
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [LINK_RESOLVES]
+    assert found[0]["path"] == f"Meetings/{WEEK}/{NOTE}"
+    assert "READMEE.md" in found[0]["detail"]
+
+
+def test_a_link_escaping_the_vault_is_reported(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    _edit(vault / "Meetings" / WEEK / NOTE, "[Meetings](../README.md)",
+          "[Meetings](../../../etc/hosts)")
+    assert _broken(conn, vault) == {LINK_RESOLVES}
+
+
+def test_a_week_index_that_omits_a_note_fails_the_membership_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    index = vault / "Meetings" / WEEK / "README.md"
+    index.write_text("".join(line for line in index.read_text().splitlines(keepends=True)
+                             if quote(NOTE) not in line))
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [WEEK_INDEX]
+    assert found[0]["path"] == f"Meetings/{WEEK}/README.md"
+
+
+def test_a_week_index_that_lists_a_stranger_fails_the_membership_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    index = vault / "Meetings" / WEEK / "README.md"
+    (index.parent / "notes.txt").write_text("x")
+    index.write_text(index.read_text() + "- [something](notes.txt)\n")
+    assert _broken(conn, vault) == {WEEK_INDEX}
+
+
+def test_a_top_index_that_omits_a_week_fails_the_membership_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    index = vault / "Meetings" / "README.md"
+    index.write_text("".join(line for line in index.read_text().splitlines(keepends=True)
+                             if quote(WEEK) not in line))
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [WEEK_INDEX]
+    assert found[0]["path"] == "Meetings/README.md"
+
+
+def test_out_of_order_sections_fail_the_heading_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    _edit(vault / "Meetings" / WEEK / NOTE, "## Organizer", "## Zzz Organizer")
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [HEADING_ORDER]
+    assert found[0]["path"] == f"Meetings/{WEEK}/{NOTE}"
+
+
+def test_a_retitled_note_fails_the_heading_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    _edit(vault / "Meetings" / WEEK / NOTE, "# Atlas Launch Readiness", "# Something Else")
+    assert _broken(conn, vault) == {HEADING_ORDER}
+
+
+def test_transcript_text_in_the_vault_is_reported_without_quoting_it(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    sentence = _payload()["transcript"][2]["text"]
+    page = vault / "Person" / "Hana Suzuki" / "README.md"
+    page.write_text(page.read_text() + f"\n{sentence}\n")
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [LEAKAGE]
+    assert found[0]["path"] == "Person/Hana Suzuki/README.md"
+    assert sentence not in json.dumps(found)
+    assert "staging soak" not in json.dumps(found)
+
+
+def test_an_audio_path_in_the_vault_is_reported_without_quoting_it(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    stored = f"{AUDIO_ROOT}/{SHORT}/audio.enc"
+    (vault / "Meetings" / "leak.txt").write_text(f"{stored}\n")
+    found = _findings(conn, vault)
+    assert {f["invariant"] for f in found} == {LEAKAGE}
+    assert {f["path"] for f in found} == {"Meetings/leak.txt"}
+    assert {f["detail"] for f in found} == {
+        "audio store path from the ledger appears in this file",
+        "audio file name from the ledger appears in this file"}
+    assert stored not in json.dumps(found)
+    assert AUDIO_ROOT not in json.dumps(found)
+
+
+def test_a_transcript_from_a_superseded_revision_is_still_forbidden(tmp_path):
+    """A revision the vault no longer renders keeps its transcript secret."""
+    payload = _payload()
+    payload["transcript"][0]["text"] = "The superseded revision said this one sentence only."
+    conn = _seeded(tmp_path, payload)
+    newer = _payload()
+    newer["revision"] = 4
+    _import(conn, newer)
+    vault = _render(tmp_path, conn)
+    assert _findings(conn, vault) == []
+    (vault / "Meetings" / "old.txt").write_text(payload["transcript"][0]["text"])
+    assert _broken(conn, vault) == {LEAKAGE}
+
+
+def test_findings_are_sorted_and_carry_only_paths_and_invariant_names(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    (vault / "Meetings" / WEEK / NOTE).unlink()
+    found = _findings(conn, vault)
+    assert found == sorted(found, key=lambda f: (f["invariant"], f["path"], f["detail"]))
+    assert all(set(f) == {"invariant", "path", "detail"} for f in found)
+    assert {f["invariant"] for f in found} <= set(MEETING_INVARIANTS)
+
+
+def test_a_no_show_is_not_expected_to_have_a_page_or_a_backlink(tmp_path):
+    """Truth is the ledger's observed attendance, not its invitee list."""
+    payload = _payload()
+    payload["participants"].append(
+        {"person_id": "ou_invited", "display_name": "Invited Noshow", "attendance": []})
+    conn = _seeded(tmp_path, payload)
+    vault = _render(tmp_path, conn)
+    assert not (vault / "Person" / "Invited Noshow").exists()
+    assert _findings(conn, vault) == []
+
+
+def test_a_summary_for_a_silent_joiner_is_not_expected_in_the_note(tmp_path):
+    """A person_summaries row for someone who never spoke must stay unrendered."""
+    payload = _payload()
+    payload["person_summaries"].append(
+        {"person_id": "ou_hana", "display_name": "Hana Suzuki", "text": "Said nothing at all."})
+    conn = _seeded(tmp_path, payload)
+    vault = _render(tmp_path, conn)
+    assert "### Hana Suzuki" not in _note(vault)
+    assert _findings(conn, vault) == []
+
+
+def test_a_note_moved_off_its_canonical_path_is_reported(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    note = vault / "Meetings" / WEEK / NOTE
+    note.rename(note.parent / "renamed.md")
+    found = _findings(conn, vault)
+    assert [f for f in found if f["invariant"] == ONE_PER_OCCURRENCE] == [{
+        "invariant": ONE_PER_OCCURRENCE,
+        "path": f"Meetings/{WEEK}/renamed.md",
+        "detail": f"the note is not at its canonical path Meetings/{WEEK}/{NOTE}",
+    }]
+
+
+def test_a_missing_project_page_is_reported_as_a_backlink_failure(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    shutil.rmtree(vault / "Projects" / "project-cygnus")
+    assert {"invariant": PROJECT_BACKLINKS,
+            "path": "Projects/project-cygnus/README.md",
+            "detail": "no page at all for a meeting backlink"} in _findings(conn, vault)
