@@ -591,3 +591,67 @@ def test_foreign_keys_are_enforced_inside_the_import_transaction(tmp_path, monke
     with pytest.raises(sqlite3.IntegrityError):
         _import(conn, _bundle(tmp_path, _payload(COMPLETE)))
     assert _counts(conn) == {table: 0 for table in MEETING_TABLES}
+
+
+def test_an_artifact_hash_that_does_not_match_the_payload_is_rejected(tmp_path):
+    """The store is content-addressed, so it recomputes rather than trusting."""
+    conn = open_db(tmp_path / "l.db")
+    bundle = _bundle(tmp_path, _payload(COMPLETE))
+
+    with pytest.raises(MeetingStoreError) as caught:
+        import_meeting_revision(
+            conn,
+            payload=bundle.payload,
+            occurrence_id=bundle.occurrence_id,
+            revision=bundle.revision,
+            artifact_hash="sha256:" + "0" * 64,
+            audio=_staged(bundle),
+            imported_at=IMPORTED_AT,
+        )
+    assert not isinstance(caught.value, (MeetingRevisionConflict, MeetingRevisionSuperseded))
+    assert _counts(conn) == {table: 0 for table in MEETING_TABLES}
+
+
+def test_a_replay_carrying_a_doctored_hash_is_rejected_not_treated_as_unchanged(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    bundle = _bundle(tmp_path, _payload(COMPLETE))
+    _import(conn, bundle)
+    before = _counts(conn)
+
+    with pytest.raises(MeetingStoreError) as caught:
+        import_meeting_revision(
+            conn,
+            payload=bundle.payload,
+            occurrence_id=bundle.occurrence_id,
+            revision=bundle.revision,
+            artifact_hash="sha256:" + "f" * 64,
+            audio=_staged(bundle),
+            imported_at="2026-09-03T08:00:00Z",
+        )
+    # The recompute has to run ahead of the replay branch, or this would have
+    # been waved through with status "unchanged".
+    assert not isinstance(caught.value, (MeetingRevisionConflict, MeetingRevisionSuperseded))
+    assert _counts(conn) == before
+    assert conn.execute("SELECT artifact_hash FROM meeting_artifacts").fetchone()[0] == \
+        bundle.artifact_hash
+
+
+def test_a_failed_import_restores_the_callers_foreign_key_setting(tmp_path, monkeypatch):
+    conn = open_db(tmp_path / "l.db")
+
+    import teammem.meeting_store as meeting_store
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("injected failure inside the transaction")
+
+    monkeypatch.setattr(meeting_store, "_insert_segments", boom)
+
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+    with pytest.raises(RuntimeError, match="injected failure"):
+        _import(conn, _bundle(tmp_path, _payload(COMPLETE)))
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+
+    conn.execute("PRAGMA foreign_keys = ON")
+    with pytest.raises(RuntimeError, match="injected failure"):
+        _import(conn, _bundle(tmp_path, _payload(MINIMAL), name="inbox2"))
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1

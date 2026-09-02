@@ -26,6 +26,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from .meeting_bundles import canonical_artifact_hash
+
 
 MEETING_AUDIO_RETENTION_DAYS = 14
 
@@ -319,7 +321,7 @@ class StagedAudio:
 
 
 @dataclass(frozen=True)
-class MeetingImportResult:
+class RevisionImportResult:
     occurrence_id: str
     revision: int
     artifact_hash: str
@@ -402,7 +404,7 @@ def import_meeting_revision(
     artifact_hash: str,
     audio: StagedAudio,
     imported_at: str,
-) -> MeetingImportResult:
+) -> RevisionImportResult:
     """Store one validated meeting revision and make it current if it is newer.
 
     The caller has already validated `payload` against `teammem-meeting/v1` and
@@ -410,10 +412,20 @@ def import_meeting_revision(
     `BEGIN IMMEDIATE` transaction with foreign keys enforced, so a failure
     anywhere leaves no artifact row and no child rows.
 
+    `artifact_hash` is recomputed from `payload` before anything else, so this
+    layer is genuinely content-addressed rather than trusting the caller's claim.
+    A hash that does not match the payload is refused ahead of the replay check,
+    so a doctored replay can never be waved through as unchanged.
+
     Replaying the same `(occurrence_id, revision, artifact_hash)` is a no-op.
     The same revision with a different hash raises `MeetingRevisionConflict`; a
     revision below the current one raises `MeetingRevisionSuperseded`.
     """
+    recomputed = canonical_artifact_hash(payload)
+    if recomputed != artifact_hash:
+        raise MeetingStoreError(
+            f"artifact hash for {occurrence_id} revision {revision} does not match the payload"
+        )
     if audio.sha256 != payload["audio"]["sha256"] or audio.bytes != payload["audio"]["bytes"]:
         raise MeetingStoreError(
             f"staged audio for {occurrence_id} revision {revision} does not match the payload"
@@ -437,7 +449,7 @@ def import_meeting_revision(
                     )
                 current, stored_expiry = _current_state(conn, occurrence_id, revision)
                 conn.rollback()
-                return MeetingImportResult(
+                return RevisionImportResult(
                     occurrence_id=occurrence_id,
                     revision=revision,
                     artifact_hash=artifact_hash,
@@ -487,7 +499,7 @@ def import_meeting_revision(
             raise
         conn.commit()
 
-    return MeetingImportResult(
+    return RevisionImportResult(
         occurrence_id=occurrence_id,
         revision=revision,
         artifact_hash=artifact_hash,
