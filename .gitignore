@@ -21,3 +21,6 @@ build/
 *.pem
 *.key
 .worktrees/
+
+# SDD controller scratch
+.superpowers/
