@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from .identity import IdentityMaps
-from .meeting_store import get_meeting
+from .meeting_store import get_meeting, list_meetings
 # `_meeting_facts` is `render.py`'s ledger-only view of one meeting, the same
 # one the semantic checks hold the vault against. The receipt names the path the
 # ledger says the note belongs at, not a path a renderer handed back.
@@ -94,22 +94,57 @@ def _git_detail(error: Exception) -> str:
     return str(error)
 
 
-def _refuse_on_drift(out: dict) -> None:
-    """Findings name a path and an invariant, never a line of a file. The offending
+def _refuse_on_drift(out: dict, occurrence_id: str, elsewhere) -> None:
+    """Refuse on what this occurrence is answerable for, and on nothing else.
+
+    Both checks are vault-wide by construction: they re-render everything and
+    read every note. Refusing on all of it would mean one occurrence that renders
+    badly withholds the receipt of every other occurrence, for as long as it
+    stays in the ledger — the malformed-artifact blast radius the meeting path
+    exists to contain. So a finding another current occurrence owns is skipped,
+    and everything else still refuses: findings `verify_meeting_semantics` could
+    not attribute to any single current occurrence (a missing index, a stray
+    note, and every leakage finding) belong to the projection as a whole and
+    block every publication until they are gone.
+
+    `elsewhere` is called only when there is drift, and returns the note paths of
+    the other current occurrences.
+
+    Findings name a path and an invariant, never a line of a file. The offending
     file is not opened here — least of all for `meeting.leakage.forbidden-content`,
-    where quoting the leak would copy it into the operator's log."""
-    findings = out["semantic"]
+    where quoting the leak would copy it into the operator's log.
+    """
+    findings = [f for f in out["semantic"]
+                if f["occurrence_id"] in (None, occurrence_id)]
     if findings:
         raise PublishRefused(
             "verify",
             f"the vault fails {len(findings)} meeting invariant check(s): "
             + "; ".join(f"{f['invariant']} on {f['path']}" for f in findings),
             tuple(sorted({f["invariant"] for f in findings})))
-    drift = {key: out[key] for key in ("missing", "unexpected", "differing") if out[key]}
-    if drift:
-        raise PublishRefused(
-            "verify", "the vault drifted from the ledger render: "
-            + "; ".join(f"{key}: {', '.join(paths)}" for key, paths in drift.items()))
+    drifted = {key: out[key] for key in ("missing", "unexpected", "differing") if out[key]}
+    if drifted:
+        others = elsewhere()
+        drift = {key: [path for path in paths if path not in others]
+                 for key, paths in drifted.items()}
+        drift = {key: paths for key, paths in drift.items() if paths}
+        if drift:
+            raise PublishRefused(
+                "verify", "the vault drifted from the ledger render: "
+                + "; ".join(f"{key}: {', '.join(paths)}" for key, paths in drift.items()))
+
+
+def _other_note_paths(conn: sqlite3.Connection, ids: IdentityMaps,
+                      occurrence_id: str) -> set[str]:
+    """Where the ledger says every *other* current occurrence's note belongs."""
+    paths = set()
+    for row in list_meetings(conn):
+        if row["occurrence_id"] == occurrence_id:
+            continue
+        meeting = get_meeting(conn, row["occurrence_id"])
+        if meeting is not None:
+            paths.add(str(_meeting_facts(meeting, ids)["rel"]))
+    return paths
 
 
 def _write_receipt(path: Path, blob: bytes) -> None:
@@ -161,8 +196,12 @@ def publish_meeting(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path
     except Exception as error:
         raise PublishRefused("render", f"the vault render failed: {error}") from error
 
-    _refuse_on_drift(verify_vault(conn, ids, vault_dir, today, weeks=weeks,
-                                  channel_names=channel_names, semantic=True))
+    _refuse_on_drift(
+        verify_vault(conn, ids, vault_dir, today, weeks=weeks,
+                     channel_names=channel_names, semantic=True),
+        occurrence_id,
+        lambda: _other_note_paths(conn, ids, occurrence_id),
+    )
 
     try:
         # A clean tree is not a failure: the note is already committed, and the

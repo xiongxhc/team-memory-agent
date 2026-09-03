@@ -1375,3 +1375,26 @@ def test_main_process_meetings_rejects_a_now_without_a_utc_offset(
     assert main(["process-meetings", "--now", "2026-09-02 16:00"]) == 2
     assert "--now" in capsys.readouterr().err
     assert not (tmp_path / "ledger.db").exists()
+
+
+def test_a_partial_meeting_configuration_leaves_the_daily_pipeline_working(
+    tmp_path, monkeypatch, capsys
+):
+    """Half-written meeting settings in a live hub.env must not stop the daily
+    timer. Only the meeting command refuses, and it names what is missing."""
+    monkeypatch.setenv("TEAMMEM_DB", str(tmp_path / "ledger.db"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    monkeypatch.setenv("TEAMMEM_VAULT", str(tmp_path / "vault"))
+    monkeypatch.setenv("TEAMMEM_MEETING_INBOX", str(tmp_path / "meeting-inbox"))
+    for key in ("TEAMMEM_MEETING_ARCHIVE", "TEAMMEM_MEETING_QUARANTINE",
+                "TEAMMEM_MEETING_AUDIO_STORE", "TEAMMEM_MEETING_RECEIPTS",
+                "TEAMMEM_MEETING_ALERTS", "TEAMMEM_VAULT_WEB_BASE"):
+        monkeypatch.delenv(key, raising=False)
+
+    assert main(["render", "--today", "2026-07-16"]) == 0
+    assert (tmp_path / "vault" / "README.md").is_file()
+    capsys.readouterr()
+
+    assert main(["process-meetings", "--now", MEETING_NOW]) == 2
+    assert "TEAMMEM_MEETING_ARCHIVE" in capsys.readouterr().err
+    assert not (tmp_path / "meeting-inbox").exists()   # nothing half-made

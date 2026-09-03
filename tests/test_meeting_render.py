@@ -22,7 +22,8 @@ import pytest
 from teammem.events import Event
 from teammem.identity import IdentityMaps
 from teammem.meeting_bundles import canonical_artifact_hash, short_occurrence_id
-from teammem.meeting_store import StagedAudio, import_meeting_revision
+from teammem.meeting_store import (StagedAudio, import_meeting_revision,
+                                   list_meetings)
 from teammem import meeting_render
 from teammem.render import (MANAGED, MEETING_INVARIANTS, render_vault,
                             verify_meeting_semantics, verify_vault)
@@ -810,8 +811,14 @@ def test_findings_are_sorted_and_carry_only_paths_and_invariant_names(tmp_path):
     (vault / "Meetings" / WEEK / NOTE).unlink()
     found = _findings(conn, vault)
     assert found == sorted(found, key=lambda f: (f["invariant"], f["path"], f["detail"]))
-    assert all(set(f) == {"invariant", "path", "detail"} for f in found)
+    assert all(set(f) == {"invariant", "path", "detail", "occurrence_id"}
+               for f in found)
     assert {f["invariant"] for f in found} <= set(MEETING_INVARIANTS)
+    # every finding is either the fault of a current occurrence or of nothing
+    # smaller than the projection itself
+    current = {row["occurrence_id"] for row in list_meetings(conn)}
+    assert all(f["occurrence_id"] in current or f["occurrence_id"] is None
+               for f in found)
 
 
 def test_a_no_show_is_not_expected_to_have_a_page_or_a_backlink(tmp_path):
@@ -846,6 +853,7 @@ def test_a_note_moved_off_its_canonical_path_is_reported(tmp_path):
         "invariant": ONE_PER_OCCURRENCE,
         "path": f"Meetings/{WEEK}/renamed.md",
         "detail": f"the note is not at its canonical path Meetings/{WEEK}/{NOTE}",
+        "occurrence_id": _payload()["occurrence_id"],
     }]
 
 
@@ -855,7 +863,8 @@ def test_a_missing_project_page_is_reported_as_a_backlink_failure(tmp_path):
     shutil.rmtree(vault / "Projects" / "project-cygnus")
     assert {"invariant": PROJECT_BACKLINKS,
             "path": "Projects/project-cygnus/README.md",
-            "detail": "no page at all for a meeting backlink"} in _findings(conn, vault)
+            "detail": "no page at all for a meeting backlink",
+            "occurrence_id": _payload()["occurrence_id"]} in _findings(conn, vault)
 
 
 def test_the_expected_note_path_comes_from_the_ledger_not_from_the_renderer(tmp_path):
@@ -887,4 +896,22 @@ def test_the_expected_note_path_comes_from_the_ledger_not_from_the_renderer(tmp_
         "invariant": ONE_PER_OCCURRENCE,
         "path": f"Meetings/{WEEK}/wrong-name.md",
         "detail": f"the note is not at its canonical path Meetings/{WEEK}/{NOTE}",
+        "occurrence_id": _payload()["occurrence_id"],
     }]
+
+
+def test_a_note_for_an_occurrence_the_ledger_dropped_is_a_vault_wide_finding(tmp_path):
+    """Nobody can publish a non-current occurrence, so a finding attributed to
+    one could never block anything. It belongs to the projection as a whole."""
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    note = vault / "Meetings" / WEEK / NOTE
+    (note.parent / "stray.md").write_text(
+        note.read_text(encoding="utf-8").replace(
+            _payload()["occurrence_id"], "vc:9f3a/board-sync@2019-01-01T00:00:00Z"),
+        encoding="utf-8")
+
+    found = [f for f in _findings(conn, vault) if f["invariant"] == ONE_PER_OCCURRENCE]
+    assert [f["detail"] for f in found] == [
+        "a note for an occurrence the ledger does not hold as current"]
+    assert found[0]["occurrence_id"] is None

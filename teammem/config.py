@@ -207,8 +207,11 @@ def validate_meeting_settings(cfg: "Config") -> None:
         raise ValueError("TEAMMEM_VAULT_REF must be a full ref, e.g. refs/heads/main")
 
     named = [(key, getattr(cfg, field)) for field, key in MEETING_PATH_SETTINGS]
-    if cfg.vault_dir.is_absolute():
-        named.append(("TEAMMEM_VAULT", cfg.vault_dir))
+    # A relative vault is still a real directory under the working directory, and
+    # a receipt outbox inside it would still be published; resolve it rather than
+    # exempt it.
+    named.append(("TEAMMEM_VAULT", cfg.vault_dir if cfg.vault_dir.is_absolute()
+                  else Path.cwd() / cfg.vault_dir))
     for position, (key, path) in enumerate(named):
         for other_key, other in named[position + 1:]:
             if path == other:
@@ -327,5 +330,8 @@ class Config:
             vault_remote=values.get("TEAMMEM_VAULT_REMOTE", cls.vault_remote),
             vault_ref=values.get("TEAMMEM_VAULT_REF", cls.vault_ref),
         )
-        validate_meeting_settings(cfg)
+        # Deliberately not validated here. `Config.load` runs for every command,
+        # and a half-written meeting configuration in a live env file must not
+        # stop the daily timer from collecting and rendering. The meeting
+        # commands validate before they do anything, so they still fail loudly.
         return cfg

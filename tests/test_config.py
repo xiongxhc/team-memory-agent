@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from teammem.config import Config, default_env_file, read_env_file
+from teammem.config import (Config, default_env_file, read_env_file,
+                            validate_meeting_settings)
 
 
 @pytest.fixture
@@ -212,6 +213,7 @@ def test_meetings_are_disabled_and_require_nothing_when_no_setting_is_present(
 
 def test_a_complete_meeting_configuration_loads(tmp_path, empty_env_file):
     cfg = Config.load(env=_meeting_env(tmp_path), env_file=empty_env_file)
+    validate_meeting_settings(cfg)
     assert cfg.meetings_enabled is True
     assert cfg.meeting_inbox == tmp_path / "meeting-inbox"
     assert cfg.meeting_archive == tmp_path / "meeting-archive"
@@ -226,16 +228,18 @@ def test_a_complete_meeting_configuration_loads(tmp_path, empty_env_file):
 def test_one_missing_meeting_setting_refuses_the_whole_set(
     tmp_path, empty_env_file, missing
 ):
-    env = _meeting_env(tmp_path, **{missing: None})
+    cfg = Config.load(env=_meeting_env(tmp_path, **{missing: None}),
+                      env_file=empty_env_file)
     with pytest.raises(ValueError) as failure:
-        Config.load(env=env, env_file=empty_env_file)
+        validate_meeting_settings(cfg)
     assert missing in str(failure.value)       # names the one the operator forgot
 
 
 def test_a_relative_meeting_path_is_refused(tmp_path, empty_env_file):
-    env = _meeting_env(tmp_path, TEAMMEM_MEETING_INBOX="meeting-inbox")
+    cfg = Config.load(env=_meeting_env(tmp_path, TEAMMEM_MEETING_INBOX="meeting-inbox"),
+                      env_file=empty_env_file)
     with pytest.raises(ValueError) as failure:
-        Config.load(env=env, env_file=empty_env_file)
+        validate_meeting_settings(cfg)
     assert "TEAMMEM_MEETING_INBOX" in str(failure.value)
     assert "absolute" in str(failure.value)
 
@@ -243,11 +247,11 @@ def test_a_relative_meeting_path_is_refused(tmp_path, empty_env_file):
 def test_two_meeting_settings_naming_one_directory_are_refused(
     tmp_path, empty_env_file
 ):
-    env = _meeting_env(
-        tmp_path, TEAMMEM_MEETING_ARCHIVE=str(tmp_path / "meeting-inbox")
-    )
+    cfg = Config.load(env=_meeting_env(
+        tmp_path, TEAMMEM_MEETING_ARCHIVE=str(tmp_path / "meeting-inbox")),
+        env_file=empty_env_file)
     with pytest.raises(ValueError) as failure:
-        Config.load(env=env, env_file=empty_env_file)
+        validate_meeting_settings(cfg)
     message = str(failure.value)
     # both offenders named, because either one may be the typo
     assert "TEAMMEM_MEETING_INBOX" in message and "TEAMMEM_MEETING_ARCHIVE" in message
@@ -256,21 +260,21 @@ def test_two_meeting_settings_naming_one_directory_are_refused(
 def test_a_meeting_directory_nested_in_another_is_refused(tmp_path, empty_env_file):
     # the archive under the inbox is the concrete hazard: the importer walks the
     # inbox, so it would re-read everything it just archived
-    env = _meeting_env(
-        tmp_path, TEAMMEM_MEETING_ARCHIVE=str(tmp_path / "meeting-inbox" / "done")
-    )
+    cfg = Config.load(env=_meeting_env(
+        tmp_path, TEAMMEM_MEETING_ARCHIVE=str(tmp_path / "meeting-inbox" / "done")),
+        env_file=empty_env_file)
     with pytest.raises(ValueError) as failure:
-        Config.load(env=env, env_file=empty_env_file)
+        validate_meeting_settings(cfg)
     assert "TEAMMEM_MEETING_ARCHIVE" in str(failure.value)
 
 
 def test_a_meeting_directory_inside_the_vault_is_refused(tmp_path, empty_env_file):
     # the vault is published; a receipt or a transcript bundle inside it would be
-    env = _meeting_env(
-        tmp_path, TEAMMEM_MEETING_RECEIPTS=str(tmp_path / "vault" / "receipts")
-    )
+    cfg = Config.load(env=_meeting_env(
+        tmp_path, TEAMMEM_MEETING_RECEIPTS=str(tmp_path / "vault" / "receipts")),
+        env_file=empty_env_file)
     with pytest.raises(ValueError) as failure:
-        Config.load(env=env, env_file=empty_env_file)
+        validate_meeting_settings(cfg)
     assert "TEAMMEM_MEETING_RECEIPTS" in str(failure.value)
     assert "TEAMMEM_VAULT" in str(failure.value)
 
@@ -283,9 +287,10 @@ def test_a_meeting_directory_inside_the_vault_is_refused(tmp_path, empty_env_fil
 def test_the_web_base_shape_is_enforced_by_meeting_publish(
     tmp_path, empty_env_file, value
 ):
-    env = _meeting_env(tmp_path, TEAMMEM_VAULT_WEB_BASE=value)
+    cfg = Config.load(env=_meeting_env(tmp_path, TEAMMEM_VAULT_WEB_BASE=value),
+                      env_file=empty_env_file)
     with pytest.raises(ValueError) as failure:
-        Config.load(env=env, env_file=empty_env_file)
+        validate_meeting_settings(cfg)
     assert "TEAMMEM_VAULT_WEB_BASE" in str(failure.value)
 
 
@@ -299,17 +304,19 @@ def test_a_trailing_slash_on_the_web_base_is_normalised(tmp_path, empty_env_file
 
 @pytest.mark.parametrize("value", ["main", "heads/main", "refs/heads/ma in", ""])
 def test_the_vault_ref_must_be_a_full_ref(tmp_path, empty_env_file, value):
-    env = _meeting_env(tmp_path, TEAMMEM_VAULT_REF=value)
+    cfg = Config.load(env=_meeting_env(tmp_path, TEAMMEM_VAULT_REF=value),
+                      env_file=empty_env_file)
     with pytest.raises(ValueError) as failure:
-        Config.load(env=env, env_file=empty_env_file)
+        validate_meeting_settings(cfg)
     assert "TEAMMEM_VAULT_REF" in str(failure.value)
 
 
 @pytest.mark.parametrize("value", ["", "or igin", "-origin"])
 def test_the_vault_remote_must_be_a_plain_name(tmp_path, empty_env_file, value):
-    env = _meeting_env(tmp_path, TEAMMEM_VAULT_REMOTE=value)
+    cfg = Config.load(env=_meeting_env(tmp_path, TEAMMEM_VAULT_REMOTE=value),
+                      env_file=empty_env_file)
     with pytest.raises(ValueError) as failure:
-        Config.load(env=env, env_file=empty_env_file)
+        validate_meeting_settings(cfg)
     assert "TEAMMEM_VAULT_REMOTE" in str(failure.value)
 
 
@@ -320,3 +327,29 @@ def test_the_remote_and_ref_are_overridable(tmp_path, empty_env_file):
         env_file=empty_env_file,
     )
     assert (cfg.vault_remote, cfg.vault_ref) == ("team-vault", "refs/heads/master")
+
+
+def test_a_partial_meeting_configuration_still_loads(tmp_path, empty_env_file):
+    """`Config.load` never validates the meeting set. An operator halfway through
+    editing a live hub.env must not take the daily timer down with them."""
+    cfg = Config.load(env={"TEAMMEM_MEETING_INBOX": str(tmp_path / "meeting-inbox")},
+                      env_file=empty_env_file)
+    assert cfg.meetings_enabled is True
+    assert cfg.meeting_archive is None
+    with pytest.raises(ValueError) as failure:
+        validate_meeting_settings(cfg)
+    assert "TEAMMEM_MEETING_ARCHIVE" in str(failure.value)
+
+
+def test_a_relative_vault_still_cannot_contain_a_meeting_directory(
+    tmp_path, monkeypatch, empty_env_file
+):
+    monkeypatch.chdir(tmp_path)
+    cfg = Config.load(env=_meeting_env(
+        tmp_path, TEAMMEM_VAULT="vault",
+        TEAMMEM_MEETING_RECEIPTS=str(tmp_path / "vault" / "receipts")),
+        env_file=empty_env_file)
+    with pytest.raises(ValueError) as failure:
+        validate_meeting_settings(cfg)
+    assert "TEAMMEM_MEETING_RECEIPTS" in str(failure.value)
+    assert "TEAMMEM_VAULT" in str(failure.value)

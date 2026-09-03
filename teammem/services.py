@@ -771,22 +771,29 @@ def prepare_meeting_dirs(cfg: Config, *, create: bool = True) -> None:
     none of these may be group- or world-accessible. They are created here at
     0700 rather than left to the importer, which would otherwise make them with
     the process umask and fail this check on the next run.
+
+    Every path is judged before any is created, so a set that is refused leaves
+    nothing half-made behind.
     """
+    absent = []
     for field, key in MEETING_PATH_SETTINGS:
         path = getattr(cfg, field)
         if path.is_symlink():
             raise ValueError(f"{key} must not be a symlink: {path}")
         if not path.exists():
-            if not create:
-                continue
-            path.mkdir(parents=True, exist_ok=True)
-            os.chmod(path, 0o700)
+            absent.append(path)
+            continue
         if not path.is_dir():
             raise ValueError(f"{key} must be a directory: {path}")
         if stat.S_IMODE(path.stat().st_mode) & 0o077:
             raise ValueError(
                 f"{key} must not be group- or world-accessible: {path}"
             )
+    if not create:
+        return
+    for path in absent:
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
 
 
 def _check_publication_target(cfg: Config) -> None:
@@ -839,12 +846,17 @@ def _vault_head(vault_dir: Path) -> str | None:
         return None
 
 
-def _managed_snapshot(vault_dir: Path) -> dict[str, bytes]:
-    return {rel: (vault_dir / rel).read_bytes()
-            for rel in managed_vault_files(vault_dir)}
+def _managed_snapshot(vault_dir: Path) -> dict[str, tuple[bytes, int]]:
+    """Bytes and mode, because a re-render writes at the process umask and an
+    operator who tightened a managed file must get that file back as it was."""
+    snapshot = {}
+    for rel in managed_vault_files(vault_dir):
+        path = vault_dir / rel
+        snapshot[rel] = (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+    return snapshot
 
 
-def _restore_managed(vault_dir: Path, snapshot: dict[str, bytes]) -> None:
+def _restore_managed(vault_dir: Path, snapshot: dict[str, tuple[bytes, int]]) -> None:
     """Put the vault's managed projection back exactly as it was.
 
     `publish_meeting` renders before it verifies, so a refusal at the verify gate
@@ -864,10 +876,11 @@ def _restore_managed(vault_dir: Path, snapshot: dict[str, bytes]) -> None:
             shutil.rmtree(path)
         elif path.exists():
             path.unlink()
-    for rel, blob in snapshot.items():
+    for rel, (blob, mode) in snapshot.items():
         path = vault_dir / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(blob)
+        os.chmod(path, mode)
 
 
 def execute_process_meetings(

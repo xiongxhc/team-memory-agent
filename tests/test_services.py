@@ -718,9 +718,11 @@ import hashlib
 import os
 import shutil
 import sqlite3
+import stat
 
 import pytest
 
+from teammem import meeting_render
 from teammem import render as render_module
 from teammem import services as services_module
 from teammem.meeting_bundles import occurrence_path_segment
@@ -765,17 +767,20 @@ class _Bench:
         return run_process_meetings(self.cfg, self.ids, now=now, dry_run=dry_run)
 
     def managed(self):
-        """Every managed vault file and its bytes — the projection render owns."""
+        """Every managed vault file with its bytes and mode — what render owns."""
+        def entry(path):
+            return (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+
         found = {}
         for name in render_module.MANAGED:
             path = self.vault / name
             if path.is_dir():
                 found.update({
-                    child.relative_to(self.vault).as_posix(): child.read_bytes()
+                    child.relative_to(self.vault).as_posix(): entry(child)
                     for child in path.rglob("*") if child.is_file()
                 })
             elif path.is_file():
-                found[name] = path.read_bytes()
+                found[name] = entry(path)
         return found
 
 
@@ -887,14 +892,22 @@ def test_a_refused_verify_leaves_nothing_a_later_run_could_commit(bench, monkeyp
     published = _payload(day=OTHER_DAY)
     bench.drop(published)
     assert bench.run() == 0
+    # a mode the render would not reproduce, so the restore has to carry it
+    note = next((bench.vault / "Meetings").rglob("*[[]*.md"))
+    note.chmod(0o600)
     before = bench.managed()
     head = _git(bench.vault, "rev-parse", "HEAD")
 
-    finding = [{"invariant": "meeting.project.backlinks", "path": "Meetings/x.md"}]
-    monkeypatch.setattr(render_module, "verify_meeting_semantics",
-                        lambda *a, **kw: finding)
     refused = _payload()
     bench.drop(refused)
+    # a real renderer bug against the new occurrence: its note is written without
+    # the project backlinks the ledger says it must have, which the diff cannot
+    # see because the re-render is wrong in exactly the same way
+    real = meeting_render.project_backlinks
+    monkeypatch.setattr(
+        meeting_render, "project_backlinks",
+        lambda notes: real([n for n in notes
+                            if n.occurrence_id != refused["occurrence_id"]]))
 
     assert bench.run() == 1
     assert not bench.receipt(refused["occurrence_id"]).exists()
@@ -940,8 +953,8 @@ def test_a_vault_publishing_to_another_ref_refuses_before_rendering(bench):
     bench.cfg.vault_ref = "refs/heads/somewhere-else"
 
     assert bench.run() == 2
-    assert not any(bench.cfg.meeting_receipts.rglob("*.json")) \
-        if bench.cfg.meeting_receipts.exists() else True
+    assert bench.cfg.meeting_receipts.is_dir()     # prepared, then refused
+    assert list(bench.cfg.meeting_receipts.iterdir()) == []
     assert bench.managed() == {}                   # nothing rendered
 
 
@@ -960,7 +973,11 @@ def test_a_group_readable_meeting_directory_is_refused(bench):
     bench.cfg.meeting_audio_store.chmod(0o755)
 
     assert bench.run() == 2
+    # the refused set leaves nothing half-made: the exposed directory is the
+    # fourth of six, and the ones before it are not created either
     assert not bench.cfg.meeting_receipts.exists()
+    assert not bench.cfg.meeting_archive.exists()
+    assert not bench.cfg.meeting_quarantine.exists()
     assert bench.managed() == {}
 
 
@@ -1061,3 +1078,57 @@ def test_a_commit_that_landed_is_never_rolled_back_by_a_later_refusal(bench):
     assert bench.run() == 1                        # refused at the receipt stage
     assert _git(bench.vault, "status", "--porcelain") == ""
     assert (bench.vault / "Meetings").is_dir()     # the published note is still there
+
+
+def test_one_occurrence_that_fails_verification_does_not_block_another(
+    bench, monkeypatch
+):
+    """The invariant checks read the whole vault, so a refusal has to be scoped
+    to the occurrence that earned it. Here one note is genuinely rendered without
+    its project backlinks — the real checker reads the real vault and reports it
+    — and the other occurrence still reaches a receipt in the same run."""
+    broken = _payload(day=OTHER_DAY)             # earlier: attempted first
+    sound = _payload()
+    bench.drop(broken)
+    bench.drop(sound)
+
+    real = meeting_render.project_backlinks
+    monkeypatch.setattr(
+        meeting_render, "project_backlinks",
+        lambda notes: real([n for n in notes
+                            if n.occurrence_id != broken["occurrence_id"]]))
+
+    assert bench.run() == 1
+
+    assert not bench.receipt(broken["occurrence_id"]).exists()
+    receipt = json.loads(bench.receipt(sound["occurrence_id"]).read_text())
+    assert receipt["occurrence_id"] == sound["occurrence_id"]
+    assert _remote_ref(bench.bare, bench.branch) == receipt["vault_commit"]
+
+    conn = open_db(bench.cfg.db_path)
+    findings = render_module.verify_meeting_semantics(conn, bench.ids, bench.vault)
+    assert {f["occurrence_id"] for f in findings} == {broken["occurrence_id"]}
+    assert {f["invariant"] for f in findings} == {"meeting.project.backlinks"}
+
+    monkeypatch.undo()                           # the renderer bug is fixed
+    assert bench.run() == 0
+    assert json.loads(bench.receipt(broken["occurrence_id"]).read_text())[
+        "occurrence_id"] == broken["occurrence_id"]
+
+
+def test_an_unattributable_finding_blocks_every_occurrence(bench):
+    """Leaked content could have come from any revision, so nothing publishes
+    while it is in the vault — and the file is never read to say what leaked."""
+    first = _payload(day=OTHER_DAY)
+    second = _payload()
+    bench.drop(first)
+    bench.drop(second)
+    sentence = first["transcript"][0]["text"]
+    (bench.vault / "Docs" / "jottings.md").write_text(
+        f"# jottings\n\n{sentence}\n", encoding="utf-8")
+    before = _remote_ref(bench.bare, bench.branch)
+
+    assert bench.run() == 1
+
+    assert not any(bench.cfg.meeting_receipts.iterdir())
+    assert _remote_ref(bench.bare, bench.branch) == before

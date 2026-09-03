@@ -833,14 +833,21 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
                              vault_dir: Path) -> list[dict]:
     """Check the rendered vault against the meeting invariants.
 
-    Returns a sorted list of `{"invariant", "path", "detail"}` findings; an
-    empty list means the vault satisfies every invariant in
+    Returns a sorted list of `{"invariant", "path", "detail", "occurrence_id"}`
+    findings; an empty list means the vault satisfies every invariant in
     `MEETING_INVARIANTS`. Reads the vault and the ledger and writes nothing.
+
+    `occurrence_id` is the current occurrence a finding is the fault of, or
+    `None` when it is the fault of the projection as a whole — a missing index,
+    a stray note the ledger no longer holds, leaked content that could have come
+    from any revision. A caller publishing one occurrence may skip another
+    occurrence's findings; it may never skip an unattributed one.
     """
     findings: list[dict] = []
 
-    def report(invariant: str, path, detail: str) -> None:
-        findings.append({"invariant": invariant, "path": str(path), "detail": detail})
+    def report(invariant: str, path, detail: str, occurrence_id: str | None = None) -> None:
+        findings.append({"invariant": invariant, "path": str(path), "detail": detail,
+                         "occurrence_id": occurrence_id})
 
     expected = {}
     for row in list_meetings(conn):
@@ -869,20 +876,26 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
         facts = expected.get(occurrence_id)
         if facts is None:
             for rel, _, _ in entries:
+                # Attributed to an occurrence that is not current, so the
+                # normalisation below turns it into a vault-wide finding.
                 report(one, rel,
-                       "a note for an occurrence the ledger does not hold as current")
+                       "a note for an occurrence the ledger does not hold as current",
+                       occurrence_id)
             continue
         chosen = next((e for e in entries if e[0] == facts["rel"]), None)
         if chosen is None:
             chosen = entries[0]
-            report(one, chosen[0], f"the note is not at its canonical path {facts['rel']}")
+            report(one, chosen[0], f"the note is not at its canonical path {facts['rel']}",
+                   occurrence_id)
         for rel, _, _ in entries:
             if rel != chosen[0]:
-                report(one, rel, "a duplicate of a note already rendered for this occurrence")
+                report(one, rel, "a duplicate of a note already rendered for this occurrence",
+                       occurrence_id)
         canonical[occurrence_id] = chosen
     for occurrence_id, facts in sorted(expected.items()):
         if occurrence_id not in canonical:
-            report(one, facts["rel"], "no canonical note for a current occurrence")
+            report(one, facts["rel"], "no canonical note for a current occurrence",
+                   occurrence_id)
 
     # ---- per-note structure -------------------------------------------------
     for occurrence_id, (rel, text, front) in sorted(canonical.items()):
@@ -890,30 +903,37 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
         lines = text.splitlines()
         if [l for l in lines if l.startswith("# ")] != [f"# {facts['title']}"]:
             report("meeting.note.heading-order", rel,
-                   "the title heading is not the meeting topic")
+                   "the title heading is not the meeting topic", occurrence_id)
         sections = tuple(l[3:].strip() for l in lines if l.startswith("## "))
         if sections != meeting_render.NOTE_HEADINGS:
             report("meeting.note.heading-order", rel,
-                   "the sections are not the nine canonical headings in order")
+                   "the sections are not the nine canonical headings in order",
+                   occurrence_id)
 
         summaries = [l[4:].strip() for l in lines if l.startswith("### ")]
         for who in [w for w in summaries if w not in facts["speakers"]]:
             report("meeting.note.per-person-summaries", rel,
-                   f"a per-person summary for a participant with no reconciled speech: {who}")
+                   f"a per-person summary for a participant with no reconciled speech: {who}",
+                   occurrence_id)
         for who in [w for w in facts["speakers"] if w not in summaries]:
             report("meeting.note.per-person-summaries", rel,
-                   f"no per-person summary for a participant who spoke: {who}")
+                   f"no per-person summary for a participant who spoke: {who}",
+                   occurrence_id)
         if sorted(summaries) == sorted(facts["speakers"]) and summaries != facts["speakers"]:
             report("meeting.note.per-person-summaries", rel,
-                   "the per-person summaries are not in the meeting's own order")
+                   "the per-person summaries are not in the meeting's own order",
+                   occurrence_id)
 
         if front.get("revision") != str(facts["revision"]):
             report("meeting.note.revision-current", rel,
                    f"the note renders revision {front.get('revision')}; "
-                   f"the current revision is {facts['revision']}")
+                   f"the current revision is {facts['revision']}", occurrence_id)
 
     # ---- weekly index membership -------------------------------------------
     index_invariant = "meeting.week-index.membership"
+    # Which occurrence owns each canonical note, for the findings that name one.
+    owner = {str(rel): occurrence_id
+             for occurrence_id, (rel, _, _) in canonical.items()}
     by_week: dict[PurePosixPath, set[str]] = {}
     for rel, _, _ in canonical.values():
         by_week.setdefault(rel.parent, set()).add(rel.name)
@@ -926,7 +946,8 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
         listed = {unquote(t) for t in _MD_LINK.findall(page.read_text(encoding="utf-8"))
                   if not t.startswith("../")}
         for name in sorted(names - listed):
-            report(index_invariant, rel, f"the week index omits a canonical note: {name}")
+            report(index_invariant, rel, f"the week index omits a canonical note: {name}",
+                   owner.get(str(parent / name)))
         for name in sorted(listed - names):
             report(index_invariant, rel,
                    f"the week index lists a file that is not a canonical note: {name}")
@@ -963,12 +984,12 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
             for folder, page_rel, text in pages:
                 links = tail in text
                 if folder in wanted and not links:
-                    report(invariant, page_rel, absent)
+                    report(invariant, page_rel, absent, occurrence_id)
                 elif folder not in wanted and links:
-                    report(invariant, page_rel, present)
+                    report(invariant, page_rel, present, occurrence_id)
             for folder in sorted(wanted - folders):
                 report(invariant, PurePosixPath(top, folder, "README.md"),
-                       "no page at all for a meeting backlink")
+                       "no page at all for a meeting backlink", occurrence_id)
 
     # ---- every relative link resolves inside the vault ----------------------
     root_dir = vault_dir.resolve()
@@ -987,7 +1008,8 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
             resolved = (path.parent / unquote(target)).resolve()
             if not resolved.is_relative_to(root_dir) or not resolved.exists():
                 report("meeting.link.resolves", name,
-                       f"a relative link does not resolve inside the vault: {target}")
+                       f"a relative link does not resolve inside the vault: {target}",
+                       owner.get(name))
 
     # ---- nothing forbidden anywhere under the vault -------------------------
     forbidden = _forbidden_values(conn, sorted(expected))
@@ -1001,4 +1023,10 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
                 report("meeting.leakage.forbidden-content", "/".join(rel_parts),
                        f"{kind} from the ledger appears in this file")
 
+    # An occurrence the ledger does not hold as current can never be published,
+    # so a finding attributed to one could never block anything. Those, and every
+    # finding nothing could attribute, belong to the projection as a whole.
+    for finding in findings:
+        if finding["occurrence_id"] not in expected:
+            finding["occurrence_id"] = None
     return sorted(findings, key=lambda f: (f["invariant"], f["path"], f["detail"]))
