@@ -421,6 +421,15 @@ file, no commit, no push, no receipt.
 anything if the vault publishes somewhere else, so a receipt cannot name a
 commit on a remote nobody reads.
 
+`teammem render` and the daily run publish the vault too, so they check meeting
+content before they commit it. A meeting that fails a check — a note that
+contradicts the ledger, a name that collides with a page the vault already owns,
+ledger content that reached a note — is withheld from the vault and named on
+stderr, while every other page renders, commits and pushes as it always did. A
+withheld meeting stays in the ledger and is filed again as soon as a corrected
+revision lands. If a check fails on vault content no meeting owns, the run
+commits and pushes nothing and exits `1`.
+
 #### Audio retention
 
 TeamMem computes one expiry for a recording, `ended_at` plus fourteen days, and
