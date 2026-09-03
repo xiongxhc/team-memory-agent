@@ -720,8 +720,37 @@ MEETING_INVARIANTS = (
 # Shorter transcript lines ("Yes.") legitimately recur in a summary; matching
 # them would make every vault look like a leak.
 _MIN_LEAKED_TEXT = 24
-# CommonMark inline links, tolerating one level of balanced parens in a target.
-_MD_LINK = re.compile(r"\[[^\]]*\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)\)")
+
+
+def _md_links(text: str) -> list[str]:
+    """Every inline-link destination in `text`.
+
+    Hand-written rather than a regular expression: a CommonMark destination may
+    carry balanced parentheses to any depth, an expression can only count to a
+    fixed one, and a destination cut short at the wrong parenthesis reads as a
+    link to a file that does not exist.
+    """
+    found, cursor = [], 0
+    while (opened := text.find("[", cursor)) >= 0:
+        closed = text.find("]", opened + 1)
+        if closed < 0:
+            break
+        if text[closed + 1:closed + 2] != "(":
+            cursor = opened + 1
+            continue
+        depth, index = 1, closed + 2
+        while index < len(text) and depth:
+            character = text[index]
+            if character.isspace():
+                break
+            depth += (character == "(") - (character == ")")
+            index += 1
+        if depth:
+            cursor = closed + 2
+            continue
+        found.append(text[closed + 2:index - 1])
+        cursor = index
+    return found
 
 
 def _unyaml(value: str) -> str:
@@ -852,6 +881,37 @@ def _vault_pages(vault_dir: Path, top: str) -> list[tuple[str, str, str]]:
     return pages
 
 
+def _meeting_expectations(conn: sqlite3.Connection, ids: IdentityMaps) -> dict[str, dict]:
+    """What the vault must say about every current occurrence, from the ledger."""
+    expected = {}
+    for row in list_meetings(conn):
+        meeting = get_meeting(conn, row["occurrence_id"])
+        if meeting is not None:                # deleted between the two reads
+            expected[meeting["occurrence_id"]] = _meeting_facts(meeting, ids)
+    return expected
+
+
+def _meeting_pages(expected: dict[str, dict]) -> dict[str, tuple[str, ...]]:
+    """Vault page -> the occurrences answerable for the meeting content on it.
+
+    Every page the meetings projection writes or writes into: the notes, the
+    indexes above them, and the person and project pages their backlinks land
+    on. A page outside this map carries nothing a meeting put there.
+    """
+    pages: dict[str, list[str]] = {}
+    index = str(PurePosixPath(meeting_render.MEETINGS_DIR, "README.md"))
+    for occurrence_id, facts in sorted(expected.items()):
+        rel = facts["rel"]
+        touched = [str(rel), str(rel.parent / "README.md"), index]
+        touched += [str(PurePosixPath("Person", folder, "README.md"))
+                    for folder in sorted(facts["person_folders"])]
+        touched += [str(PurePosixPath("Projects", folder, "README.md"))
+                    for folder in sorted(facts["project_folders"])]
+        for page in touched:
+            pages.setdefault(page, []).append(occurrence_id)
+    return {page: tuple(owners) for page, owners in sorted(pages.items())}
+
+
 def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
                              vault_dir: Path) -> list[dict]:
     """Check the rendered vault against the meeting invariants.
@@ -872,11 +932,7 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
         findings.append({"invariant": invariant, "path": str(path), "detail": detail,
                          "occurrence_id": occurrence_id})
 
-    expected = {}
-    for row in list_meetings(conn):
-        meeting = get_meeting(conn, row["occurrence_id"])
-        if meeting is not None:                # deleted between the two reads
-            expected[meeting["occurrence_id"]] = _meeting_facts(meeting, ids)
+    expected = _meeting_expectations(conn, ids)
 
     # ---- one canonical file per current occurrence --------------------------
     one = "meeting.note.one-per-occurrence"
@@ -966,7 +1022,7 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
         if not page.is_file():
             report(index_invariant, rel, "the week has notes but no index")
             continue
-        listed = {unquote(t) for t in _MD_LINK.findall(page.read_text(encoding="utf-8"))
+        listed = {unquote(t) for t in _md_links(page.read_text(encoding="utf-8"))
                   if not t.startswith("../")}
         for name in sorted(names - listed):
             report(index_invariant, rel, f"the week index omits a canonical note: {name}",
@@ -981,7 +1037,7 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
             report(index_invariant, top_rel, "the meetings index is missing")
     else:
         text = (vault_dir / top_rel).read_text(encoding="utf-8")
-        listed = {unquote(t).split("/")[0] for t in _MD_LINK.findall(text)
+        listed = {unquote(t).split("/")[0] for t in _md_links(text)
                   if t.endswith("/README.md") and not t.startswith("../")}
         weeks = {parent.name for parent in by_week}
         for week in sorted(weeks - listed):
@@ -1014,14 +1070,25 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
                 report(invariant, PurePosixPath(top, folder, "README.md"),
                        "no page at all for a meeting backlink", occurrence_id)
 
-    # ---- every relative link resolves inside the vault ----------------------
+    # ---- every link a meeting is answerable for resolves --------------------
+    # Scoped to the meeting notes and the meeting links on the pages they
+    # backlink into. A person page keeps full history while the Work Journal
+    # keeps four weeks, so its older week links dangle by design; those are no
+    # meeting's fault, no meeting can repair them, and a finding no occurrence
+    # owns blocks every publication, so this checker does not raise them.
     root_dir = vault_dir.resolve()
-    for name in sorted(_managed_files(vault_dir)):
-        if not name.endswith(".md"):
-            continue
+    prefix = meeting_render.MEETINGS_DIR + "/"
+    by_rel = {str(facts["rel"]): occurrence_id
+              for occurrence_id, facts in expected.items()}
+    by_short = {short_occurrence_id(occurrence_id): occurrence_id
+                for occurrence_id in expected}
+    for name, owners in sorted(_meeting_pages(expected).items()):
         path = vault_dir / name
+        if not path.is_file():        # a page that is missing is another finding
+            continue
+        inside = name.startswith(prefix)
         seen: set[str] = set()
-        for target in _MD_LINK.findall(path.read_text(encoding="utf-8")):
+        for target in _md_links(path.read_text(encoding="utf-8")):
             target = target.split("#", 1)[0]
             if not target or target in seen or "://" in target:
                 continue
@@ -1029,10 +1096,23 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
                 continue
             seen.add(target)
             resolved = (path.parent / unquote(target)).resolve()
-            if not resolved.is_relative_to(root_dir) or not resolved.exists():
+            within = resolved.is_relative_to(root_dir)
+            rel = resolved.relative_to(root_dir).as_posix() if within else None
+            # Who the link belongs to: the occurrence whose note it names, else
+            # the sole occupant of the page it sits on.
+            blamed = by_rel.get(rel)
+            if blamed is None and rel is not None and rel.startswith(prefix):
+                stem = PurePosixPath(rel).stem
+                if stem.endswith("]") and "[" in stem:
+                    blamed = by_short.get(stem.rsplit("[", 1)[1][:-1])
+            if blamed is None:
+                if not inside:
+                    continue          # not a link any meeting put there
+                blamed = owner.get(name) or (owners[0] if len(owners) == 1 else None)
+            if not within or not resolved.exists():
                 report("meeting.link.resolves", name,
                        f"a relative link does not resolve inside the vault: {target}",
-                       owner.get(name))
+                       blamed)
 
     # ---- nothing forbidden anywhere under the vault -------------------------
     probe_len, indexed, unindexed = _forbidden_values(conn, sorted(expected))

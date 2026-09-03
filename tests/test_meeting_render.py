@@ -25,6 +25,7 @@ from teammem.meeting_bundles import canonical_artifact_hash, short_occurrence_id
 from teammem.meeting_store import (StagedAudio, import_meeting_revision,
                                    list_meetings)
 from teammem import meeting_render
+from teammem import render as render_module
 from teammem.render import (MANAGED, MEETING_INVARIANTS, render_vault,
                             verify_meeting_semantics, verify_vault)
 from teammem.store import insert_events, open_db
@@ -915,3 +916,78 @@ def test_a_note_for_an_occurrence_the_ledger_dropped_is_a_vault_wide_finding(tmp
     assert [f["detail"] for f in found] == [
         "a note for an occurrence the ledger does not hold as current"]
     assert found[0]["occurrence_id"] is None
+
+
+# --- what a meeting is answerable for ---------------------------------------
+# The Work Journal projection keeps four weeks while a person page keeps the
+# whole history, so a person page always links weeks the journal no longer
+# renders. Those links dangle by design and no meeting can repair them.
+
+STALE = [
+    Event(person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+          kind="commit", summary="fix: JWT refresh race", hash="s1",
+          project="project-alpha"),
+    Event(person="sam", ts="2026-07-01T09:00:00+04:00", source="gitlab",
+          kind="commit", summary="feat: portal nav", hash="s2",
+          project="project-beta"),
+]
+STALE_WEEK_LINK = "../../Work%20Journal/Week%202026-07-13-17.md"
+
+
+def test_link_targets_carry_balanced_parentheses_to_any_depth():
+    assert render_module._md_links("[a](b(c(d)e)f) and [g](h.md)") == [
+        "b(c(d)e)f", "h.md"]
+    assert render_module._md_links("[r]( x.md)") == []      # a space ends a target
+    assert render_module._md_links("[u](https://x/a1)") == ["https://x/a1"]
+
+
+def test_activity_older_than_the_journal_window_raises_no_meeting_finding(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, STALE)
+    vault = _render(tmp_path, conn)
+    assert STALE_WEEK_LINK in (vault / "Person" / "Alex Rivera" / "README.md").read_text()
+    assert not (vault / "Work Journal" / "Week 2026-07-13-17.md").exists()
+    assert _findings(conn, vault) == []
+
+
+def test_a_meeting_on_a_vault_of_older_activity_is_clean(tmp_path):
+    conn = _seeded(tmp_path)
+    insert_events(conn, STALE)
+    vault = _render(tmp_path, conn)
+    assert STALE_WEEK_LINK in (vault / "Person" / "Alex Rivera" / "README.md").read_text()
+    assert _findings(conn, vault) == []
+
+
+def test_a_broken_link_inside_a_note_is_charged_to_its_occurrence(tmp_path):
+    conn = _seeded(tmp_path)
+    insert_events(conn, STALE)
+    vault = _render(tmp_path, conn)
+    _edit(vault / "Meetings" / WEEK / NOTE, "[Meetings](../README.md)",
+          "[Meetings](../READMEE.md)")
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [LINK_RESOLVES]
+    assert found[0]["occurrence_id"] == _payload()["occurrence_id"]
+
+
+def test_a_backlink_to_a_missing_note_is_charged_to_its_occurrence(tmp_path):
+    conn = _seeded(tmp_path)
+    insert_events(conn, STALE)
+    vault = _render(tmp_path, conn)
+    (vault / "Meetings" / WEEK / NOTE).unlink()
+    dangling = [f for f in _findings(conn, vault) if f["invariant"] == LINK_RESOLVES]
+    assert {f["path"] for f in dangling} >= {"Projects/project-atlas/README.md"}
+    assert {f["occurrence_id"] for f in dangling} == {_payload()["occurrence_id"]}
+
+
+def test_a_link_target_with_nested_parentheses_is_not_cut_short(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render(tmp_path, conn)
+    (vault / "Docs").mkdir()
+    (vault / "Docs" / "a(b(c)d).md").write_text("notes\n")
+    _edit(vault / "Meetings" / WEEK / NOTE, "[Meetings](../README.md)",
+          "[Meetings](../../Docs/a(b(c)d).md)")
+    assert _broken(conn, vault) == set()
+    _edit(vault / "Meetings" / WEEK / NOTE, "a(b(c)d).md", "a(b(c)gone).md")
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [LINK_RESOLVES]
+    assert "a(b(c)gone).md" in found[0]["detail"]   # the whole target, not a prefix
