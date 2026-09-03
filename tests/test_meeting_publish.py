@@ -212,9 +212,10 @@ def test_an_occurrence_the_ledger_does_not_hold_is_refused(bench):
     assert not (vault / "Meetings").exists()
 
 
-def test_a_render_that_raises_leaves_no_receipt_and_no_commit(tmp_path):
-    # Two meetings whose project names collide on casefold: render refuses
-    # before it wipes anything.
+def test_a_withheld_meeting_gets_no_receipt_and_its_neighbour_still_publishes(tmp_path):
+    """Two meetings whose project names collide on casefold: the render leaves
+    the losing one out and files the other, so one producer's casing choice
+    cannot hold every other occurrence unpublished."""
     other = _payload(day="2026-09-01")
     other["provider_meeting_id"] = "board-sync-2"
     other["occurrence_id"] = f"board-sync-2@{other['started_at']}"
@@ -229,9 +230,14 @@ def test_a_render_that_raises_leaves_no_receipt_and_no_commit(tmp_path):
         _publish(conn, vault, receipt)
 
     assert caught.value.stage == "render"
+    assert "filename collision" in caught.value.reason
     assert not receipt.exists()
     assert _remote_ref(bare, branch) == before
-    assert vaultgit.head_commit(vault) == before
+
+    published = _publish(conn, vault, receipt,
+                         occurrence_id=other["occurrence_id"])
+    assert published["status"] == "published"
+    assert _remote_ref(bare, branch) == published["vault_commit"]
 
 
 def test_a_semantic_finding_refuses_publication_and_pushes_nothing(bench, monkeypatch):

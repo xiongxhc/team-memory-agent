@@ -191,10 +191,15 @@ def publish_meeting(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path
     rel = str(_meeting_facts(meeting, ids)["rel"])
 
     try:
-        render_vault(conn, ids, vault_dir, today, weeks=weeks,
-                     channel_names=channel_names)
+        out = render_vault(conn, ids, vault_dir, today, weeks=weeks,
+                           channel_names=channel_names)
     except Exception as error:
         raise PublishRefused("render", f"the vault render failed: {error}") from error
+    if occurrence_id in out["withheld"]:
+        # A name this meeting carries collides with a page the vault already
+        # owns, so the render left it out. Nothing to publish, and the other
+        # occurrences are unaffected.
+        raise PublishRefused("render", out["withheld"][occurrence_id])
 
     _refuse_on_drift(
         verify_vault(conn, ids, vault_dir, today, weeks=weeks,

@@ -473,15 +473,17 @@ def test_a_vault_with_no_meetings_still_renders(tmp_path):
     assert not any(p.is_dir() for p in (vault / "Meetings").iterdir())
 
 
-def test_a_dot_segment_display_name_cannot_escape_the_person_directory(tmp_path):
+def test_a_dot_segment_display_name_costs_the_meeting_not_the_render(tmp_path):
     """Provider display names are untrusted; `..` must never become a folder."""
     payload = _payload()
     payload["participants"][0]["display_name"] = ".."
     conn = _seeded(tmp_path, payload)
     vault = tmp_path / "vault"
-    with pytest.raises(ValueError, match="filename collision in vault render"):
-        render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
-    assert not (vault / "Meetings").exists()      # refused before anything was written
+    out = render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    assert list(out["withheld"]) == [payload["occurrence_id"]]
+    assert "Person/.." in out["withheld"][payload["occurrence_id"]]
+    assert not (vault / "Meetings" / WEEK).exists()      # the meeting is not filed
+    assert (vault / "Work Journal").is_dir()             # the render still ran
 
 
 def test_an_unrostered_participant_cannot_take_over_a_rostered_person_page(tmp_path):
@@ -492,8 +494,33 @@ def test_an_unrostered_participant_cannot_take_over_a_rostered_person_page(tmp_p
     insert_events(conn, [Event(person="alex", ts="2026-09-02T09:00:00+04:00",
                                source="gitlab", kind="commit", summary="fix: a thing",
                                hash="a1", project="project-alpha")])
-    with pytest.raises(ValueError, match="filename collision in vault render"):
-        render_vault(conn, IdentityMaps.load(CONFIG_DIR), tmp_path / "vault", TODAY)
+    vault = tmp_path / "vault"
+    out = render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    assert list(out["withheld"]) == [payload["occurrence_id"]]
+    page = (vault / "Person" / "Alex Rivera" / "README.md").read_text()
+    assert "fix: a thing" in page and "Meetings" not in page   # still the roster page
+
+
+def test_a_colliding_project_name_costs_the_later_meeting_only(tmp_path):
+    """One producer's casing choice must not unpublish another meeting."""
+    other = _renumber(_payload(day="2026-09-01"), "vc:9f3a/board-sync-2")
+    for project in other["projects"]:
+        project["name"] = project["name"].upper()
+    conn = _seeded(tmp_path, _payload(), other)
+    vault = tmp_path / "vault"
+    out = render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    assert list(out["withheld"]) == [_payload()["occurrence_id"]]
+    assert (vault / "Projects" / "PROJECT-ATLAS" / "README.md").is_file()
+    assert [p.name for p in (vault / "Meetings").rglob("*.md")
+            if p.name != "README.md"] == [
+        f"2026-09-01 14-00 Atlas Launch Readiness "
+        f"[{short_occurrence_id(other['occurrence_id'])}].md"]
+    assert _findings(conn, vault) == [{
+        "invariant": ONE_PER_OCCURRENCE,
+        "path": f"Meetings/{WEEK}/{NOTE}",
+        "detail": "no canonical note for a current occurrence",
+        "occurrence_id": _payload()["occurrence_id"],
+    }]
 
 
 # --- semantic verification --------------------------------------------------
@@ -880,9 +907,9 @@ def test_the_expected_note_path_comes_from_the_ledger_not_from_the_renderer(tmp_
     ids = IdentityMaps.load(CONFIG_DIR)
     real = meeting_render.collect_notes
 
-    def _misfiles(conn, *, naming, today):
+    def _misfiles(conn, *, naming, today, withhold=frozenset()):
         return [dataclasses.replace(note, file_name="wrong-name.md")
-                for note in real(conn, naming=naming, today=today)]
+                for note in real(conn, naming=naming, today=today, withhold=withhold)]
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(meeting_render, "collect_notes", _misfiles)

@@ -71,6 +71,21 @@ class VaultNaming:
     safe_filename: Callable[[str], str]
 
 
+class MeetingWithheld(ValueError):
+    """One meeting cannot be filed in the vault, so it is left out of it.
+
+    Raised where a name a producer chose collides with a page the vault already
+    owns. The render retries without the named occurrences: a collision costs
+    the meeting it came from, never the whole render, which also carries the
+    person pages, the project pages and the Work Journal.
+    """
+
+    def __init__(self, occurrence_ids, reason: str):
+        super().__init__(reason)
+        self.occurrence_ids = tuple(occurrence_ids)
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class Attendee:
     key: str
@@ -104,6 +119,7 @@ class PersonBacklinks:
     key: str
     display_name: str
     person_ids: tuple[str, ...]
+    occurrence_ids: tuple[str, ...]
     bullets: tuple[str, ...]
 
 
@@ -156,7 +172,8 @@ def _attendees(meeting: dict, naming: VaultNaming) -> tuple[Attendee, ...]:
         if folder in (".", ".."):
             # A provider-supplied display name is untrusted input; a dot segment
             # would write the page outside Person/.
-            raise ValueError(
+            raise MeetingWithheld(
+                (meeting["occurrence_id"],),
                 f"filename collision in vault render: Person/{folder} "
                 f"from participant {participant['person_id']!r}")
         attendees.append(Attendee(
@@ -317,15 +334,19 @@ def _yaml(value: str) -> str:
 # --- collection -------------------------------------------------------------
 
 
-def collect_notes(conn, *, naming: VaultNaming, today: date) -> list[MeetingNote]:
+def collect_notes(conn, *, naming: VaultNaming, today: date,
+                  withhold=frozenset()) -> list[MeetingNote]:
     """One note per current occurrence, oldest first.
 
     Every current occurrence is rendered: no time window. The managed
     `Meetings/` subtree is wiped on every render, so a window would delete
-    already-published notes from the live vault.
+    already-published notes from the live vault. `withhold` names the
+    occurrences the render has already decided it cannot file.
     """
     notes = []
     for row in list_meetings(conn):
+        if row["occurrence_id"] in withhold:
+            continue
         meeting = get_meeting(conn, row["occurrence_id"])
         if meeting is None:                     # deleted between the two reads
             continue
@@ -415,21 +436,26 @@ def person_backlinks(notes: list[MeetingNote]) -> dict[str, PersonBacklinks]:
                 "key": attendee.key,
                 "display_name": attendee.display_name,
                 "person_ids": [],
+                "occurrence_ids": [],
                 "bullets": [],
             })
             if entry["key"] != attendee.key:
-                raise ValueError(
+                raise MeetingWithheld(
+                    (note.occurrence_id,),
                     "filename collision in vault render: "
                     f"Person/{attendee.folder} claimed by both "
                     f"{entry['key']!r} and {attendee.key!r}")
             if attendee.person_id not in entry["person_ids"]:
                 entry["person_ids"].append(attendee.person_id)
+            if note.occurrence_id not in entry["occurrence_ids"]:
+                entry["occurrence_ids"].append(note.occurrence_id)
             entry["bullets"].append(f"- {note_link(note, 2)}\n")
     return {
         folder: PersonBacklinks(
             key=entry["key"],
             display_name=entry["display_name"],
             person_ids=tuple(entry["person_ids"]),
+            occurrence_ids=tuple(entry["occurrence_ids"]),
             bullets=tuple(entry["bullets"]),
         )
         for folder, entry in sorted(collected.items())

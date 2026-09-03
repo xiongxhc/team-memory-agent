@@ -131,7 +131,10 @@ def _evidence_notice(cutoff: tuple[str | None, str, str | None]) -> str:
 
 
 def _validate_project_filenames(conn: sqlite3.Connection,
-                                extra: set[str] = frozenset()) -> None:
+                                extra: dict[str, list[str]] | None = None) -> None:
+    """`extra` maps a project a meeting named to the occurrences that named it,
+    so a collision a producer caused costs those meetings and not the render."""
+    extra = extra or {}
     seen = {"readme.md": "project index"}
     projects = conn.execute(
         "SELECT DISTINCT project FROM events WHERE project IS NOT NULL ORDER BY project"
@@ -143,9 +146,15 @@ def _validate_project_filenames(conn: sqlite3.Connection,
         folder = _project_fname(project)
         key = folder.casefold()
         if folder in (".", "..") or key in seen:
-            raise ValueError(
-                f"filename collision in vault render: {project!r} and {seen.get(key)!r}"
-            )
+            other = seen.get(key)
+            message = (f"filename collision in vault render: {project!r} "
+                       f"and {other!r}")
+            # The later of the two names loses, so the earlier one keeps its
+            # folder and only one meeting pays for the pair.
+            owners = [*(extra.get(project) or extra.get(other) or ())]
+            if owners:
+                raise meeting_render.MeetingWithheld(owners, message)
+            raise ValueError(message)
         seen[key] = project
 
 
@@ -230,7 +239,35 @@ def _validate_flag_entries(
 
 def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                  today: date, weeks: int = 4,
-                 channel_names: dict | None = None) -> dict:
+                 channel_names: dict | None = None, *,
+                 withhold: dict[str, str] | None = None) -> dict:
+    """Regenerate every managed path from the ledger.
+
+    A meeting whose participant or project name collides with a page the vault
+    already owns is left out and named in `out["withheld"]`, and the rest of the
+    vault renders as it always did: a producer-chosen name costs its own
+    meeting, never the daily render. `withhold` seeds that set, so a caller that
+    has its own reason to leave a meeting out passes it here.
+    """
+    withheld = dict(withhold or {})
+    while True:
+        try:
+            out = _render_vault(conn, ids, vault_dir, today, weeks, channel_names,
+                                frozenset(withheld))
+        except meeting_render.MeetingWithheld as refusal:
+            fresh = [o for o in refusal.occurrence_ids if o not in withheld]
+            if not fresh:                  # nothing left to withhold; a real bug
+                raise ValueError(refusal.reason) from refusal
+            for occurrence_id in fresh:
+                withheld[occurrence_id] = refusal.reason
+            continue
+        out["withheld"] = withheld
+        return out
+
+
+def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
+                  today: date, weeks: int, channel_names: dict | None,
+                  withhold: frozenset) -> dict:
     weeks = max(1, weeks)
     channel_names = channel_names or {}
     mondays = [week_monday(today) - timedelta(weeks=i) for i in range(weeks)]
@@ -252,11 +289,16 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     )
     # Every current occurrence, no window: Meetings/ is wiped on every render,
     # so a window would delete already-published notes from the live vault.
-    notes = meeting_render.collect_notes(conn, naming=naming, today=today)
+    notes = meeting_render.collect_notes(conn, naming=naming, today=today,
+                                         withhold=withhold)
     person_meetings = meeting_render.person_backlinks(notes)
     project_meetings = meeting_render.project_backlinks(notes)
     meeting_projects = sorted(project_meetings)
-    _validate_project_filenames(conn, set(meeting_projects))
+    project_owners: dict[str, list[str]] = {}
+    for note in notes:
+        for project in note.projects:
+            project_owners.setdefault(project, []).append(note.occurrence_id)
+    _validate_project_filenames(conn, project_owners)
     vault_dir.mkdir(parents=True, exist_ok=True)
     for m in MANAGED:
         p = vault_dir / m
@@ -450,7 +492,8 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         backlinks = person_meetings.pop(name, None)
         if backlinks is not None:
             if backlinks.key != person:
-                raise ValueError(
+                raise meeting_render.MeetingWithheld(
+                    backlinks.occurrence_ids,
                     "filename collision in vault render: "
                     f"Person/{name} claimed by both {person!r} and {backlinks.key!r}")
             md.append(meeting_render.meetings_section(backlinks.bullets))
@@ -471,7 +514,9 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     for name, backlinks in sorted(person_meetings.items()):
         pdir = vault_dir / "Person" / name
         if pdir.exists():
-            raise ValueError(f"filename collision in vault render: {pdir}")
+            raise meeting_render.MeetingWithheld(
+                backlinks.occurrence_ids,
+                f"filename collision in vault render: {pdir}")
         pdir.mkdir()
         _write(pdir / "README.md", meeting_render.person_page(backlinks, today))
         files += 1
@@ -583,7 +628,9 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     for proj, bullets in sorted(project_meetings.items()):
         pdir = vault_dir / "Projects" / _project_fname(proj)
         if pdir.name == "README.md" or pdir.exists():
-            raise ValueError(f"filename collision in vault render: {pdir}")
+            raise meeting_render.MeetingWithheld(
+                project_owners[proj],
+                f"filename collision in vault render: {pdir}")
         pdir.mkdir()
         _write(pdir / "README.md", meeting_render.project_page(proj, bullets, today))
         files += 1
