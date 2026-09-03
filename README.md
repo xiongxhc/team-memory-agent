@@ -310,6 +310,17 @@ Reports consolidate evidence into `Shipped`, `Needs attention`, and
 score. Without an LLM backend, journal and report synthesis are skipped while
 deterministic rendering continues from ledger evidence and any cached summaries.
 
+`TEAMMEM_LLM_PROVIDER` selects the synthesis backend and defaults to `claude`.
+Claude preserves the existing Anthropic-API-first, Claude-CLI-fallback behavior
+and uses `TEAMMEM_LLM_DAILY_MODEL` / `TEAMMEM_LLM_REPORT_MODEL`. Selecting
+`codex` uses the operator's existing Codex login and pins both workloads to
+`gpt-5.6-sol`; daily calls use medium reasoning and weekly reports use high
+reasoning. Codex runs ephemerally with model-driven tools disabled, a read-only
+sandbox, a credential-scrubbed environment, and a structured text envelope.
+Cache hits require the configured model, so a provider switch never silently
+returns a summary produced by the other model. Start a Codex trial with
+`TEAMMEM_LLM_CONCURRENCY=1` and raise it only after observing account capacity.
+
 For an operator-managed intraday trigger, use the capture mode:
 
 ```bash

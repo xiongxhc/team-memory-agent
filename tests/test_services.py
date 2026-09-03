@@ -4,6 +4,7 @@ import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import teammem.services as services_module
 from teammem.config import Config
 from teammem.events import Event
 from teammem.identity import IdentityMaps
@@ -18,6 +19,7 @@ from teammem.services import (
     run_journal,
     run_render,
     run_report,
+    resolve_llm_backend,
 )
 from teammem.store import (
     SummaryRecord,
@@ -65,6 +67,54 @@ def _fake_journal_llm(calls):
     return llm
 
 
+def test_codex_provider_wins_over_anthropic_key_and_selects_workload_effort(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(
+        tmp_path,
+        TEAMMEM_LLM_PROVIDER="codex",
+        TEAMMEM_CODEX_BIN="/opt/codex",
+        ANTHROPIC_API_KEY="x",
+    )
+    calls = []
+
+    def fake_codex(model, *, reasoning_effort, codex_bin):
+        calls.append((model, reasoning_effort, codex_bin))
+        return lambda _system, _user: "codex"
+
+    monkeypatch.setattr(
+        services_module,
+        "codex_cli_llm",
+        fake_codex,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        services_module,
+        "http_llm",
+        lambda *_args, **_kwargs: (lambda _system, _user: "anthropic"),
+    )
+    monkeypatch.setattr("shutil.which", lambda binary: binary)
+
+    daily = resolve_llm_backend(cfg, cfg.llm_daily_model, max_tokens=1024)
+    report = resolve_llm_backend(cfg, cfg.llm_report_model, max_tokens=8192)
+
+    assert daily("system", "user") == "codex"
+    assert report("system", "user") == "codex"
+    assert calls == [
+        ("gpt-5.6-sol", "medium", "/opt/codex"),
+        ("gpt-5.6-sol", "high", "/opt/codex"),
+    ]
+
+
+def test_codex_provider_without_configured_binary_has_no_backend(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path, TEAMMEM_LLM_PROVIDER="codex")
+    monkeypatch.setattr("shutil.which", lambda _binary: None)
+
+    assert resolve_llm_backend(cfg, cfg.llm_daily_model, 1024) is None
+
+
 def test_render_service_preserves_existing_dry_run_output(tmp_path, capsys):
     cfg = _cfg(tmp_path)
     _seed(cfg)
@@ -85,6 +135,10 @@ def test_render_service_preserves_existing_dry_run_output(tmp_path, capsys):
 def test_journal_service_preserves_existing_dry_run_output(tmp_path, capsys):
     cfg = _cfg(tmp_path)
     _seed(cfg)
+    conn = open_db(cfg.db_path)
+    put_summary(conn, SummaryRecord(
+        "daily-person", "alex|2026-07-14", "stale", "old", "other-model", "t"
+    ))
 
     assert run_journal(
         cfg,
@@ -136,11 +190,11 @@ def test_execute_journal_counts_hits_migrations_and_calls_by_their_real_scope(
     assert all(item is not None for item in prepared)
     put_summary(conn, SummaryRecord(
         "daily-person", prepared[0].key, prepared[0].input_hash,
-        "current cache", "old", "old-ts",
+        "current cache", cfg.llm_daily_model, "old-ts",
     ))
     put_summary(conn, SummaryRecord(
         "daily-person", prepared[1].key, prepared[1].legacy_input_hash,
-        "legacy cache", "old", "old-ts",
+        "legacy cache", cfg.llm_daily_model, "old-ts",
     ))
     calls = []
     progress = []
@@ -178,6 +232,42 @@ def test_execute_journal_counts_hits_migrations_and_calls_by_their_real_scope(
     assert progress[-1].stage == "journal"
     assert dict(progress[-1].fields)["prompt_events_count"] == 3
     assert dict(progress[-1].fields)["queue_wait_seconds_count"] == 1
+
+
+def test_execute_journal_treats_other_model_cache_as_a_miss(tmp_path):
+    cfg = _cfg(tmp_path, TEAMMEM_LLM_PROVIDER="codex")
+    _seed(cfg)
+    conn = open_db(cfg.db_path)
+    ids = IdentityMaps.load(CONFIG_DIR)
+    prepared = prepare_daily_journal(
+        conn, "alex", ids.display_name("alex"), "2026-07-14", ["project-alpha"]
+    )
+    put_summary(conn, SummaryRecord(
+        "daily-person",
+        prepared.key,
+        prepared.input_hash,
+        "cached Claude summary",
+        "claude-haiku-4-5",
+        "old-ts",
+    ))
+    calls = []
+
+    result = execute_journal(
+        cfg,
+        ids,
+        start_day="2026-07-14",
+        end_day="2026-07-14",
+        created_ts="2026-07-16T00:00:00",
+        conn=conn,
+        llm=_fake_journal_llm(calls),
+    )
+
+    assert result.metrics.cached == 0
+    assert result.metrics.llm_calls == 1
+    assert len(calls) == 1
+    assert get_summary(conn, "daily-person", prepared.key).model == "gpt-5.6-sol"
+    assert result.metrics.queue_wait_seconds.count == 1
+    assert result.metrics.backend_seconds.count == 1
 
 
 def test_execute_journal_bounds_workers_keeps_sqlite_on_caller_and_persists_sorted(
@@ -326,6 +416,9 @@ def test_report_service_preserves_existing_dry_run_output(tmp_path, capsys):
         "INSERT INTO summaries (kind, key, input_hash, text, model, created_ts)"
         " VALUES ('daily-person', 'alex|2026-07-14', 'h', 'Alex fixed X.', 'f', 't')"
     )
+    put_summary(conn, SummaryRecord(
+        "weekly-team", "team|2026-07-13", "stale", "old", "other-model", "t"
+    ))
     conn.commit()
 
     assert run_report(
@@ -440,6 +533,46 @@ def test_execute_report_cache_uses_daily_canonical_hash_even_when_text_is_same(
         "generated", "cached", "generated"
     )
     assert len(calls) == 2
+
+
+def test_execute_report_reports_generation_when_model_changes(tmp_path):
+    claude_cfg = _cfg(tmp_path)
+    codex_cfg = _cfg(tmp_path, TEAMMEM_LLM_PROVIDER="codex")
+    conn = open_db(claude_cfg.db_path)
+    insert_events(conn, [Event(
+        person="alex",
+        project="project-alpha",
+        ts="2026-08-04T09:00:00+04:00",
+        source="gitlab",
+        kind="commit",
+        summary="work",
+        hash="work",
+    )])
+    put_summary(conn, SummaryRecord(
+        "daily-person",
+        "alex|2026-08-04",
+        "daily-hash",
+        "same daily text",
+        "daily-model",
+        "daily-created",
+    ))
+    calls = []
+    common = dict(
+        ids=IdentityMaps.load(CONFIG_DIR),
+        target_week=date(2026, 8, 4),
+        operator_date=date(2026, 8, 4),
+        conn=conn,
+        llm=_fake_journal_llm(calls),
+    )
+
+    first = execute_report(claude_cfg, **common)
+    switched = execute_report(codex_cfg, **common)
+
+    assert (first.status, switched.status) == ("generated", "generated")
+    assert len(calls) == 2
+    assert get_summary(conn, "weekly-team", "team|2026-08-03").model == (
+        "gpt-5.6-sol"
+    )
 
 
 def test_execute_report_cache_is_stable_across_equal_flag_reconciliation_order(
