@@ -21,6 +21,7 @@ from .services import (
     run_collect,
     run_docs_sync,
     run_journal,
+    run_expire_meeting_audio,
     run_process_meetings,
     run_render,
     run_report,
@@ -122,6 +123,15 @@ def _parser() -> argparse.ArgumentParser:
     p_meetings.add_argument("--now", type=str, default=None, metavar="ISO",
                             help="UTC instant of this run (default: now)")
     p_meetings.add_argument("--dry-run", action="store_true")
+
+    p_expire = sub.add_parser(
+        "expire-meeting-audio",
+        help="delete meeting audio 14 days after the meeting, and warn before "
+             "an incomplete transcript loses its source",
+    )
+    p_expire.add_argument("--now", type=str, default=None, metavar="ISO",
+                          help="UTC instant of this run (default: now)")
+    p_expire.add_argument("--dry-run", action="store_true")
 
     p_schedule = sub.add_parser(
         "schedule", help="manage the explicit daily hub schedule"
@@ -303,6 +313,10 @@ def main(argv: list[str] | None = None) -> int:
         ids = IdentityMaps.load(cfg.config_dir)
         now = args.now or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         return run_process_meetings(cfg, ids, now=now, dry_run=args.dry_run)
+
+    if args.cmd == "expire-meeting-audio":
+        now = args.now or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return run_expire_meeting_audio(cfg, now=now, dry_run=args.dry_run)
 
     if args.cmd == "connectors":
         settings = load_connector_settings(cfg.config_dir)

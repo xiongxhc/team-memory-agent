@@ -353,3 +353,29 @@ def test_a_relative_vault_still_cannot_contain_a_meeting_directory(
         validate_meeting_settings(cfg)
     assert "TEAMMEM_MEETING_RECEIPTS" in str(failure.value)
     assert "TEAMMEM_VAULT" in str(failure.value)
+
+
+def test_the_audio_warning_window_defaults_and_stays_optional(tmp_path, empty_env_file):
+    """A meeting-free hub sets nothing, and a meeting hub gets a window without
+    naming one: an unset warning window must never disable retention itself."""
+    bare = Config.load(env={}, env_file=empty_env_file)
+    assert bare.meeting_warn_days == 3
+
+    cfg = Config.load(env=_meeting_env(tmp_path), env_file=empty_env_file)
+    validate_meeting_settings(cfg)              # still complete without the window
+    assert cfg.meeting_warn_days == 3
+
+
+def test_the_audio_warning_window_is_overridable(tmp_path, empty_env_file):
+    cfg = Config.load(env=_meeting_env(tmp_path, TEAMMEM_MEETING_WARN_DAYS="0"),
+                      env_file=empty_env_file)
+    assert cfg.meeting_warn_days == 0           # 0 warns about nothing
+
+
+@pytest.mark.parametrize("value", ["-1", "15", "three", ""])
+def test_an_out_of_range_warning_window_is_refused(empty_env_file, value):
+    """The ceiling is the retention window itself: a longer warning would fire
+    before the meeting had even ended."""
+    with pytest.raises(ValueError) as failure:
+        Config.load(env={"TEAMMEM_MEETING_WARN_DAYS": value}, env_file=empty_env_file)
+    assert "TEAMMEM_MEETING_WARN_DAYS" in str(failure.value)

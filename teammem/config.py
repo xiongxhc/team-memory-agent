@@ -9,6 +9,11 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
+# The retention window is the ceiling on the pre-expiry warning window: a
+# warning longer than the window itself would fire before the meeting ended.
+from .meeting_retention import DEFAULT_WARN_DAYS
+from .meeting_store import MEETING_AUDIO_RETENTION_DAYS
+
 
 _ENVIRONMENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -255,6 +260,8 @@ class Config:
     meeting_audio_store: Path | None = None  # encrypted bytes only; never decrypted
     meeting_receipts: Path | None = None     # one receipt file per occurrence
     meeting_alerts: Path | None = None       # one operator alert file per occurrence
+    # warn this long before audio expiry; 0 warns never, and it never extends it
+    meeting_warn_days: int = DEFAULT_WARN_DAYS
     vault_web_base: str = ""     # https root of the published vault; no default
     vault_remote: str = "origin"          # the remote a receipt's commit must reach
     vault_ref: str = "refs/heads/main"    # and the ref on it
@@ -325,6 +332,13 @@ class Config:
             meeting_audio_store=_path(values, "TEAMMEM_MEETING_AUDIO_STORE"),
             meeting_receipts=_path(values, "TEAMMEM_MEETING_RECEIPTS"),
             meeting_alerts=_path(values, "TEAMMEM_MEETING_ALERTS"),
+            meeting_warn_days=_bounded_integer(
+                values,
+                "TEAMMEM_MEETING_WARN_DAYS",
+                cls.meeting_warn_days,
+                0,
+                MEETING_AUDIO_RETENTION_DAYS,
+            ),
             vault_web_base=values.get(
                 "TEAMMEM_VAULT_WEB_BASE", cls.vault_web_base).rstrip("/"),
             vault_remote=values.get("TEAMMEM_VAULT_REMOTE", cls.vault_remote),

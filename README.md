@@ -421,6 +421,36 @@ file, no commit, no push, no receipt.
 anything if the vault publishes somewhere else, so a receipt cannot name a
 commit on a remote nobody reads.
 
+#### Audio retention
+
+TeamMem computes one expiry for a recording, `ended_at` plus fourteen days, and
+a bundle asking for longer is provenance only. `expire-meeting-audio` destroys
+the encrypted file at that instant:
+
+```bash
+teammem expire-meeting-audio --now 2026-09-16T14:52:00Z
+teammem expire-meeting-audio --dry-run
+```
+
+What goes is the ciphertext and nothing else. The meeting, its transcript, its
+synthesis, its revision history, and the recording's hash, format, duration and
+expiry all stay queryable, with a deletion timestamp beside them. TeamMem never
+holds the recording key and never decrypts, so deleted bytes cannot be
+regenerated and the deadline is exact in both directions. Every revision expires
+on its own schedule, and two meetings with identical recordings are stored and
+deleted separately.
+
+When a meeting's current transcript is still incomplete and its recording is
+within `TEAMMEM_MEETING_WARN_DAYS` (default 3, `0` to warn about nothing) of
+expiry, the run writes one alert file per occurrence into
+`TEAMMEM_MEETING_ALERTS` naming the occurrence and the deadline, and exits `1`.
+The alert carries no transcript text. Retention is never extended for a warned
+meeting: backfill arrives as a higher revision from the producer, and a warning
+nobody acts on still ends in deletion on time. The command exits `0` when there
+was nothing to say, `1` when it warned or a deletion is left to retry, and `2`
+when the configuration is wrong. `--dry-run` reports what a real run would do
+and writes nothing: no file removed, no row changed, no alert.
+
 Configuring meetings adds `teammem-meetings` and `teammem-meeting-retention`
 beside the daily job the next time the schedule is installed — publication every
 quarter hour, audio expiry an hour after the daily run. Removing the meeting

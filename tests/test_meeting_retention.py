@@ -1,0 +1,784 @@
+"""Audio retention: the encrypted source is gone fourteen days after the meeting.
+
+Every meeting here is imported through the real importer, so the rows, the store
+layout and the file on disk are the ones production would have. The clock is
+always injected: no test reads the wall clock, and every boundary is asserted at
+an exact instant.
+
+The promise being tested is made to meeting participants — the audio is deleted
+at fourteen days — and it cuts both ways. Deleting late breaks it. Deleting early
+destroys bytes TeamMem can never regenerate, because it never holds the recording
+key.
+"""
+
+import errno
+import json
+import os
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from teammem import cli as cli_module
+from teammem import config as config_module
+from teammem.cli import main
+from teammem.meeting_bundles import occurrence_path_segment
+from teammem.meeting_importer import audio_revision_dir, import_meeting_inbox
+from teammem.meeting_retention import expire_meeting_audio
+from teammem.meeting_store import (
+    get_meeting,
+    list_meeting_revisions,
+    mark_audio_deleted,
+)
+from teammem.store import open_db
+from tests.test_meeting_bundles import write_meeting_bundle
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "meetings"
+COMPLETE = FIXTURES / "teammem-meeting-v1.complete.json"
+CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
+
+IMPORTED_AT = "2026-09-02T16:00:00Z"
+# The complete fixture ends at 2026-09-02T14:52:00Z, so TeamMem's own expiry is
+# that instant plus fourteen days. The fixture's own `audio.expires_at` claims
+# 2026-10-02 — thirty days — and is never authoritative.
+EXPIRY = "2026-09-16T14:52:00Z"
+JUST_BEFORE = "2026-09-16T14:51:59Z"
+LATER = "2026-09-20T09:00:00Z"
+
+# A sentence that exists only inside the complete fixture's transcript.
+TRANSCRIPT_SENTENCE = (
+    "The staging soak has been green for six days, so I am comfortable with the current build."
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_operator_env_file(monkeypatch, tmp_path):
+    """No test may read the operator's real hub.env; point both resolution
+    sites at a file that does not exist."""
+    absent = tmp_path / "absent-hub.env"
+    monkeypatch.setattr(config_module, "default_env_file", lambda **_: absent)
+    monkeypatch.setattr(cli_module, "default_env_file", lambda **_: absent)
+
+
+def _payload(*, day: str | None = None, revision: int | None = None, **fields) -> dict:
+    text = COMPLETE.read_text(encoding="utf-8")
+    if day is not None:
+        text = text.replace("2026-09-02", day)
+    data = json.loads(text)
+    if revision is not None:
+        data["revision"] = revision
+    data.update(fields)
+    return data
+
+
+def _db(tmp_path: Path):
+    return open_db(tmp_path / "ledger.db")
+
+
+def _store(tmp_path: Path) -> Path:
+    return tmp_path / "meeting-audio"
+
+
+def _alerts(tmp_path: Path) -> Path:
+    directory = tmp_path / "meeting-alerts"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    return directory
+
+
+def _alert_path(tmp_path: Path):
+    return lambda occurrence_id: (
+        _alerts(tmp_path) / f"{occurrence_path_segment(occurrence_id)}.json"
+    )
+
+
+def _audio(tmp_path: Path, payload: dict, revision: int | None = None) -> Path:
+    revision = payload["revision"] if revision is None else revision
+    return audio_revision_dir(
+        _store(tmp_path), payload["occurrence_id"], revision) / "audio.enc"
+
+
+def _import(conn, tmp_path: Path, payload: dict) -> None:
+    """Import one bundle the way `process-meetings` would, private directories
+    and all, so a retention run over the result is not refused for their modes."""
+    inbox = tmp_path / "meeting-inbox"
+    for name in ("meeting-inbox", "meeting-archive", "meeting-quarantine",
+                 "meeting-audio", "meeting-receipts"):
+        (tmp_path / name).mkdir(mode=0o700, exist_ok=True)
+    write_meeting_bundle(inbox, payload)
+    result = import_meeting_inbox(
+        conn,
+        inbox,
+        tmp_path / "meeting-archive",
+        tmp_path / "meeting-quarantine",
+        _store(tmp_path),
+        now=IMPORTED_AT,
+    )
+    assert result.quarantined == 0, result.details
+
+
+def _expire(conn, tmp_path: Path, now: str, **kw):
+    return expire_meeting_audio(
+        conn, _store(tmp_path), now=now, alert_path=_alert_path(tmp_path), **kw
+    )
+
+
+def _files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(p for p in root.rglob("*") if p.is_file())
+
+
+# --- the boundary -----------------------------------------------------------
+
+
+def test_one_second_before_expiry_the_audio_is_retained(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+
+    result = _expire(conn, tmp_path, JUST_BEFORE)
+
+    assert result.deleted == ()
+    assert _audio(tmp_path, payload).exists()
+    stored = get_meeting(conn, payload["occurrence_id"])
+    assert stored["audio"]["deleted_at"] is None
+    assert result.exit_code == 0
+
+
+def test_exactly_at_expiry_the_audio_is_deleted_and_the_row_marked(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    occurrence_id = payload["occurrence_id"]
+    assert get_meeting(conn, occurrence_id)["audio"]["expires_at"] == EXPIRY
+
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    assert result.deleted == ((occurrence_id, payload["revision"]),)
+    assert not _audio(tmp_path, payload).exists()
+    assert get_meeting(conn, occurrence_id)["audio"]["deleted_at"] == EXPIRY
+    assert _files(_store(tmp_path)) == []          # the empty directories are pruned
+    assert result.exit_code == 0
+
+
+def test_a_second_run_after_expiry_deletes_nothing_and_keeps_the_first_timestamp(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    _expire(conn, tmp_path, EXPIRY)
+
+    result = _expire(conn, tmp_path, LATER)
+
+    assert result.deleted == ()
+    assert result.failed == ()
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+    assert result.exit_code == 0
+
+
+def test_an_already_missing_file_is_still_marked_deleted(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    _audio(tmp_path, payload).unlink()
+
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    assert result.deleted == ((payload["occurrence_id"], payload["revision"]),)
+    assert result.failed == ()
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+
+
+def test_audio_that_no_longer_matches_its_digest_is_deleted_and_reported(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    _audio(tmp_path, payload).write_bytes(b"\x00\x01\x02" * 64)
+
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    key = (payload["occurrence_id"], payload["revision"])
+    assert result.deleted == (key,)                # the promise outranks the anomaly
+    assert result.mismatched == (key,)
+    assert not _audio(tmp_path, payload).exists()
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+    assert result.exit_code == 1
+
+
+# --- occurrence scoping -----------------------------------------------------
+
+
+def test_two_occurrences_with_identical_audio_expire_independently(tmp_path):
+    conn = _db(tmp_path)
+    early = _payload(day="2026-08-20")
+    late = _payload()
+    assert early["audio"]["sha256"] == late["audio"]["sha256"]
+    _import(conn, tmp_path, early)
+    _import(conn, tmp_path, late)
+    assert _audio(tmp_path, early).read_bytes() == _audio(tmp_path, late).read_bytes()
+
+    result = _expire(conn, tmp_path, "2026-09-03T14:52:00Z")
+
+    assert result.deleted == ((early["occurrence_id"], early["revision"]),)
+    assert not _audio(tmp_path, early).exists()
+    assert _audio(tmp_path, late).exists()
+    assert get_meeting(conn, late["occurrence_id"])["audio"]["deleted_at"] is None
+
+
+def test_a_stale_prior_revision_loses_its_audio_on_its_own_schedule(tmp_path):
+    conn = _db(tmp_path)
+    first = _payload(revision=1)
+    second = _payload(revision=2, ended_at="2026-09-02T15:52:00Z")
+    _import(conn, tmp_path, first)
+    _import(conn, tmp_path, second)
+    occurrence_id = first["occurrence_id"]
+    assert get_meeting(conn, occurrence_id)["revision"] == 2
+
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    assert result.deleted == ((occurrence_id, 1),)
+    assert not _audio(tmp_path, first, 1).exists()
+    assert _audio(tmp_path, second, 2).exists()
+    assert get_meeting(conn, occurrence_id, revision=1)["audio"]["deleted_at"] == EXPIRY
+    assert get_meeting(conn, occurrence_id, revision=2)["audio"]["deleted_at"] is None
+
+    later = _expire(conn, tmp_path, "2026-09-16T15:52:00Z")
+    assert later.deleted == ((occurrence_id, 2),)
+    assert not _audio(tmp_path, second, 2).exists()
+
+
+# --- failures ---------------------------------------------------------------
+
+
+def test_an_unlink_failure_leaves_the_row_live_for_the_next_run(tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    target = _audio(tmp_path, payload)
+    real_unlink = os.unlink
+
+    def refuse(path, *args, **kwargs):
+        if Path(path) == target:
+            raise OSError(errno.EACCES, "permission denied")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", refuse)
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    assert result.deleted == ()
+    assert [(f.occurrence_id, f.revision, f.stage) for f in result.failed] == [
+        (payload["occurrence_id"], payload["revision"], "unlink")
+    ]
+    assert target.exists()
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] is None
+    assert result.exit_code == 1
+
+    monkeypatch.undo()
+    retried = _expire(conn, tmp_path, LATER)
+    assert retried.deleted == ((payload["occurrence_id"], payload["revision"]),)
+    assert not target.exists()
+
+
+def test_a_database_failure_after_the_unlink_is_retried_until_it_converges(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+
+    def refuse(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("teammem.meeting_retention.mark_audio_deleted", refuse)
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    # The file goes first, so a crash between the two leaves bytes deleted and a
+    # row that will be marked on the next run — never the reverse.
+    assert not _audio(tmp_path, payload).exists()
+    assert [(f.occurrence_id, f.stage) for f in result.failed] == [
+        (payload["occurrence_id"], "mark")
+    ]
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] is None
+    assert result.exit_code == 1
+
+    monkeypatch.undo()
+    retried = _expire(conn, tmp_path, LATER)
+    assert retried.deleted == ((payload["occurrence_id"], payload["revision"]),)
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == LATER
+
+
+def test_revived_audio_from_a_replayed_bundle_is_removed_again(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    _expire(conn, tmp_path, EXPIRY)
+    target = _audio(tmp_path, payload)
+    assert not target.exists()
+
+    # The same revision is re-delivered. The importer re-stages the file, the
+    # store reports `unchanged` and rolls back, so `deleted_at` still stands and
+    # `audio_due_for_expiry` will never return this row again.
+    _import(conn, tmp_path, payload)
+    assert target.exists()
+
+    result = _expire(conn, tmp_path, LATER)
+
+    assert result.swept == ((payload["occurrence_id"], payload["revision"]),)
+    assert not target.exists()
+    stored = get_meeting(conn, payload["occurrence_id"])["audio"]
+    assert stored["deleted_at"] == EXPIRY           # a replay never moves the decision
+    assert stored["sha256"] == payload["audio"]["sha256"]
+
+
+# --- what survives ----------------------------------------------------------
+
+
+def test_everything_but_the_encrypted_bytes_survives_the_deletion(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    occurrence_id = payload["occurrence_id"]
+    before = get_meeting(conn, occurrence_id)
+
+    _expire(conn, tmp_path, EXPIRY)
+
+    after = get_meeting(conn, occurrence_id)
+    assert after["title"] == payload["title"]
+    assert after["summary"] == payload["summary"]
+    assert after["artifact_hash"] == before["artifact_hash"]
+    assert after["transcript"] == before["transcript"]
+    assert after["participants"] == before["participants"]
+    assert after["decisions"] == before["decisions"]
+    assert after["action_items"] == before["action_items"]
+    assert after["provenance"] == before["provenance"]
+    assert [row["revision"] for row in list_meeting_revisions(conn, occurrence_id)] == [
+        payload["revision"]
+    ]
+    audio = after["audio"]
+    assert audio["sha256"] == payload["audio"]["sha256"]
+    assert audio["format"] == payload["audio"]["format"]
+    assert audio["duration_seconds"] == payload["audio"]["duration_seconds"]
+    assert audio["bytes"] == payload["audio"]["bytes"]
+    assert audio["expires_at"] == EXPIRY
+    assert audio["deleted_at"] == EXPIRY
+
+
+# --- the pre-expiry alert ---------------------------------------------------
+
+
+def test_an_incomplete_transcript_inside_the_window_is_alerted(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+
+    result = _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+
+    assert result.alerted == (payload["occurrence_id"],)
+    path = _alert_path(tmp_path)(payload["occurrence_id"])
+    alert = json.loads(path.read_text(encoding="utf-8"))
+    assert alert["occurrence_id"] == payload["occurrence_id"]
+    assert alert["revision"] == payload["revision"]
+    assert alert["audio_expires_at"] == EXPIRY
+    assert alert["transcript_complete"] is False
+    assert result.exit_code == 1
+    assert _audio(tmp_path, payload).exists()       # warning is not deletion
+    assert result.deleted == ()
+
+
+def test_the_alert_carries_no_transcript_text(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    payload["summary"] = TRANSCRIPT_SENTENCE
+    payload["transcript"][0]["text"] = TRANSCRIPT_SENTENCE
+    _import(conn, tmp_path, payload)
+
+    _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+
+    text = _alert_path(tmp_path)(payload["occurrence_id"]).read_text(encoding="utf-8")
+    assert TRANSCRIPT_SENTENCE not in text
+    assert payload["title"] not in text
+    for segment in payload["transcript"]:
+        assert segment["text"] not in text
+
+
+def test_a_complete_transcript_inside_the_window_is_not_alerted(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+
+    result = _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+
+    assert result.alerted == ()
+    assert _files(_alerts(tmp_path)) == []
+    assert result.exit_code == 0
+
+
+def test_an_incomplete_transcript_before_the_window_is_not_alerted(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+
+    result = _expire(conn, tmp_path, "2026-09-13T14:51:59Z")
+
+    assert result.alerted == ()
+    assert _files(_alerts(tmp_path)) == []
+
+
+def test_a_failed_alert_write_leaves_no_partial_file(tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+
+    def refuse(*_args, **_kwargs):
+        raise OSError(errno.EIO, "input/output error")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    result = _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+
+    assert result.alerted == ()
+    assert [(f.occurrence_id, f.stage) for f in result.failed] == [
+        (payload["occurrence_id"], "alert")
+    ]
+    assert sorted(p.name for p in _alerts(tmp_path).iterdir()) == []
+    assert result.exit_code == 1
+
+
+def test_an_alert_does_not_delay_a_deletion_due_in_the_same_run(tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    due = _payload(day="2026-08-20")
+    warned = _payload(transcript_complete=False)
+    _import(conn, tmp_path, due)
+    _import(conn, tmp_path, warned)
+
+    def refuse(*_args, **_kwargs):
+        raise OSError(errno.EIO, "input/output error")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    result = _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+
+    assert result.deleted == ((due["occurrence_id"], due["revision"]),)
+    assert not _audio(tmp_path, due).exists()
+    assert get_meeting(conn, due["occurrence_id"])["audio"]["deleted_at"] == (
+        "2026-09-14T00:00:00Z"
+    )
+    assert [f.stage for f in result.failed] == ["alert"]
+
+
+def test_dry_run_deletes_nothing_marks_nothing_and_writes_no_alert(tmp_path):
+    conn = _db(tmp_path)
+    due = _payload(day="2026-08-20")
+    warned = _payload(transcript_complete=False)
+    _import(conn, tmp_path, due)
+    _import(conn, tmp_path, warned)
+
+    result = _expire(conn, tmp_path, "2026-09-14T00:00:00Z", dry_run=True)
+
+    assert result.deleted == ((due["occurrence_id"], due["revision"]),)
+    assert result.alerted == (warned["occurrence_id"],)
+    assert _audio(tmp_path, due).exists()
+    assert _audio(tmp_path, warned).exists()
+    assert get_meeting(conn, due["occurrence_id"])["audio"]["deleted_at"] is None
+    assert _files(_alerts(tmp_path)) == []
+
+
+def test_dry_run_removes_no_revived_audio(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    _expire(conn, tmp_path, EXPIRY)
+    _import(conn, tmp_path, payload)                # the replay revives the file
+
+    result = _expire(conn, tmp_path, LATER, dry_run=True)
+
+    assert result.swept == ((payload["occurrence_id"], payload["revision"]),)
+    assert _audio(tmp_path, payload).exists()
+
+
+# --- the command ------------------------------------------------------------
+
+
+def _hub(tmp_path, monkeypatch) -> None:
+    values = {
+        "TEAMMEM_DB": str(tmp_path / "ledger.db"),
+        "TEAMMEM_CONFIG_DIR": str(CONFIG_DIR),
+        "TEAMMEM_VAULT": str(tmp_path / "vault"),
+        "TEAMMEM_MEETING_INBOX": str(tmp_path / "meeting-inbox"),
+        "TEAMMEM_MEETING_ARCHIVE": str(tmp_path / "meeting-archive"),
+        "TEAMMEM_MEETING_QUARANTINE": str(tmp_path / "meeting-quarantine"),
+        "TEAMMEM_MEETING_AUDIO_STORE": str(_store(tmp_path)),
+        "TEAMMEM_MEETING_RECEIPTS": str(tmp_path / "meeting-receipts"),
+        "TEAMMEM_MEETING_ALERTS": str(tmp_path / "meeting-alerts"),
+        "TEAMMEM_VAULT_WEB_BASE": "https://git.example.com/team/team-vault",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+
+def test_main_expire_meeting_audio_deletes_and_exits_zero(tmp_path, monkeypatch, capsys):
+    _hub(tmp_path, monkeypatch)
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    conn.close()
+
+    assert main(["expire-meeting-audio", "--now", EXPIRY]) == 0
+
+    assert not _audio(tmp_path, payload).exists()
+    assert payload["occurrence_id"] in capsys.readouterr().out
+
+
+def test_main_expire_meeting_audio_exits_one_when_an_alert_is_written(
+    tmp_path, monkeypatch, capsys
+):
+    _hub(tmp_path, monkeypatch)
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+    conn.close()
+
+    assert main(["expire-meeting-audio", "--now", "2026-09-14T00:00:00Z"]) == 1
+
+    capsys.readouterr()
+    alert = json.loads(
+        (tmp_path / "meeting-alerts" /
+         f"{occurrence_path_segment(payload['occurrence_id'])}.json"
+         ).read_text(encoding="utf-8")
+    )
+    assert alert["audio_expires_at"] == EXPIRY
+
+
+def test_main_expire_meeting_audio_dry_run_writes_nothing(tmp_path, monkeypatch, capsys):
+    _hub(tmp_path, monkeypatch)
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+    conn.close()
+
+    assert main(["expire-meeting-audio", "--now", EXPIRY, "--dry-run"]) == 0
+
+    assert "dry-run" in capsys.readouterr().out
+    assert _audio(tmp_path, payload).exists()
+    assert not (tmp_path / "meeting-alerts").exists()
+
+
+def test_main_expire_meeting_audio_without_configuration_exits_2(
+    tmp_path, monkeypatch, capsys
+):
+    for key in ("TEAMMEM_MEETING_INBOX", "TEAMMEM_MEETING_ARCHIVE",
+                "TEAMMEM_MEETING_QUARANTINE", "TEAMMEM_MEETING_AUDIO_STORE",
+                "TEAMMEM_MEETING_RECEIPTS", "TEAMMEM_MEETING_ALERTS",
+                "TEAMMEM_VAULT_WEB_BASE"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TEAMMEM_DB", str(tmp_path / "ledger.db"))
+    monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+
+    assert main(["expire-meeting-audio", "--now", EXPIRY]) == 2
+    assert "TEAMMEM_MEETING_INBOX" in capsys.readouterr().err
+
+
+def test_main_expire_meeting_audio_rejects_a_now_without_a_utc_offset(
+    tmp_path, monkeypatch, capsys
+):
+    _hub(tmp_path, monkeypatch)
+
+    assert main(["expire-meeting-audio", "--now", "2026-09-16T14:52:00"]) == 2
+    assert "UTC offset" in capsys.readouterr().err
+
+
+def test_the_warning_window_is_configurable(tmp_path, monkeypatch):
+    _hub(tmp_path, monkeypatch)
+    monkeypatch.setenv("TEAMMEM_MEETING_WARN_DAYS", "1")
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+    conn.close()
+
+    # Inside the three-day default, outside a one-day window.
+    assert main(["expire-meeting-audio", "--now", "2026-09-14T00:00:00Z"]) == 0
+    assert not any((tmp_path / "meeting-alerts").iterdir())
+
+    assert main(["expire-meeting-audio", "--now", "2026-09-16T00:00:00Z"]) == 1
+    assert any((tmp_path / "meeting-alerts").iterdir())
+
+
+def test_expire_meeting_audio_does_not_need_a_vault_repository(tmp_path, monkeypatch):
+    """Retention must keep its promise with no remote and no git at all: the
+    deletion deadline cannot wait on a network."""
+    _hub(tmp_path, monkeypatch)
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    conn.close()
+    assert not (tmp_path / "vault").exists()
+
+    assert main(["expire-meeting-audio", "--now", EXPIRY]) == 0
+    assert not _audio(tmp_path, payload).exists()
+
+
+def test_meeting_directories_are_created_privately_by_the_retention_run(
+    tmp_path, monkeypatch
+):
+    _hub(tmp_path, monkeypatch)
+    conn = _db(tmp_path)
+    _import(conn, tmp_path, _payload())
+    conn.close()
+
+    assert main(["expire-meeting-audio", "--now", JUST_BEFORE]) == 0
+
+    alerts = tmp_path / "meeting-alerts"
+    assert alerts.is_dir()
+    assert oct(alerts.stat().st_mode & 0o777) == "0o700"
+
+
+def test_a_group_readable_alert_directory_is_refused(tmp_path, monkeypatch, capsys):
+    _hub(tmp_path, monkeypatch)
+    alerts = tmp_path / "meeting-alerts"
+    alerts.mkdir(mode=0o755)
+
+    assert main(["expire-meeting-audio", "--now", EXPIRY]) == 2
+    assert "TEAMMEM_MEETING_ALERTS" in capsys.readouterr().err
+
+
+def test_an_alert_that_cannot_be_written_at_all_still_leaves_the_audio_deleted(
+    tmp_path, monkeypatch
+):
+    """Deletions are performed before any warning is attempted, so even an
+    unhandled fault while warning cannot cost a meeting its deadline."""
+    conn = _db(tmp_path)
+    due = _payload(day="2026-08-20")
+    warned = _payload(transcript_complete=False)
+    _import(conn, tmp_path, due)
+    _import(conn, tmp_path, warned)
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("the alert spool is on fire")
+
+    monkeypatch.setattr("teammem.meeting_retention._write_atomic", explode)
+    with pytest.raises(RuntimeError):
+        _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+
+    assert not _audio(tmp_path, due).exists()
+    assert get_meeting(conn, due["occurrence_id"])["audio"]["deleted_at"] == (
+        "2026-09-14T00:00:00Z"
+    )
+
+
+def test_the_window_opens_exactly_warn_days_before_expiry(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+
+    assert _expire(conn, tmp_path, "2026-09-13T14:52:00Z").alerted == (
+        payload["occurrence_id"],
+    )
+
+
+def test_an_incomplete_transcript_at_expiry_is_deleted_rather_than_warned(tmp_path):
+    """The window closes where the deadline begins: past it the loss has already
+    happened and a warning would only invite someone to ask for an extension."""
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    assert result.alerted == ()
+    assert result.deleted == ((payload["occurrence_id"], payload["revision"]),)
+    assert not _audio(tmp_path, payload).exists()
+    assert _files(_alerts(tmp_path)) == []
+
+
+def test_audio_recorded_under_another_store_is_reported_not_guessed_at(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    elsewhere = tmp_path / "other-audio"
+
+    result = expire_meeting_audio(
+        conn, elsewhere, now=EXPIRY, alert_path=_alert_path(tmp_path))
+
+    assert result.deleted == ()
+    assert [(f.occurrence_id, f.stage) for f in result.failed] == [
+        (payload["occurrence_id"], "store_path")
+    ]
+    assert _audio(tmp_path, payload).exists()       # the real bytes are untouched
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] is None
+    assert result.exit_code == 1
+
+
+def test_a_sweep_that_cannot_unlink_is_reported_and_retried(tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    _expire(conn, tmp_path, EXPIRY)
+    _import(conn, tmp_path, payload)                # the replay revives the file
+    target = _audio(tmp_path, payload)
+    real_unlink = os.unlink
+
+    def refuse(path, *args, **kwargs):
+        if Path(path) == target:
+            raise OSError(errno.EACCES, "permission denied")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", refuse)
+    result = _expire(conn, tmp_path, LATER)
+
+    assert result.swept == ()
+    assert [(f.occurrence_id, f.stage) for f in result.failed] == [
+        (payload["occurrence_id"], "sweep")
+    ]
+    assert target.exists()
+
+    monkeypatch.undo()
+    assert _expire(conn, tmp_path, LATER).swept == (
+        (payload["occurrence_id"], payload["revision"]),
+    )
+    assert not target.exists()
+
+
+def test_a_symlink_in_place_of_the_audio_is_reported_and_not_followed(tmp_path):
+    """The link is what gets unlinked, so the bytes the row describes are not the
+    ones destroyed — even when the target hashes exactly right."""
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    target = _audio(tmp_path, payload)
+    outside = tmp_path / "somebody-elses.enc"
+    outside.write_bytes(target.read_bytes())     # a perfect digest match
+    target.unlink()
+    target.symlink_to(outside)
+
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    assert result.mismatched == ((payload["occurrence_id"], payload["revision"]),)
+    assert not target.exists() and not target.is_symlink()
+    assert outside.exists()                      # the link went, its target stayed
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+    assert result.exit_code == 1
+
+
+def test_audio_that_is_already_gone_is_not_warned_about(tmp_path):
+    """A warning exists to save a source that can still be saved."""
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+    mark_audio_deleted(
+        conn, payload["occurrence_id"], payload["revision"], "2026-09-05T00:00:00Z")
+
+    result = _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+
+    assert result.alerted == ()
+    assert _files(_alerts(tmp_path)) == []
+
+
+def test_a_zero_day_window_warns_about_nothing(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+
+    result = _expire(conn, tmp_path, "2026-09-14T00:00:00Z", warn_days=0)
+
+    assert result.alerted == ()
+    assert _files(_alerts(tmp_path)) == []
+    assert result.exit_code == 0
+    assert _audio(tmp_path, payload).exists()    # and retention is not extended

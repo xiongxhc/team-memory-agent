@@ -13,6 +13,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 
 from .config import MEETING_PATH_SETTINGS, Config, validate_meeting_settings
@@ -25,6 +26,7 @@ from .identity import IdentityMaps, _read
 from .meeting_bundles import occurrence_path_segment
 from .meeting_importer import MeetingImportResult, import_meeting_inbox
 from .meeting_publish import PublishRefused, publish_meeting
+from .meeting_retention import RetentionResult, expire_meeting_audio
 from .meeting_store import list_meetings
 from .queries import report_context, week_label, week_monday
 from .reclaim import reclaim, reclaim_channel_projects
@@ -988,6 +990,89 @@ def run_process_meetings(
     for failure in result.refused:
         print(
             f"REFUSED {failure.occurrence_id} at {failure.stage}: {failure.detail}",
+            file=sys.stderr,
+        )
+    return result.exit_code
+
+
+# --- meeting audio retention -------------------------------------------------
+# The deletion deadline cannot wait on anything: this command needs no vault, no
+# remote and no network, only the ledger and the audio store.
+
+
+def execute_expire_meeting_audio(
+    cfg: Config,
+    *,
+    now: str,
+    conn: sqlite3.Connection,
+    dry_run: bool = False,
+) -> RetentionResult:
+    """Delete every expired recording and warn before an incomplete one is lost."""
+    return expire_meeting_audio(
+        conn,
+        cfg.meeting_audio_store,
+        now=now,
+        alert_path=partial(meeting_alert_path, cfg),
+        warn_days=cfg.meeting_warn_days,
+        dry_run=dry_run,
+    )
+
+
+def run_expire_meeting_audio(
+    cfg: Config,
+    *,
+    now: str,
+    dry_run: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """CLI entry: 0 clean, 1 an alert or a retryable failure, 2 misconfigured."""
+    try:
+        _utc_day(now)
+        validate_meeting_settings(cfg)
+        if not cfg.meetings_enabled:
+            raise ValueError(
+                "TEAMMEM_MEETING_INBOX is not set; this hub processes no meetings"
+            )
+        prepare_meeting_dirs(cfg, create=not dry_run)
+    except ValueError as failure:
+        print(f"error: {redact_secrets(failure, cfg)}", file=sys.stderr)
+        return 2
+
+    prefix = "dry-run: " if dry_run else ""
+    if conn is not None:
+        connection = conn
+    elif dry_run and not cfg.db_path.exists():
+        connection = open_db(Path(":memory:"))   # classify without creating a ledger
+    else:
+        connection = open_db(cfg.db_path)
+    result = execute_expire_meeting_audio(cfg, now=now, conn=connection, dry_run=dry_run)
+
+    print(
+        f"{prefix}meeting audio: deleted={len(result.deleted)} "
+        f"swept={len(result.swept)} alerted={len(result.alerted)} "
+        f"failed={len(result.failed)}"
+    )
+    deleted, swept = ("would delete", "would sweep") if dry_run else ("deleted", "swept")
+    for occurrence_id, revision in result.deleted:
+        print(f"{prefix}{deleted} {occurrence_id} revision {revision}")
+    for occurrence_id, revision in result.swept:
+        print(f"{prefix}{swept} {occurrence_id} revision {revision}")
+    for occurrence_id, revision in result.mismatched:
+        print(
+            f"MISMATCH {occurrence_id} revision {revision}: the deleted audio was "
+            "not the bytes this revision recorded",
+            file=sys.stderr,
+        )
+    for occurrence_id in result.alerted:
+        print(
+            f"{prefix}ALERT {occurrence_id}: the transcript is incomplete and its "
+            "audio expires soon",
+            file=sys.stderr,
+        )
+    for failure in result.failed:
+        print(
+            f"FAILED {failure.occurrence_id} revision {failure.revision} at "
+            f"{failure.stage}: {redact_secrets(failure.detail, cfg)}",
             file=sys.stderr,
         )
     return result.exit_code

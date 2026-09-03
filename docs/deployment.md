@@ -123,6 +123,7 @@ Process environment values override file values for one run.
 | `TEAMMEM_INBOX`, `TEAMMEM_ARCHIVE`, `TEAMMEM_QUARANTINE` | Optional as one complete set | Import an already-exported MemberKit inbox and retain accepted/rejected files |
 | `TEAMMEM_SNAPSHOTS` | Optional | Daily SQLite backup directory; newest 14 are retained |
 | `TEAMMEM_MEETING_INBOX`, `TEAMMEM_MEETING_ARCHIVE`, `TEAMMEM_MEETING_QUARANTINE`, `TEAMMEM_MEETING_AUDIO_STORE`, `TEAMMEM_MEETING_RECEIPTS`, `TEAMMEM_MEETING_ALERTS`, `TEAMMEM_VAULT_WEB_BASE` | Optional as one complete set | Enable meetings: import `teammem-meeting/v1` bundles, hold encrypted audio, and emit one receipt per published occurrence. Absolute, distinct, non-nested directories, outside the vault, created at 0700; a group- or world-accessible one is refused. `TEAMMEM_VAULT_WEB_BASE` is the vault's absolute `https` repository root, with no view path, query, fragment, or credentials |
+| `TEAMMEM_MEETING_WARN_DAYS` | Optional | Days before a recording's expiry that an incomplete transcript is warned about, `0` to warn about nothing; default `3`, maximum `14`. Writes one alert file per occurrence into `TEAMMEM_MEETING_ALERTS` and never extends retention |
 | `TEAMMEM_VAULT_REMOTE`, `TEAMMEM_VAULT_REF` | Optional | Remote and ref a meeting receipt's commit must reach; default `origin` and `refs/heads/main`. A vault publishing elsewhere is refused before anything is rendered |
 | `TEAMMEM_OBSIDIAN_PROJECTS` | Optional | Source directory for project-document synchronization |
 | `TEAMMEM_PUSH` | Optional | Best-effort Git push of the rendered vault when true |
@@ -294,7 +295,9 @@ does not create them.
 A hub configured for meetings gets two further jobs beside the daily one:
 `teammem-meetings` runs `process-meetings` every fifteen minutes, and
 `teammem-meeting-retention` runs `expire-meeting-audio` one hour after the daily
-run. They are generated only while the meeting settings are present — remove the
+run — it destroys every recording that has reached `ended_at` plus fourteen days,
+needs no vault, no remote and no network to do it, and warns before an incomplete
+transcript loses its source. They are generated only while the meeting settings are present — remove the
 settings and reinstall and both are disabled and deleted. The daily unit's own
 bytes do not change either way, so an existing daily schedule keeps running
 exactly as it was.
