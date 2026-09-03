@@ -38,6 +38,7 @@ from .meeting_bundles import AUDIO_FILENAME, occurrence_path_segment, short_occu
 # question drift apart.
 from .meeting_importer import _digest_file, _prune_empty, _write_atomic, audio_revision_dir
 from .meeting_store import (
+    MEETING_AUDIO_WARN_DAYS,
     audio_due_for_expiry,
     get_meeting,
     list_meetings,
@@ -46,18 +47,14 @@ from .meeting_store import (
 
 log = logging.getLogger(__name__)
 
-# The one default for the pre-expiry warning window; `Config` reads it from
-# here so the setting and the function cannot drift to two different windows.
-DEFAULT_WARN_DAYS = 3
-
 ALERT_SCHEMA = "teammem-meeting-audio-alert/v1"
 ALERT_STATUS = "audio_expiring"
 
 
 @dataclass(frozen=True)
 class RetentionFailure:
-    """One revision retention could not finish with. `stage` is `unlink`,
-    `mark`, `sweep`, `store_path` or `alert`; every one is retryable."""
+    """One revision retention could not finish with. `stage` is `symlink`,
+    `unlink`, `mark`, `sweep` or `alert`; every one is retryable."""
 
     occurrence_id: str
     revision: int
@@ -71,6 +68,7 @@ class RetentionResult:
     swept: tuple[tuple[str, int], ...] = ()        # revived files removed again
     mismatched: tuple[tuple[str, int], ...] = ()   # deleted, but not the recorded bytes
     alerted: tuple[str, ...] = ()                  # occurrence ids warned
+    cleared: tuple[str, ...] = ()                  # alerts whose warning has lapsed
     failed: tuple[RetentionFailure, ...] = ()
     dry_run: bool = False
 
@@ -99,7 +97,7 @@ def expire_meeting_audio(
     *,
     now: str,
     alert_path: Callable[[str], Path],
-    warn_days: int = DEFAULT_WARN_DAYS,
+    warn_days: int = MEETING_AUDIO_WARN_DAYS,
     dry_run: bool = False,
 ) -> RetentionResult:
     """Delete every expired recording, sweep revived ones, then warn.
@@ -122,13 +120,14 @@ def expire_meeting_audio(
         _expire_one(conn, store, row, stamp=stamp, dry_run=dry_run,
                     deleted=deleted, mismatched=mismatched, failed=failed)
     swept = _sweep_revived(conn, store, dry_run=dry_run, failed=failed)
-    alerted = _warn(conn, now=now, warn_days=warn_days, alert_path=alert_path,
-                    dry_run=dry_run, failed=failed)
+    alerted, cleared = _warn(conn, now=now, warn_days=warn_days,
+                             alert_path=alert_path, dry_run=dry_run, failed=failed)
     return RetentionResult(
         deleted=tuple(deleted),
         swept=tuple(swept),
         mismatched=tuple(mismatched),
         alerted=tuple(alerted),
+        cleared=tuple(cleared),
         failed=tuple(failed),
         dry_run=dry_run,
     )
@@ -154,14 +153,21 @@ def _expire_one(
     return again.
     """
     key = (row["occurrence_id"], row["revision"])
-    path = audio_revision_dir(store, *key) / AUDIO_FILENAME
-    if row["stored_path"] != str(path):
-        # The row was written against a different audio store. Deleting the path
-        # this store implies would leave the real ciphertext behind under a name
-        # nothing points at, so say so instead of quietly missing it.
+    # TeamMem wrote `stored_path` when it staged those bytes, so it is the
+    # authoritative name of the file — not a guess, and not something to
+    # re-derive. Deleting the path the *current* setting implies instead would
+    # strand every recording on disk the day `TEAMMEM_MEETING_AUDIO_STORE`
+    # changes, with only a daily failure line to say so.
+    path = Path(row["stored_path"])
+    inside = path == audio_revision_dir(store, *key) / AUDIO_FILENAME
+
+    # A symlinked directory in the path is the one thing worth refusing: unlink
+    # would delete a file in whatever the link points at, which is exactly the
+    # store the sweep already declines to walk into. Loud and retryable, because
+    # a link where the importer put a directory is tampering, not configuration.
+    if path.parent.is_symlink() or path.parent.parent.is_symlink():
         failed.append(RetentionFailure(
-            *key, "store_path",
-            "the recorded audio path is not this TEAMMEM_MEETING_AUDIO_STORE"))
+            *key, "symlink", "the stored audio directory is a symlink"))
         return
 
     # Reported, never a veto: retention deletes what sits at this occurrence's
@@ -187,7 +193,11 @@ def _expire_one(
     except OSError as error:
         failed.append(RetentionFailure(*key, "unlink", str(error)))
         return
-    _prune_empty(path.parent, store)
+    if inside:
+        # Pruning walks up until it reaches the store root. A path from an older
+        # store has no such stop, so its empty directories are left to the
+        # operator who moved them rather than climbed by this job.
+        _prune_empty(path.parent, store)
 
     try:
         mark_audio_deleted(conn, row["occurrence_id"], row["revision"], stamp)
@@ -258,34 +268,30 @@ def _warn(
     alert_path: Callable[[str], Path],
     dry_run: bool,
     failed: list,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Write one alert per occurrence whose current transcript is incomplete and
-    whose recording is about to go.
+    whose recording is about to go, and clear the ones that have lapsed.
 
     TeamMem never re-transcribes. Backfill is Meeting Agent's, and it arrives as
     a higher revision; all this can do is say which occurrence and by when, in
     the same terms as Meeting Agent's own warning. Retention is not extended for
     a warned meeting, ever — that is the whole point of warning.
+
+    An alert whose warning no longer applies — the transcript completed, or the
+    audio is already gone — is removed. A spool where a live warning cannot be
+    told from a dead one is worse than no spool: the operator's only signal is
+    which files are in it. `warn_days` of 0 warns about nothing and still clears,
+    so turning warnings off does not freeze yesterday's warnings on disk.
     """
-    # A shortcut past the scan, not a second rule: a zero window is already
-    # empty under the comparison below.
-    if warn_days <= 0:
-        return []
     moment = _instant(now, "now")
     alerted: list[str] = []
+    cleared: list[str] = []
     for meeting in list_meetings(conn):
-        if meeting["transcript_complete"]:
-            continue
         occurrence_id = meeting["occurrence_id"]
-        stored = get_meeting(conn, occurrence_id)
-        audio = stored["audio"] if stored else None
-        if audio is None or audio["deleted_at"] is not None:
-            continue                            # nothing left to lose
-        # The stored column, not a second derivation from `ended_at`: this is the
-        # exact value `audio_due_for_expiry` compares, so a warning and a
-        # deletion can never disagree about when the deadline is.
-        deadline = _instant(audio["expires_at"], "audio_expires_at")
-        if not deadline - timedelta(days=warn_days) <= moment < deadline:
+        audio = _at_risk(conn, meeting, moment, warn_days)
+        if audio is None:
+            _clear(alert_path(occurrence_id), occurrence_id, meeting,
+                   dry_run=dry_run, cleared=cleared, failed=failed)
             continue
         if dry_run:
             alerted.append(occurrence_id)
@@ -316,4 +322,48 @@ def _warn(
         log.warning("meeting audio expiring with an incomplete transcript: %s by %s",
                     occurrence_id, alert["audio_expires_at"])
         alerted.append(occurrence_id)
-    return alerted
+    return alerted, cleared
+
+
+def _at_risk(
+    conn: sqlite3.Connection, meeting: dict, moment: datetime, warn_days: int
+) -> dict | None:
+    """This occurrence's live audio row when its transcript is incomplete and the
+    deadline is inside the window, otherwise None.
+
+    The deadline comes from the stored `audio_expires_at` column — the exact
+    value `audio_due_for_expiry` compares — rather than a second derivation from
+    `ended_at`, so a warning and a deletion cannot disagree about when it is.
+    """
+    if meeting["transcript_complete"]:
+        return None
+    stored = get_meeting(conn, meeting["occurrence_id"])
+    audio = stored["audio"] if stored else None
+    if audio is None or audio["deleted_at"] is not None:
+        return None                             # nothing left to lose
+    deadline = _instant(audio["expires_at"], "audio_expires_at")
+    if not deadline - timedelta(days=warn_days) <= moment < deadline:
+        return None
+    return audio
+
+
+def _clear(
+    path: Path, occurrence_id: str, meeting: dict, *,
+    dry_run: bool, cleared: list, failed: list,
+) -> None:
+    """Remove a lapsed alert. `os.unlink` is itself the atomic step: the file is
+    either there in full or not there at all, never half-retracted."""
+    if not path.exists():
+        return
+    if dry_run:
+        cleared.append(occurrence_id)
+        return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        failed.append(RetentionFailure(
+            occurrence_id, meeting["current_revision"], "alert", str(error)))
+        return
+    cleared.append(occurrence_id)

@@ -444,7 +444,9 @@ When a meeting's current transcript is still incomplete and its recording is
 within `TEAMMEM_MEETING_WARN_DAYS` (default 3, `0` to warn about nothing) of
 expiry, the run writes one alert file per occurrence into
 `TEAMMEM_MEETING_ALERTS` naming the occurrence and the deadline, and exits `1`.
-The alert carries no transcript text. Retention is never extended for a warned
+The alert carries no transcript text. It is removed again once the warning has
+lapsed — the transcript completed, or the recording is gone — so every file in
+the spool is a warning that still applies. Retention is never extended for a warned
 meeting: backfill arrives as a higher revision from the producer, and a warning
 nobody acts on still ends in deletion on time. The command exits `0` when there
 was nothing to say, `1` when it warned or a deletion is left to retry, and `2`

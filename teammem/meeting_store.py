@@ -30,6 +30,10 @@ from .meeting_bundles import canonical_artifact_hash
 
 
 MEETING_AUDIO_RETENTION_DAYS = 14
+# How long before that deadline an incomplete transcript is warned about.
+# It lives here, beside the window it is measured against, so the setting,
+# the retention job and the deadline cannot drift apart.
+MEETING_AUDIO_WARN_DAYS = 3
 
 MEETING_TABLES = (
     "meeting_artifacts",

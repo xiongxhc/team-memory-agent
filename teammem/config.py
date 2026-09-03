@@ -10,9 +10,9 @@ import re
 from typing import Any, Mapping
 
 # The retention window is the ceiling on the pre-expiry warning window: a
-# warning longer than the window itself would fire before the meeting ended.
-from .meeting_retention import DEFAULT_WARN_DAYS
-from .meeting_store import MEETING_AUDIO_RETENTION_DAYS
+# warning longer than the window itself would fire before the meeting ended,
+# and both live in the store beside the deadline they describe.
+from .meeting_store import MEETING_AUDIO_RETENTION_DAYS, MEETING_AUDIO_WARN_DAYS
 
 
 _ENVIRONMENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -261,7 +261,7 @@ class Config:
     meeting_receipts: Path | None = None     # one receipt file per occurrence
     meeting_alerts: Path | None = None       # one operator alert file per occurrence
     # warn this long before audio expiry; 0 warns never, and it never extends it
-    meeting_warn_days: int = DEFAULT_WARN_DAYS
+    meeting_warn_days: int = MEETING_AUDIO_WARN_DAYS
     vault_web_base: str = ""     # https root of the published vault; no default
     vault_remote: str = "origin"          # the remote a receipt's commit must reach
     vault_ref: str = "refs/heads/main"    # and the ref on it

@@ -1050,7 +1050,7 @@ def run_expire_meeting_audio(
     print(
         f"{prefix}meeting audio: deleted={len(result.deleted)} "
         f"swept={len(result.swept)} alerted={len(result.alerted)} "
-        f"failed={len(result.failed)}"
+        f"cleared={len(result.cleared)} failed={len(result.failed)}"
     )
     deleted, swept = ("would delete", "would sweep") if dry_run else ("deleted", "swept")
     for occurrence_id, revision in result.deleted:
@@ -1063,6 +1063,9 @@ def run_expire_meeting_audio(
             "not the bytes this revision recorded",
             file=sys.stderr,
         )
+    for occurrence_id in result.cleared:
+        print(f"{prefix}{'would clear' if dry_run else 'cleared'} the alert for "
+              f"{occurrence_id}")
     for occurrence_id in result.alerted:
         print(
             f"{prefix}ALERT {occurrence_id}: the transcript is incomplete and its "

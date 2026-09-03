@@ -295,12 +295,12 @@ does not create them.
 A hub configured for meetings gets two further jobs beside the daily one:
 `teammem-meetings` runs `process-meetings` every fifteen minutes, and
 `teammem-meeting-retention` runs `expire-meeting-audio` one hour after the daily
-run — it destroys every recording that has reached `ended_at` plus fourteen days,
-needs no vault, no remote and no network to do it, and warns before an incomplete
-transcript loses its source. They are generated only while the meeting settings are present — remove the
-settings and reinstall and both are disabled and deleted. The daily unit's own
-bytes do not change either way, so an existing daily schedule keeps running
-exactly as it was.
+run — it destroys every recording that has reached `ended_at` plus fourteen
+days, needs no vault, no remote and no network to do it, and warns before an
+incomplete transcript loses its source. They are generated only while the
+meeting settings are present — remove the settings and reinstall and both are
+disabled and deleted. The daily unit's own bytes do not change either way, so an
+existing daily schedule keeps running exactly as it was.
 
 This repository holds the generator, not the deployed artifact. The operator's
 deployment overlay keeps the exact deployed copy of every generated unit, so the

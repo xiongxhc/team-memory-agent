@@ -688,20 +688,66 @@ def test_an_incomplete_transcript_at_expiry_is_deleted_rather_than_warned(tmp_pa
     assert _files(_alerts(tmp_path)) == []
 
 
-def test_audio_recorded_under_another_store_is_reported_not_guessed_at(tmp_path):
+def test_a_moved_audio_store_still_destroys_the_bytes_the_row_records(tmp_path):
+    """`stored_path` is not a guess: TeamMem wrote it. Changing the setting must
+    not strand a recording on disk with only a daily failure line to say so."""
     conn = _db(tmp_path)
     payload = _payload()
     _import(conn, tmp_path, payload)
-    elsewhere = tmp_path / "other-audio"
+    recorded = Path(get_meeting(conn, payload["occurrence_id"])["audio"]["stored_path"])
+    assert recorded.exists()
+    moved = tmp_path / "somewhere-else"           # the setting changed under the rows
 
     result = expire_meeting_audio(
-        conn, elsewhere, now=EXPIRY, alert_path=_alert_path(tmp_path))
+        conn, moved, now=EXPIRY, alert_path=_alert_path(tmp_path))
+
+    assert result.deleted == ((payload["occurrence_id"], payload["revision"]),)
+    assert result.failed == ()
+    assert not recorded.exists()
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+    assert result.exit_code == 0
+    # Pruning stops at the configured store, and this path is not under it, so
+    # its empty directories are left to whoever moved them.
+    assert recorded.parent.is_dir() and _store(tmp_path).is_dir()
+
+
+def test_a_recorded_path_that_is_gone_is_marked_rather_than_failing_forever(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    Path(get_meeting(conn, payload["occurrence_id"])["audio"]["stored_path"]).unlink()
+
+    result = expire_meeting_audio(
+        conn, tmp_path / "somewhere-else", now=EXPIRY,
+        alert_path=_alert_path(tmp_path))
+
+    assert result.deleted == ((payload["occurrence_id"], payload["revision"]),)
+    assert result.failed == ()
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+
+
+def test_a_symlinked_audio_directory_is_refused_rather_than_followed(tmp_path):
+    """The sweep declines to walk into a linked directory; deletion declines to
+    unlink through one, loudly, because that is tampering and not a setting."""
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    real = _audio(tmp_path, payload).parent
+    elsewhere = tmp_path / "planted"
+    elsewhere.mkdir()
+    (elsewhere / "audio.enc").write_bytes(b"\x00\x01\x02" * 64)
+    for entry in real.iterdir():
+        entry.unlink()
+    real.rmdir()
+    real.symlink_to(elsewhere, target_is_directory=True)
+
+    result = _expire(conn, tmp_path, EXPIRY)
 
     assert result.deleted == ()
     assert [(f.occurrence_id, f.stage) for f in result.failed] == [
-        (payload["occurrence_id"], "store_path")
+        (payload["occurrence_id"], "symlink")
     ]
-    assert _audio(tmp_path, payload).exists()       # the real bytes are untouched
+    assert (elsewhere / "audio.enc").exists()     # never unlinked through the link
     assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] is None
     assert result.exit_code == 1
 
@@ -782,3 +828,79 @@ def test_a_zero_day_window_warns_about_nothing(tmp_path):
     assert _files(_alerts(tmp_path)) == []
     assert result.exit_code == 0
     assert _audio(tmp_path, payload).exists()    # and retention is not extended
+
+
+# --- the alert spool holds only live warnings --------------------------------
+
+
+def _alert_file(tmp_path: Path, payload: dict) -> Path:
+    return _alert_path(tmp_path)(payload["occurrence_id"])
+
+
+def test_an_alert_is_cleared_when_the_transcript_is_completed(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+    _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+    assert _alert_file(tmp_path, payload).exists()
+
+    # Backfill arrives the only way it can: as a higher revision.
+    _import(conn, tmp_path, _payload(revision=payload["revision"] + 1))
+    result = _expire(conn, tmp_path, "2026-09-15T00:00:00Z")
+
+    assert result.cleared == (payload["occurrence_id"],)
+    assert result.alerted == ()
+    assert not _alert_file(tmp_path, payload).exists()
+    assert result.exit_code == 0
+
+
+def test_an_alert_is_cleared_when_the_audio_is_destroyed(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+    _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+    assert _alert_file(tmp_path, payload).exists()
+
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    assert result.deleted == ((payload["occurrence_id"], payload["revision"]),)
+    assert result.cleared == (payload["occurrence_id"],)
+    assert not _alert_file(tmp_path, payload).exists()
+
+
+def test_a_zero_day_window_still_clears_a_standing_alert(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+    _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+
+    result = _expire(conn, tmp_path, "2026-09-15T00:00:00Z", warn_days=0)
+
+    assert result.cleared == (payload["occurrence_id"],)
+    assert not _alert_file(tmp_path, payload).exists()
+
+
+def test_a_standing_alert_is_left_alone_while_the_warning_still_applies(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+    _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+    first = _alert_file(tmp_path, payload).read_bytes()
+
+    result = _expire(conn, tmp_path, "2026-09-14T06:00:00Z")
+
+    assert result.cleared == ()
+    assert result.alerted == (payload["occurrence_id"],)
+    assert _alert_file(tmp_path, payload).read_bytes() != first    # rewritten, not stale
+
+
+def test_dry_run_clears_no_alert(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(transcript_complete=False)
+    _import(conn, tmp_path, payload)
+    _expire(conn, tmp_path, "2026-09-14T00:00:00Z")
+
+    result = _expire(conn, tmp_path, EXPIRY, dry_run=True)
+
+    assert result.cleared == (payload["occurrence_id"],)
+    assert _alert_file(tmp_path, payload).exists()
