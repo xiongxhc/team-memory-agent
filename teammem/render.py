@@ -28,6 +28,11 @@ WORK_KINDS = ("commit", "pr", "mr", "issue", "repo", "comment", "journal-highlig
 _FLAG_KEYS = frozenset({"gaps", "unmapped", "unmapped_channels", "concentration"})
 _INVALID_FLAGS_MESSAGE = "invalid weekly report effective flags provenance"
 _NO_COMMIT_COUNTS = "No commit count collected for this week."
+_WEEKLY_REPORT_SECTIONS = (
+    "Shipped",
+    "Needs attention",
+    "Coordination-heavy / low artifact",
+)
 _KIND_LABELS = {
     "commit": ("commit", "commits"),
     "pr": ("PR", "PRs"),
@@ -59,6 +64,112 @@ def _project_fname(name: str) -> str:
     if cleaned.split(".", 1)[0].casefold() in _WINDOWS_DEVICE_NAMES:
         cleaned = f"_{cleaned}"
     return cleaned
+
+
+def _weekly_report_blocks(text: str) -> dict[str, list[str]] | None:
+    lines = text.splitlines()
+    if any(re.match(r"^ {0,3}(?:```|~~~)", line) for line in lines):
+        return None
+    headings = [
+        (i, line[3:].rstrip())
+        for i, line in enumerate(lines)
+        if line.startswith("## ")
+    ]
+    if [heading for _, heading in headings] != list(_WEEKLY_REPORT_SECTIONS):
+        return None
+
+    sections = {}
+    for section_index, (line_index, heading) in enumerate(headings):
+        end = (
+            headings[section_index + 1][0]
+            if section_index + 1 < len(headings)
+            else len(lines)
+        )
+        blocks: list[str] = []
+        current: list[str] = []
+
+        def finish_block() -> None:
+            while current and not current[-1].strip():
+                current.pop()
+            if current:
+                blocks.append("\n".join(current))
+                current.clear()
+
+        for line in lines[line_index + 1:end]:
+            if not line.strip():
+                if current and current[0].startswith("- "):
+                    current.append(line)
+                else:
+                    finish_block()
+            elif line.startswith("- ") and current:
+                finish_block()
+                current = [line]
+            elif (
+                current
+                and current[0].startswith("- ")
+                and not line[0].isspace()
+                and not current[-1].strip()
+            ):
+                finish_block()
+                current = [line]
+            else:
+                current.append(line)
+        finish_block()
+        sections[heading] = blocks
+    return sections
+
+
+def _project_weekly_brief(summary, project: str, raw_cutoff: str) -> list[str]:
+    if (
+        summary is None
+        or summary.evidence_cutoff is None
+        or summary.cutoff_precision not in {"instant", "date"}
+        or summary.coverage_state not in {"provisional", "friday-checkpoint"}
+    ):
+        return []
+    sections = _weekly_report_blocks(summary.text)
+    if sections is None:
+        return []
+    canonical = unicodedata.normalize("NFC", project).casefold()
+
+    def attributes_project(block: str) -> bool:
+        for bold in re.findall(r"\*\*([^*\n]+)\*\*", block):
+            label = unicodedata.normalize("NFC", bold).casefold().strip()
+            parenthetical = [
+                part.strip() for part in re.findall(r"\(([^()]*)\)", label)
+            ]
+            if canonical in parenthetical or label == canonical:
+                return True
+            if (
+                "-" in canonical
+                and label.startswith(f"{canonical} ")
+                and label.endswith(":")
+            ):
+                return True
+        return False
+
+    matched = {
+        heading: [block for block in blocks if attributes_project(block)]
+        for heading, blocks in sections.items()
+    }
+    if not any(matched.values()):
+        return []
+
+    state_label = {
+        "provisional": "Provisional",
+        "friday-checkpoint": "Friday checkpoint",
+    }[summary.coverage_state]
+    body = [
+        "\n## Weekly brief\n",
+        f"\n> {state_label} summary evidence through "
+        f"{summary.evidence_cutoff} ({summary.cutoff_precision} precision); "
+        f"raw activity evidence through {raw_cutoff}.\n",
+    ]
+    for heading in _WEEKLY_REPORT_SECTIONS:
+        if matched[heading]:
+            body.append(f"\n### {heading}\n\n")
+            body.append("\n\n".join(matched[heading]) + "\n")
+    return body
 
 
 def _person_link(name: str, up: int = 1) -> str:
@@ -632,6 +743,10 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                     f"{_activity_summary(mine)}\n\n",
                     f"{_evidence_notice(cutoff)}\n",
                 ]
+                if root_name == "Projects":
+                    wmd += _project_weekly_brief(
+                        weekly_summaries.get(monday), proj, cutoff[0]
+                    )
                 wmd += _project_week_body(mine)
                 _write(pdir / f"{_fname(label)}.md", "".join(wmd))
                 files += 1

@@ -594,6 +594,218 @@ def test_project_week_files_and_index_make_history_navigable(tmp_path):
     assert "fix: JWT refresh race" in week
 
 
+def test_project_week_projects_exact_weekly_brief_with_both_cutoffs(tmp_path):
+    conn = _seed(tmp_path)
+    _store_weekly_summary(
+        conn,
+        coverage_state="provisional",
+        text=(
+            "> Provisional report.\n\n"
+            "## Shipped\n\n"
+            "**project-alpha** — auth path shipped.\n\n"
+            "**project-beta** — unrelated shipped item.\n\n"
+            "## Needs attention\n\n"
+            "- **project-alphabet** — substring trap.\n"
+            "- **project-alpha permissions:** follow-up remains.\n"
+            "- **project-alpha permissions (open):** owner still needed.\n"
+            "- **Security** — unrelated attention item.\n\n"
+            "## Coordination-heavy / low artifact\n\n"
+            "- **Sam (project-alpha)** — rollout decision pending.\n"
+            "- **Alex (project-beta)** — unrelated coordination."
+        ),
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    path = vault / "Projects" / "project-alpha" / "Week 2026-07-13-17.md"
+    page = path.read_text()
+    assert "## Weekly brief" in page
+    assert "### Shipped\n\n**project-alpha** — auth path shipped." in page
+    assert "### Needs attention\n\n- **project-alpha permissions:** follow-up remains." in page
+    assert "**project-alpha permissions (open):** owner still needed." in page
+    assert (
+        "### Coordination-heavy / low artifact\n\n"
+        "- **Sam (project-alpha)** — rollout decision pending."
+    ) in page
+    assert "Provisional summary evidence through 2026-07-14T10:00:00+04:00" in page
+    assert "raw activity evidence through 2026-07-15T09:00:00+04:00" in page
+    assert "project-alphabet" not in page
+    assert "unrelated shipped item" not in page
+    assert "unrelated attention item" not in page
+    assert "unrelated coordination" not in page
+    assert page.index("## Weekly brief") < page.index("### [Alex Rivera]")
+
+    first = path.read_bytes()
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    assert path.read_bytes() == first
+
+
+@pytest.mark.parametrize(
+    ("text", "coverage_state"),
+    [
+        (
+            "## Shipped\n\n**project-alpha** — legacy match.\n\n"
+            "## Needs attention\n\n- none\n\n"
+            "## Coordination-heavy / low artifact\n\n- none",
+            None,
+        ),
+        (
+            "## Shipped\n\n**project-alpha** — malformed match.\n\n"
+            "## Needs attention\n\n- none",
+            "provisional",
+        ),
+        (
+            "## Shipped\n\nProject-alpha appears only in prose.\n\n"
+            "## Needs attention\n\n- **project-alpha-v2** — suffix collision.\n\n"
+            "## Coordination-heavy / low artifact\n\n- none",
+            "provisional",
+        ),
+        (
+            "```markdown\n## Shipped\n\n**project-alpha** — fenced match.\n\n"
+            "## Needs attention\n\n- none\n\n"
+            "## Coordination-heavy / low artifact\n\n- none\n```",
+            "provisional",
+        ),
+        (
+            "   ~~~markdown\n## Shipped\n\n**project-alpha** — fenced match.\n\n"
+            "## Needs attention\n\n- none\n\n"
+            "## Coordination-heavy / low artifact\n\n- none\n   ~~~",
+            "provisional",
+        ),
+    ],
+)
+def test_project_week_unchanged_when_weekly_brief_is_unsafe(
+    tmp_path, text, coverage_state
+):
+    conn = _seed(tmp_path)
+    vault = tmp_path / "vault"
+    path = vault / "Projects" / "project-alpha" / "Week 2026-07-13-17.md"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    baseline = path.read_bytes()
+    _store_weekly_summary(conn, text=text, coverage_state=coverage_state)
+
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    assert path.read_bytes() == baseline
+
+
+@pytest.mark.parametrize(
+    ("project", "bold_label"),
+    [
+        ("risk", "Risk assessment:"),
+        ("alex", "Alex:"),
+        ("alex", "Alex Rivera (project-alpha)"),
+        ("project-alpha", "project-alpha+next:"),
+    ],
+)
+def test_project_week_does_not_treat_bold_prose_or_people_as_projects(
+    tmp_path, project, bold_label
+):
+    conn = _seed(tmp_path)
+    insert_events(conn, [Event(
+        person="sam",
+        ts="2026-07-14T11:00:00+04:00",
+        source="gitlab",
+        kind="commit",
+        summary="project evidence",
+        hash=f"{project}-1",
+        project=project,
+    )])
+    _store_weekly_summary(
+        conn,
+        coverage_state="provisional",
+        text=(
+            f"## Shipped\n\n**{bold_label}** — unrelated report prose.\n\n"
+            "## Needs attention\n\n- none\n\n"
+            "## Coordination-heavy / low artifact\n\n- none"
+        ),
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    page = vault / "Projects" / project / "Week 2026-07-13-17.md"
+    assert "## Weekly brief" not in page.read_text()
+
+
+def test_project_week_preserves_selected_bullet_continuations(tmp_path):
+    conn = _seed(tmp_path)
+    _store_weekly_summary(
+        conn,
+        coverage_state="friday-checkpoint",
+        text=(
+            "## Shipped\n\n"
+            "- **project-alpha** — shared rollout:\n\n"
+            "  - release decision recorded\n"
+            "  - owner confirmed\n"
+            "- **project-beta** — unrelated rollout.\n\n"
+            "## Needs attention\n\n- none\n\n"
+            "## Coordination-heavy / low artifact\n\n- none"
+        ),
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    page = (
+        vault / "Projects" / "project-alpha" / "Week 2026-07-13-17.md"
+    ).read_text()
+    assert "release decision recorded" in page
+    assert "owner confirmed" in page
+    assert "unrelated rollout" not in page
+    assert "Friday checkpoint summary evidence" in page
+
+
+def test_weekly_brief_is_limited_to_full_project_week_pages(tmp_path):
+    conn = _seed(tmp_path)
+    insert_events(conn, [
+        Event(
+            person="sam", ts="2026-07-14T11:00:00+04:00", source="gitlab",
+            kind="commit", summary="shared project work", hash="gamma-1",
+            project="project-gamma",
+        ),
+        Event(
+            person="sam", ts="2026-07-14T12:00:00+04:00", source="memberkit",
+            kind="journal-highlight", summary="area work", hash="area-1",
+            project="coordination",
+        ),
+        Event(
+            person="sam", ts="2026-07-14T13:00:00+04:00", source="gitlab",
+            kind="commit", summary="count-only work", hash="beta-current-1",
+            project="project-beta",
+        ),
+    ])
+    _store_weekly_summary(
+        conn,
+        coverage_state="provisional",
+        text=(
+            "## Shipped\n\n"
+            "**project-alpha** and **project-gamma** — shared launch.\n\n"
+            "**coordination** — area update.\n\n"
+            "**project-beta** — count-only update.\n\n"
+            "## Needs attention\n\n- none\n\n"
+            "## Coordination-heavy / low artifact\n\n- none"
+        ),
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    for project in ("project-alpha", "project-gamma"):
+        page = vault / "Projects" / project / "Week 2026-07-13-17.md"
+        assert "**project-alpha** and **project-gamma** — shared launch." in page.read_text()
+    assert "## Weekly brief" not in (
+        vault / "Projects" / "project-alpha" / "README.md"
+    ).read_text()
+    assert "## Weekly brief" not in (
+        vault / "Areas" / "coordination" / "Week 2026-07-13-17.md"
+    ).read_text()
+    assert "## Weekly brief" not in (
+        vault / "Projects" / "project-beta" / "Week 2026-07-13-17.md"
+    ).read_text()
+
+
 def test_render_classifies_projects_areas_hidden_and_count_only_activity(tmp_path):
     """Routing every label to Projects or rendering count-only events breaks this."""
     conn = open_db(tmp_path / "l.db")
