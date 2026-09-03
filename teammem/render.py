@@ -1190,3 +1190,74 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
         if finding["occurrence_id"] not in expected:
             finding["occurrence_id"] = None
     return sorted(findings, key=lambda f: (f["invariant"], f["path"], f["detail"]))
+
+
+# ---- Rendering for a caller that will publish -------------------------------
+
+
+def _blame_findings(conn: sqlite3.Connection, ids: IdentityMaps,
+                    findings: list[dict], withheld: dict[str, str]) -> dict[str, str]:
+    """The occurrences that could be withheld to clear these findings.
+
+    `verify_meeting_semantics` attributes a finding only when one current
+    occurrence is at fault, and reports leakage against the projection as a
+    whole because a leaked value could come from any stored revision. For
+    withholding, the file a finding names is enough: a note belongs to the
+    occurrence its short id spells, and a person or project page belongs to the
+    occurrences whose backlinks reach it.
+    """
+    blamed: dict[str, str] = {}
+    shorts: dict[str, str] | None = None
+    pages: dict[str, tuple[str, ...]] | None = None
+    for finding in findings:
+        path = finding["path"]
+        owners = [finding["occurrence_id"]] if finding["occurrence_id"] else []
+        if not owners and path.startswith(meeting_render.MEETINGS_DIR + "/"):
+            if shorts is None:
+                shorts = {short_occurrence_id(row["occurrence_id"]): row["occurrence_id"]
+                          for row in list_meetings(conn)}
+            stem = PurePosixPath(path).stem
+            if stem.endswith("]") and "[" in stem:
+                owners = [o for o in (shorts.get(stem.rsplit("[", 1)[1][:-1]),) if o]
+        if not owners:
+            if pages is None:
+                pages = _meeting_pages(_meeting_expectations(conn, ids))
+            owners = list(pages.get(path, ()))
+        for occurrence_id in owners:
+            if occurrence_id not in withheld:
+                blamed[occurrence_id] = f"{finding['invariant']} on {path}"
+    return blamed
+
+
+def render_vault_verified(conn: sqlite3.Connection, ids: IdentityMaps,
+                          vault_dir: Path, today: date, weeks: int = 4,
+                          channel_names: dict | None = None) -> dict:
+    """Render for a caller that is going to commit and push the result.
+
+    `render_vault` on its own leaves meeting content in the vault that no check
+    has read, and the daily pipeline commits and pushes whatever it finds there.
+    Refusing would be worse than the disease: one bad note would stop the vault
+    publishing anything. So the offending occurrence is withheld instead — left
+    out of the projection and named — while every other page renders exactly as
+    it always did, and is committed and pushed as it always was. The occurrence
+    stays retryable: nothing is deleted from the ledger, and the next render
+    files it as soon as a corrected revision lands.
+
+    Returns `render_vault`'s dict, plus `withheld` (occurrence -> what it failed)
+    and `findings`: the findings no occurrence could be withheld for. Those name
+    vault content the meetings projection does not own and no render can remove,
+    so a caller that pushes must not.
+    """
+    withheld: dict[str, str] = {}
+    while True:
+        out = render_vault(conn, ids, vault_dir, today, weeks=weeks,
+                           channel_names=channel_names, withhold=withheld)
+        withheld = out["withheld"]
+        findings = verify_meeting_semantics(conn, ids, vault_dir)
+        blamed = _blame_findings(conn, ids, findings, withheld)
+        if blamed:
+            withheld.update(blamed)
+            continue
+        out["findings"] = [f for f in findings
+                           if f["occurrence_id"] not in withheld]
+        return out

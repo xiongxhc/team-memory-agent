@@ -34,7 +34,7 @@ from .reclaim import reclaim, reclaim_channel_projects
 # `_upstream` the one definition of where a vault publishes. Spelling either a
 # second time here is how two answers to one question drift apart; Task 6 imports
 # `render._meeting_facts` across the same boundary for the same reason.
-from .render import MANAGED, render_vault, verify_vault
+from .render import MANAGED, render_vault_verified, verify_vault
 from .render import _managed_files as managed_vault_files
 from .slices import active_person_days
 from .store import get_summary, insert_events, open_db, reconcile_gitlab_events
@@ -320,7 +320,11 @@ def run_render(
         print("verify-render: vault matches ledger render")
         return 0
     ensure_repo(cfg.vault_dir)
-    out = render_vault(
+    # Verified, not bare: this path commits and pushes what it renders, and no
+    # meeting content may reach the remote that the meeting invariants have not
+    # read. A meeting that fails them is withheld and reported; the rest of the
+    # vault renders, commits and pushes exactly as it always did.
+    out = render_vault_verified(
         connection,
         ids,
         cfg.vault_dir,
@@ -328,6 +332,19 @@ def run_render(
         weeks=weeks,
         channel_names=channel_names,
     )
+    for occurrence_id, reason in sorted(out["withheld"].items()):
+        print(f"WARN: meeting {occurrence_id} withheld from the vault: {reason}",
+              file=sys.stderr)
+    if out["findings"]:
+        # Named by invariant and path only, never by content: reporting a leak
+        # must not copy it into the operator's log.
+        for finding in out["findings"]:
+            print(f"WARN: {finding['invariant']} on {finding['path']}",
+                  file=sys.stderr)
+        print(f"render: {len(out['findings'])} meeting invariant finding(s) no "
+              "meeting could be withheld for; nothing committed or pushed",
+              file=sys.stderr)
+        return 1
     committed = commit_all(
         cfg.vault_dir,
         f"render: {today.isoformat()} {out['week_label']} ({out['files']} files)",
