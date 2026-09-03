@@ -53,8 +53,9 @@ ALERT_STATUS = "audio_expiring"
 
 @dataclass(frozen=True)
 class RetentionFailure:
-    """One revision retention could not finish with. `stage` is `symlink`,
-    `unlink`, `mark`, `sweep` or `alert`; every one is retryable."""
+    """One revision retention could not finish with. `stage` is `path`,
+    `symlink`, `digest`, `unlink`, `mark`, `sweep` or `alert`; every one is
+    retryable, and every one costs exactly the occurrence it names."""
 
     occurrence_id: str
     revision: int
@@ -117,8 +118,16 @@ def expire_meeting_audio(
     stamp = _stamp(_instant(now, "now"))
 
     for row in audio_due_for_expiry(conn, now):
-        _expire_one(conn, store, row, stamp=stamp, dry_run=dry_run,
-                    deleted=deleted, mismatched=mismatched, failed=failed)
+        try:
+            _expire_one(conn, store, row, stamp=stamp, dry_run=dry_run,
+                        deleted=deleted, mismatched=mismatched, failed=failed)
+        except OSError as error:
+            # The backstop for every filesystem probe inside, present and future:
+            # `Path.is_symlink` re-raises EACCES, so one unsearchable directory
+            # would otherwise abort the run and strand every other occurrence
+            # due that day. One bad path costs exactly one meeting.
+            failed.append(RetentionFailure(
+                row["occurrence_id"], row["revision"], "path", str(error)))
     swept = _sweep_revived(conn, store, dry_run=dry_run, failed=failed)
     alerted, cleared = _warn(conn, now=now, warn_days=warn_days,
                              alert_path=alert_path, dry_run=dry_run, failed=failed)
@@ -177,10 +186,20 @@ def _expire_one(
         # The importer never stores one. Unlink removes the link and not its
         # target, so the bytes this row describes are somewhere else entirely.
         mismatched.append(key)
-    elif path.exists():
-        digest, size = _digest_file(path)
-        if digest != row["sha256"] or size != row["bytes"]:
-            mismatched.append(key)
+    else:
+        try:
+            digest, size = _digest_file(path)
+        except FileNotFoundError:
+            pass                                # already gone; the unlink converges
+        except OSError as error:
+            # A digest that cannot be read is not treated more leniently than one
+            # that is read and disagrees: both are reported and both still lose
+            # their bytes. Distinct stages, because "unreadable" and "disagreed"
+            # ask different questions of an operator.
+            failed.append(RetentionFailure(*key, "digest", str(error)))
+        else:
+            if digest != row["sha256"] or size != row["bytes"]:
+                mismatched.append(key)
 
     if dry_run:
         deleted.append(key)
@@ -233,31 +252,56 @@ def _sweep_revived(
     swept: list[tuple[str, int]] = []
     for segment in sorted(store.iterdir()):
         occurrence_id = known.get(segment.name)
-        if occurrence_id is None or segment.is_symlink() or not segment.is_dir():
+        if occurrence_id is None:
             continue
-        for revision_dir in sorted(segment.iterdir()):
-            if revision_dir.is_symlink() or not revision_dir.name.isdigit():
-                continue
-            path = revision_dir / AUDIO_FILENAME
-            if path.is_symlink() or not path.is_file():
-                continue
-            revision = int(revision_dir.name)
-            meeting = get_meeting(conn, occurrence_id, revision=revision)
-            audio = meeting["audio"] if meeting else None
-            if audio is None or audio["deleted_at"] is None:
-                continue
-            if dry_run:
-                swept.append((occurrence_id, revision))
-                continue
+        # Every probe below can raise on an unreadable directory, and a janitor
+        # must never abort the run: one unreachable directory costs that
+        # directory. Revision 0 says the fault was above any single revision.
+        try:
+            entries = ([] if segment.is_symlink() or not segment.is_dir()
+                       else sorted(segment.iterdir()))
+        except OSError as error:
+            failed.append(RetentionFailure(occurrence_id, 0, "sweep", str(error)))
+            continue
+        for revision_dir in entries:
             try:
-                os.unlink(path)
+                found = _sweep_revision(
+                    conn, store, occurrence_id, revision_dir, dry_run=dry_run)
             except OSError as error:
+                name = revision_dir.name
                 failed.append(RetentionFailure(
-                    occurrence_id, revision, "sweep", str(error)))
+                    occurrence_id, int(name) if name.isdigit() else 0,
+                    "sweep", str(error)))
                 continue
-            _prune_empty(revision_dir, store)
-            swept.append((occurrence_id, revision))
+            if found is not None:
+                swept.append(found)
     return swept
+
+
+def _sweep_revision(
+    conn: sqlite3.Connection,
+    store: Path,
+    occurrence_id: str,
+    revision_dir: Path,
+    *,
+    dry_run: bool,
+) -> tuple[str, int] | None:
+    """Remove one revision's ciphertext when its row already says it is gone."""
+    if revision_dir.is_symlink() or not revision_dir.name.isdigit():
+        return None
+    path = revision_dir / AUDIO_FILENAME
+    if path.is_symlink() or not path.is_file():
+        return None
+    revision = int(revision_dir.name)
+    meeting = get_meeting(conn, occurrence_id, revision=revision)
+    audio = meeting["audio"] if meeting else None
+    if audio is None or audio["deleted_at"] is None:
+        return None
+    if dry_run:
+        return occurrence_id, revision
+    os.unlink(path)
+    _prune_empty(revision_dir, store)
+    return occurrence_id, revision
 
 
 def _warn(
@@ -353,12 +397,12 @@ def _clear(
 ) -> None:
     """Remove a lapsed alert. `os.unlink` is itself the atomic step: the file is
     either there in full or not there at all, never half-retracted."""
-    if not path.exists():
-        return
-    if dry_run:
-        cleared.append(occurrence_id)
-        return
     try:
+        if not path.exists():
+            return
+        if dry_run:
+            cleared.append(occurrence_id)
+            return
         os.unlink(path)
     except FileNotFoundError:
         return

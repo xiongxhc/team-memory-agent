@@ -14,6 +14,7 @@ key.
 import errno
 import json
 import os
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -21,6 +22,7 @@ import pytest
 
 from teammem import cli as cli_module
 from teammem import config as config_module
+from teammem import meeting_retention
 from teammem.cli import main
 from teammem.meeting_bundles import occurrence_path_segment
 from teammem.meeting_importer import audio_revision_dir, import_meeting_inbox
@@ -904,3 +906,137 @@ def test_dry_run_clears_no_alert(tmp_path):
 
     assert result.cleared == (payload["occurrence_id"],)
     assert _alert_file(tmp_path, payload).exists()
+
+
+# --- one bad file costs exactly one meeting ----------------------------------
+
+
+def test_an_unreadable_digest_still_deletes_and_never_stops_the_other_meetings(
+    tmp_path, monkeypatch
+):
+    """A digest that cannot be read is not treated more leniently than one that
+    is read and disagrees: the bytes still go, and every other occurrence due
+    that day is still processed."""
+    conn = _db(tmp_path)
+    first = _payload(day="2026-08-20")
+    second = _payload()
+    _import(conn, tmp_path, first)
+    _import(conn, tmp_path, second)
+    blocked = _audio(tmp_path, first)
+    real_digest = meeting_retention._digest_file
+
+    def refuse(path, *args, **kwargs):
+        if Path(path) == blocked:
+            raise PermissionError(errno.EACCES, "permission denied")
+        return real_digest(path, *args, **kwargs)
+
+    monkeypatch.setattr(meeting_retention, "_digest_file", refuse)
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    assert result.deleted == (
+        (first["occurrence_id"], first["revision"]),
+        (second["occurrence_id"], second["revision"]),
+    )
+    assert not blocked.exists() and not _audio(tmp_path, second).exists()
+    assert get_meeting(conn, first["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+    assert get_meeting(conn, second["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+    assert [(f.occurrence_id, f.stage) for f in result.failed] == [
+        (first["occurrence_id"], "digest")
+    ]
+    assert result.exit_code == 1
+
+
+def test_an_unsearchable_directory_costs_one_meeting_and_not_the_run(
+    tmp_path, monkeypatch
+):
+    """`Path.is_symlink` re-raises EACCES, so the probes before the unlink need a
+    backstop of their own."""
+    conn = _db(tmp_path)
+    first = _payload(day="2026-08-20")
+    second = _payload()
+    _import(conn, tmp_path, first)
+    _import(conn, tmp_path, second)
+    blocked = _audio(tmp_path, first).parent
+    real_is_symlink = Path.is_symlink
+
+    def refuse(self):
+        if self == blocked:
+            raise PermissionError(errno.EACCES, "permission denied")
+        return real_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", refuse)
+    result = _expire(conn, tmp_path, EXPIRY)
+
+    assert result.deleted == ((second["occurrence_id"], second["revision"]),)
+    assert not _audio(tmp_path, second).exists()
+    # The deletion pass and the janitor both trip over the same directory, and
+    # both report it against that one occurrence rather than ending the run.
+    assert [(f.occurrence_id, f.stage) for f in result.failed] == [
+        (first["occurrence_id"], "path"),
+        (first["occurrence_id"], "sweep"),
+    ]
+    assert get_meeting(conn, first["occurrence_id"])["audio"]["deleted_at"] is None
+    assert result.exit_code == 1
+
+    monkeypatch.undo()
+    assert _expire(conn, tmp_path, LATER).deleted == (
+        (first["occurrence_id"], first["revision"]),
+    )
+
+
+def test_an_audio_store_moved_on_disk_and_repointed_loses_its_bytes_in_one_run(
+    tmp_path
+):
+    """The other half of a store move: the recorded path 404s, so the row is
+    marked, and the sweep destroys the relocated ciphertext in the same run
+    because it reads its own write on the same connection."""
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    recorded = Path(get_meeting(conn, payload["occurrence_id"])["audio"]["stored_path"])
+    moved = tmp_path / "meeting-audio-moved"
+    shutil.move(str(_store(tmp_path)), str(moved))
+    relocated = audio_revision_dir(
+        moved, payload["occurrence_id"], payload["revision"]) / "audio.enc"
+    assert relocated.exists() and not recorded.exists()
+
+    result = expire_meeting_audio(
+        conn, moved, now=EXPIRY, alert_path=_alert_path(tmp_path))
+
+    key = (payload["occurrence_id"], payload["revision"])
+    assert result.deleted == (key,)
+    assert result.swept == (key,)
+    assert not relocated.exists()
+    assert result.failed == ()
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+    assert result.exit_code == 0
+
+
+def test_an_unlistable_occurrence_directory_costs_only_the_janitor(
+    tmp_path, monkeypatch
+):
+    """The sweep is a janitor with no deadline: a directory it cannot list is
+    reported against that occurrence and the deletion that is due still lands."""
+    conn = _db(tmp_path)
+    due = _payload(day="2026-08-20")
+    later = _payload()
+    _import(conn, tmp_path, due)
+    _import(conn, tmp_path, later)
+    blocked = _audio(tmp_path, later).parent.parent      # not due, so still there
+    real_iterdir = Path.iterdir
+
+    def refuse(self):
+        if self == blocked:
+            raise PermissionError(errno.EACCES, "permission denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", refuse)
+    result = _expire(conn, tmp_path, "2026-09-03T14:52:00Z")
+
+    assert result.deleted == ((due["occurrence_id"], due["revision"]),)
+    assert not _audio(tmp_path, due).exists()
+    assert _audio(tmp_path, later).exists()
+    assert [(f.occurrence_id, f.revision, f.stage) for f in result.failed] == [
+        (later["occurrence_id"], 0, "sweep")     # 0: above any single revision
+    ]
+    assert result.exit_code == 1
