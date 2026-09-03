@@ -1,0 +1,4 @@
+# The wire contract a bundle producer implements against, carried in the source
+# archive so a release can be read without the git repository. The wheel is code
+# only: nothing here is installed into site-packages.
+include docs/schemas/teammem-meeting-v1.md
