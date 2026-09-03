@@ -97,7 +97,7 @@ never absent.
 | `discussion_points` | array | Key discussion points with evidence. |
 | `person_summaries` | array | See [Per-person summaries](#per-person-summaries). |
 | `recording_gaps` | array | Ordered, disjoint, inside the meeting window. |
-| `processing_warnings` | array | `{code, detail}`; `code` is a lowercase token, `detail` ≤ 500 chars. |
+| `processing_warnings` | array | `{code, detail}`; `code` is a lowercase token, `detail` ≤ 500 chars. The note renders the code; `detail` is kept in the ledger and never published. |
 | `provenance` | object | See [Provenance](#provenance). |
 | `audio` | object | See [Encrypted audio](#encrypted-audio). |
 

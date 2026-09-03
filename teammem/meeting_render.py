@@ -215,8 +215,11 @@ def _details(meeting: dict) -> str:
         body += "- Recording gaps: none\n"
     warnings = meeting["processing_warnings"]
     if warnings:
+        # The code only. `detail` is the one note field a producer writes free
+        # text into, up to 500 characters of it, and the vault is a git remote:
+        # the ledger keeps the text for provenance, the note names the code.
         body += "- Processing warnings:\n" + "".join(
-            f"  - {warning['code']} — {warning['detail']}\n" for warning in warnings
+            f"  - {warning['code']}\n" for warning in warnings
         )
     else:
         body += "- Processing warnings: none\n"

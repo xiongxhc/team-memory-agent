@@ -991,3 +991,13 @@ def test_a_link_target_with_nested_parentheses_is_not_cut_short(tmp_path):
     found = _findings(conn, vault)
     assert [f["invariant"] for f in found] == [LINK_RESOLVES]
     assert "a(b(c)gone).md" in found[0]["detail"]   # the whole target, not a prefix
+
+
+def test_a_processing_warning_reaches_the_note_as_a_code_and_nothing_else(tmp_path):
+    """`detail` is producer free text and the vault is a published git remote."""
+    payload = _payload()
+    payload["processing_warnings"] = [
+        {"code": "overlapping_speech_ambiguous", "detail": "leaked " * 20}]
+    note = _note(_render(tmp_path, _seeded(tmp_path, payload)))
+    assert "- overlapping_speech_ambiguous\n" in note
+    assert "leaked" not in note
