@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from .config import Config
+from .config import CODEX_MODEL, Config
 from .connectors.base import CollectionResult, Connector
 from .connectors.config import ConnectorSettings
 from .connectors.registry import get_connector
@@ -37,6 +38,7 @@ from .summarize import (
     DailySummaryInput,
     PreparedDailyJournal,
     claude_cli_llm,
+    codex_cli_llm,
     daily_cache_status,
     http_llm,
     prepare_daily_journal,
@@ -133,10 +135,17 @@ def redact_secrets(detail: object, cfg: Config) -> str:
 
 def resolve_llm_backend(cfg: Config, model: str, max_tokens: int):
     """Resolve the optional synthesis backend without exposing credentials."""
+    if cfg.llm_provider == "codex":
+        if shutil.which(cfg.codex_bin) is None:
+            return None
+        reasoning_effort = "medium" if max_tokens <= 1024 else "high"
+        return codex_cli_llm(
+            CODEX_MODEL,
+            reasoning_effort=reasoning_effort,
+            codex_bin=cfg.codex_bin,
+        )
     if cfg.anthropic_api_key:
         return http_llm(model, cfg.anthropic_api_key, max_tokens=max_tokens)
-    import shutil
-
     if shutil.which("claude"):
         return claude_cli_llm(model)
     return None
@@ -452,7 +461,9 @@ def execute_journal(
         if prepared is None:
             continue
         prepared_journals.append(prepared)
-        status, _text = daily_cache_status(conn, prepared)
+        status, _text = daily_cache_status(
+            conn, prepared, cfg.llm_daily_model
+        )
         if status == "cached":
             cached += 1
         elif status == "migrated":
@@ -556,8 +567,8 @@ def run_journal(
         for person, pair_day in pairs:
             cached = connection.execute(
                 "SELECT input_hash FROM summaries "
-                "WHERE kind = 'daily-person' AND key = ?",
-                (f"{person}|{pair_day}",),
+                "WHERE kind = 'daily-person' AND key = ? AND model = ?",
+                (f"{person}|{pair_day}", cfg.llm_daily_model),
             ).fetchone()
             state = "hit" if cached else "miss"
             print(f"DRY journal {person:<28} {pair_day}  {state}")
@@ -570,8 +581,13 @@ def run_journal(
         cfg, cfg.llm_daily_model, max_tokens=1024
     )
     if backend is None:
+        setup = (
+            f"install {cfg.codex_bin} and run `codex login`"
+            if cfg.llm_provider == "codex"
+            else "set ANTHROPIC_API_KEY or install the claude CLI"
+        )
         print(
-            "no LLM backend: set ANTHROPIC_API_KEY or install the claude CLI",
+            f"no LLM backend: {setup}",
             file=sys.stderr,
         )
         return 2
@@ -667,7 +683,11 @@ def execute_report(
         )
         status = (
             "cached"
-            if existing is not None and existing.input_hash == record.input_hash
+            if (
+                existing is not None
+                and existing.input_hash == record.input_hash
+                and existing.model == cfg.llm_report_model
+            )
             else "generated"
         )
         detail = f"{len(dailies)} dailies"
@@ -703,8 +723,9 @@ def run_report(
         return 0
     if dry_run:
         cached = connection.execute(
-            "SELECT 1 FROM summaries WHERE kind='weekly-team' AND key=?",
-            (f"team|{monday.isoformat()}",),
+            "SELECT 1 FROM summaries "
+            "WHERE kind='weekly-team' AND key=? AND model=?",
+            (f"team|{monday.isoformat()}", cfg.llm_report_model),
         ).fetchone()
         print(
             f"DRY report {week_label(monday)}: {len(dailies)} dailies,"
@@ -715,8 +736,13 @@ def run_report(
         cfg, cfg.llm_report_model, max_tokens=8192
     )
     if backend is None:
+        setup = (
+            f"install {cfg.codex_bin} and run `codex login`"
+            if cfg.llm_provider == "codex"
+            else "set ANTHROPIC_API_KEY or install the claude CLI"
+        )
         print(
-            "no LLM backend: set ANTHROPIC_API_KEY or install the claude CLI",
+            f"no LLM backend: {setup}",
             file=sys.stderr,
         )
         return 2

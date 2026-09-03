@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 
 _ENVIRONMENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+CODEX_MODEL = "gpt-5.6-sol"
 
 
 def default_env_file(
@@ -161,6 +162,8 @@ class Config:
     push: bool = False
     obsidian_projects: Path | None = None  # docs-sync source; unset = command guarded off
     anthropic_api_key: str = ""    # ANTHROPIC_API_KEY — synthesis only, never committed
+    llm_provider: str = "claude"
+    codex_bin: str = "codex"
     llm_daily_model: str = "daily-summary-model"
     llm_report_model: str = "weekly-summary-model"
     llm_concurrency: int = 2
@@ -172,6 +175,15 @@ class Config:
     archive: Path | None = None
     quarantine: Path | None = None
     snapshots: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.llm_provider not in ("claude", "codex"):
+            raise ValueError(
+                "TEAMMEM_LLM_PROVIDER must be one of: claude, codex"
+            )
+        if self.llm_provider == "codex":
+            self.llm_daily_model = CODEX_MODEL
+            self.llm_report_model = CODEX_MODEL
 
     @classmethod
     def load(
@@ -196,6 +208,7 @@ class Config:
             windows_api=windows_api,
         )
         values.update(os.environ if env is None else env)
+        llm_provider = values.get("TEAMMEM_LLM_PROVIDER", cls.llm_provider)
         return cls(
             db_path=Path(values.get("TEAMMEM_DB", str(cls.db_path))),
             config_dir=Path(values.get("TEAMMEM_CONFIG_DIR", str(cls.config_dir))),
@@ -210,8 +223,14 @@ class Config:
             obsidian_projects=(Path(values["TEAMMEM_OBSIDIAN_PROJECTS"])
                                if values.get("TEAMMEM_OBSIDIAN_PROJECTS") else None),
             anthropic_api_key=values.get("ANTHROPIC_API_KEY", cls.anthropic_api_key),
-            llm_daily_model=values.get("TEAMMEM_LLM_DAILY_MODEL", cls.llm_daily_model),
-            llm_report_model=values.get("TEAMMEM_LLM_REPORT_MODEL", cls.llm_report_model),
+            llm_provider=llm_provider,
+            codex_bin=values.get("TEAMMEM_CODEX_BIN", cls.codex_bin),
+            llm_daily_model=values.get(
+                "TEAMMEM_LLM_DAILY_MODEL", cls.llm_daily_model
+            ),
+            llm_report_model=values.get(
+                "TEAMMEM_LLM_REPORT_MODEL", cls.llm_report_model
+            ),
             llm_concurrency=_bounded_integer(
                 values,
                 "TEAMMEM_LLM_CONCURRENCY",

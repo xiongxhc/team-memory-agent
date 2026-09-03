@@ -141,13 +141,23 @@ descriptor remains held for the entire run. Capture mode fails fast with
 `msvcrt` only on that platform.
 
 Daily cache identity is local to one person-day: identity, local date, project
-names in that slice, and the complete ordered event text. A compatibility check
+names in that slice, the complete ordered event text, and the configured model.
+A compatibility check
 migrates verifiable old cache rows without an LLM call; an unverifiable row is
 regenerated safely. Only genuine misses enter a bounded worker pool, and worker
 threads call the LLM only. SQLite preparation, migration, and persistence remain
 serial on the main thread. `TEAMMEM_LLM_CONCURRENCY` defaults to `2` and accepts
 `1..8`. This changes execution and cache isolation only: it adds no ranking,
 caps, truncation, cross-person batching, retries, compaction, or model change.
+
+Provider resolution is centralized behind the injected `(system, user) -> text`
+callable. The Claude provider retains the Anthropic API / Claude CLI behavior.
+The Codex provider pins `gpt-5.6-sol`; its trusted synthesis contract is passed
+as developer instructions while the evidence slice remains the untrusted stdin
+payload. Codex receives no model-driven shell, web, image, or multi-agent tools,
+and its subprocess environment excludes TeamMem and secret-shaped variables.
+Provider changes affect only synthesis misses; capture, SQL flags, rendering,
+publishing, scheduling, and MemberKit remain provider-independent.
 
 Each successful full synthesis run reconciles the previous and current report
 weeks. Monday through Thursday current-week reports are provisional; Friday is

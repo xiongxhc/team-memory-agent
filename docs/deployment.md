@@ -124,12 +124,22 @@ Process environment values override file values for one run.
 | `TEAMMEM_SNAPSHOTS` | Optional | Daily SQLite backup directory; newest 14 are retained |
 | `TEAMMEM_OBSIDIAN_PROJECTS` | Optional | Source directory for project-document synchronization |
 | `TEAMMEM_PUSH` | Optional | Best-effort Git push of the rendered vault when true |
-| `ANTHROPIC_API_KEY` | Optional | Enables journal and weekly-report synthesis |
-| `TEAMMEM_LLM_DAILY_MODEL`, `TEAMMEM_LLM_REPORT_MODEL` | Optional | Override synthesis model names |
+| `TEAMMEM_LLM_PROVIDER` | Optional | Synthesis backend: `claude` (default) or `codex` |
+| `ANTHROPIC_API_KEY` | Optional | With the Claude provider, use the Anthropic API instead of the Claude CLI fallback |
+| `TEAMMEM_LLM_DAILY_MODEL`, `TEAMMEM_LLM_REPORT_MODEL` | Optional | Claude synthesis model names; ignored by the Codex provider |
+| `TEAMMEM_CODEX_BIN` | Optional | Codex executable; default `codex` |
 | `TEAMMEM_LLM_CONCURRENCY` | Optional | Concurrent journal LLM calls; default `2`, valid integers `1..8` |
 
 Without an LLM backend, synthesis stages are skipped and deterministic rendering
 still succeeds.
+
+The Codex provider requires a prior interactive `codex login` for the same OS
+account that owns the schedule. It pins `gpt-5.6-sol`, uses medium reasoning for
+daily journals and high reasoning for weekly reports, and runs each call
+ephemerally with tools disabled, a read-only sandbox, a credential-scrubbed
+environment, and structured text output. Begin with
+`TEAMMEM_LLM_CONCURRENCY=1`; concurrent processes use isolated temporary output
+paths but still share one account's authentication and limits.
 
 ## Provider setup and visibility
 

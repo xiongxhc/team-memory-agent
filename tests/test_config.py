@@ -15,6 +15,8 @@ def test_defaults(empty_env_file):
     assert cfg.db_path == Path("ledger.db")
     assert cfg.since_days == 7
     assert cfg.gitlab_url == ""
+    assert cfg.llm_provider == "claude"
+    assert cfg.codex_bin == "codex"
     assert cfg.llm_concurrency == 2
 
 
@@ -164,4 +166,73 @@ def test_llm_concurrency_rejects_out_of_range_or_non_integer_values(
     ):
         Config.load(
             env={"TEAMMEM_LLM_CONCURRENCY": value}, env_file=empty_env_file
+        )
+
+
+def test_llm_provider_and_codex_binary_load_from_environment(empty_env_file):
+    cfg = Config.load(
+        env={
+            "TEAMMEM_LLM_PROVIDER": "codex",
+            "TEAMMEM_CODEX_BIN": "/opt/codex/bin/codex",
+        },
+        env_file=empty_env_file,
+    )
+
+    assert cfg.llm_provider == "codex"
+    assert cfg.codex_bin == "/opt/codex/bin/codex"
+
+
+def test_codex_provider_pins_gpt_model_and_ignores_claude_model_values(
+    empty_env_file,
+):
+    cfg = Config.load(
+        env={
+            "TEAMMEM_LLM_PROVIDER": "codex",
+            "TEAMMEM_LLM_DAILY_MODEL": "claude-haiku-4-5",
+            "TEAMMEM_LLM_REPORT_MODEL": "claude-sonnet-5",
+        },
+        env_file=empty_env_file,
+    )
+
+    assert cfg.llm_daily_model == "gpt-5.6-sol"
+    assert cfg.llm_report_model == "gpt-5.6-sol"
+
+
+def test_direct_codex_config_also_pins_gpt_model():
+    cfg = Config(
+        llm_provider="codex",
+        llm_daily_model="caller-daily",
+        llm_report_model="caller-report",
+    )
+
+    assert (cfg.llm_daily_model, cfg.llm_report_model) == (
+        "gpt-5.6-sol",
+        "gpt-5.6-sol",
+    )
+
+
+def test_claude_provider_keeps_configured_claude_models(empty_env_file):
+    cfg = Config.load(
+        env={
+            "TEAMMEM_LLM_PROVIDER": "claude",
+            "TEAMMEM_LLM_DAILY_MODEL": "claude-haiku-4-5",
+            "TEAMMEM_LLM_REPORT_MODEL": "claude-sonnet-5",
+        },
+        env_file=empty_env_file,
+    )
+
+    assert cfg.llm_daily_model == "claude-haiku-4-5"
+    assert cfg.llm_report_model == "claude-sonnet-5"
+
+
+@pytest.mark.parametrize("value", ["", "Claude", "openai"])
+def test_llm_provider_rejects_values_other_than_claude_or_codex(
+    empty_env_file, value
+):
+    with pytest.raises(
+        ValueError,
+        match="^TEAMMEM_LLM_PROVIDER must be one of: claude, codex$",
+    ):
+        Config.load(
+            env={"TEAMMEM_LLM_PROVIDER": value}, env_file=empty_env_file
         )
