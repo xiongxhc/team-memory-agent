@@ -739,11 +739,27 @@ from teammem.vaultgit import commit_all
 from tests.test_meeting_bundles import write_meeting_bundle
 from tests.test_meeting_publish import _git, _remote_ref, _vault
 from tests.test_meeting_render import CONFIG_DIR as MEETING_CONFIG_DIR
-from tests.test_meeting_render import _payload
+from tests.test_meeting_render import NOTE, WEEK, _payload
 
 MEETING_NOW = "2026-09-02T16:00:00Z"
 MEETING_WEB_BASE = "https://git.example.com/team/team-vault"
 OTHER_DAY = "2026-09-01"
+# Ordinary activity, most of it older than the four-week Work Journal window.
+# A hub that has been running for a while is the only realistic vault to publish
+# a meeting into: its person pages link weeks the journal no longer renders, and
+# a publish path tested only against a meetings-only vault never meets one.
+ORDINARY = [
+    Event(person="alex", ts="2026-07-14T09:00:00+04:00", source="gitlab",
+          kind="commit", summary="fix: JWT refresh race", hash="o1",
+          project="project-alpha"),
+    Event(person="sam", ts="2026-07-01T09:00:00+04:00", source="gitlab",
+          kind="commit", summary="feat: portal nav", hash="o2",
+          project="project-beta"),
+    Event(person="alex", ts="2026-09-01T09:00:00+04:00", source="gitlab",
+          kind="mr", summary="[merged] Auth middleware fix", hash="o3",
+          project="project-alpha"),
+]
+STALE_WEEK_LINK = "../../Work%20Journal/Week%202026-07-13-17.md"
 
 
 class _Bench:
@@ -802,6 +818,7 @@ def bench(tmp_path):
         "TEAMMEM_VAULT_WEB_BASE": MEETING_WEB_BASE,
         "TEAMMEM_VAULT_REF": f"refs/heads/{branch}",
     })
+    insert_events(open_db(cfg.db_path), ORDINARY)
     return _Bench(tmp_path, branch, vault, bare, cfg)
 
 
@@ -824,6 +841,13 @@ def test_process_meetings_imports_renders_and_publishes_without_approval(bench):
     # and the ledger and the audio store hold the imported revision
     assert list_meetings(open_db(bench.cfg.db_path))[0]["occurrence_id"] == (
         payload["occurrence_id"])
+    # the vault it published into is a working hub, not a meetings-only tree:
+    # ordinary pages are there, and they link weeks the journal has aged out
+    person = (bench.vault / "Person" / "Alex Rivera" / "README.md").read_text()
+    assert "[merged] Auth middleware fix" in person
+    aged = (bench.vault / "Person" / "Alex Rivera" / "Week 2026-07-13-17.md").read_text()
+    assert "fix: JWT refresh race" in aged and STALE_WEEK_LINK in aged
+    assert not (bench.vault / "Work Journal" / "Week 2026-07-13-17.md").exists()
     assert list(bench.cfg.meeting_audio_store.rglob("audio.enc"))
     assert not list(bench.cfg.meeting_inbox.rglob("meeting.json"))   # consumed
 
@@ -1131,4 +1155,95 @@ def test_an_unattributable_finding_blocks_every_occurrence(bench):
     assert bench.run() == 1
 
     assert not any(bench.cfg.meeting_receipts.iterdir())
+    assert _remote_ref(bench.bare, bench.branch) == before
+
+
+# --- the render path is gated too --------------------------------------------
+# `MANAGED` carries `Meetings`, so `teammem render` and the daily pipeline render
+# meeting notes, commit them and push them. The publish gate sits on
+# `process-meetings` alone, so without a gate here the remote can carry meeting
+# content no check has ever read.
+
+MEETING_TODAY = date(2026, 9, 2)
+
+
+def _render(bench, capsys, **kw):
+    code = run_render(bench.cfg, bench.ids, today=MEETING_TODAY,
+                      push_requested=True, **kw)
+    return code, capsys.readouterr()
+
+
+def _remote_holds(bench, path: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(bench.bare), "cat-file", "-e",
+         f"{_remote_ref(bench.bare, bench.branch)}:{path}"],
+    ).returncode == 0
+
+
+def _leaking(text: str) -> dict:
+    """A bundle whose summary quotes a transcript line: legitimate free text in
+    the one note field that must carry it, holding what must never be published."""
+    payload = _payload()
+    payload["summary"] = f"{payload['summary']}\n\n{text}"
+    return payload
+
+
+def test_the_daily_render_withholds_meeting_content_that_fails_the_checks(
+    bench, capsys
+):
+    leak = _payload()["transcript"][0]["text"]
+    payload = _leaking(leak)
+    bench.drop(payload)
+    assert bench.run() == 1                     # publication refuses, as it did
+
+    code, captured = _render(bench, capsys)
+
+    assert code == 0                            # the daily run is not stopped
+    assert payload["occurrence_id"] in captured.err
+    assert "meeting.leakage.forbidden-content" in captured.err
+    assert leak not in captured.err             # never quote what leaked
+    assert not list((bench.vault / "Meetings").rglob("*.md"))[1:]
+    assert leak not in "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for path in sorted(bench.vault.rglob("*"))
+        if path.is_file() and ".git" not in path.relative_to(bench.vault).parts)
+    assert not _remote_holds(bench, f"Meetings/{WEEK}/{NOTE}")
+    # and everything the vault always published still went out
+    assert _remote_holds(bench, "Person/Alex Rivera/README.md")
+    assert _remote_holds(bench, "Work Journal/Week 2026-08-31-04.md")
+
+
+def test_a_withheld_meeting_publishes_once_its_next_revision_is_clean(bench, capsys):
+    leak = _payload()["transcript"][0]["text"]
+    bench.drop(_leaking(leak))
+    assert bench.run() == 1
+    assert _render(bench, capsys)[0] == 0
+    assert not _remote_holds(bench, f"Meetings/{WEEK}/{NOTE}")
+
+    corrected = _payload()
+    corrected["revision"] = corrected["revision"] + 1
+    bench.drop(corrected)
+    assert bench.run() == 0
+
+    code, captured = _render(bench, capsys)
+    assert code == 0
+    assert corrected["occurrence_id"] not in captured.err
+    assert (bench.vault / "Meetings" / WEEK / NOTE).is_file()
+    assert _remote_holds(bench, f"Meetings/{WEEK}/{NOTE}")
+
+
+def test_a_finding_no_meeting_owns_stops_the_commit_and_the_push(bench, capsys):
+    """A transcript line in an unmanaged file is a leak no render can withdraw,
+    so the vault does not publish at all until an operator clears it."""
+    bench.drop(_payload())
+    assert bench.run() == 0
+    before = _remote_ref(bench.bare, bench.branch)
+    (bench.vault / "Docs").mkdir(exist_ok=True)
+    (bench.vault / "Docs" / "jottings.md").write_text(
+        _payload()["transcript"][0]["text"] + "\n", encoding="utf-8")
+
+    code, captured = _render(bench, capsys)
+
+    assert code == 1
+    assert "nothing committed or pushed" in captured.err
     assert _remote_ref(bench.bare, bench.branch) == before

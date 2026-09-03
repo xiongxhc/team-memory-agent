@@ -58,7 +58,7 @@ def test_a_meeting_goes_from_bundle_to_receipt_to_destroyed_audio(bench):  # noq
     # ---- stage 1: a ready bundle, and a hub that has never seen this meeting
     bundle = bench.drop(payload)
     assert (bundle / "meeting.json").is_file()
-    assert not bench.cfg.db_path.exists()
+    assert list_meetings(open_db(bench.cfg.db_path)) == []   # ordinary events only
     assert not (bench.vault / RELATIVE_NOTE).exists()
     assert not meeting_receipt_path(bench.cfg, occurrence_id).exists()
     seed_commit = _remote_ref(bench.bare, bench.branch)
