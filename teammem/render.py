@@ -792,28 +792,51 @@ def _meeting_facts(meeting: dict, ids: IdentityMaps) -> dict:
     }
 
 
-def _forbidden_values(conn: sqlite3.Connection, occurrence_ids) -> list[tuple[str, str]]:
-    """(kind, value) for everything that must never reach the vault.
+def _forbidden_values(conn: sqlite3.Connection, occurrence_ids
+                      ) -> tuple[int, dict[str, list[tuple[str, str]]],
+                                 list[tuple[str, str]]]:
+    """A probe index of (kind, value) for everything that must never reach the vault.
 
     Every stored revision, not only the current one: a superseded revision's
     transcript is exactly as confidential as the one being rendered.
+
+    Returns `(probe_len, indexed, unindexed)`. A file can hold a value only if
+    it holds that value's first `probe_len` characters, so reading a file's
+    distinct windows of that length once names every value worth a full
+    substring test, and the sweep costs files plus values rather than files
+    times values. `unindexed` carries the few values too short to have a probe;
+    those are tested directly. Nothing rests on `probe_len` but speed: every
+    candidate is still confirmed with the same substring test as before.
     """
-    values: list[tuple[str, str]] = []
+    # ~4 words of prose: long enough that vault text does not collide with the
+    # start of a transcript line, short enough to index all but a stray value.
+    probe_len = 32
+    values: dict[tuple[str, str], None] = {}      # deduplicated, insertion order
     for occurrence_id in occurrence_ids:
         for entry in list_meeting_revisions(conn, occurrence_id):
             meeting = get_meeting(conn, occurrence_id, revision=entry["revision"])
             if meeting is None:
                 continue
-            values += [("transcript text", segment["text"])
-                       for segment in meeting["transcript"]
-                       if len(segment["text"]) >= _MIN_LEAKED_TEXT]
+            for segment in meeting["transcript"]:
+                if len(segment["text"]) >= _MIN_LEAKED_TEXT:
+                    values[("transcript text", segment["text"])] = None
             audio = meeting["audio"]
             if audio:
-                values.append(("audio store path", audio["stored_path"]))
-                values.append(("audio digest", audio["sha256"]))
+                values[("audio store path", audio["stored_path"])] = None
+                values[("audio digest", audio["sha256"])] = None
                 if len(audio["filename"]) >= 5:
-                    values.append(("audio file name", audio["filename"]))
-    return values
+                    values[("audio file name", audio["filename"])] = None
+    indexed: dict[str, list[tuple[str, str]]] = {}
+    unindexed: list[tuple[str, str]] = []
+    for pair in values:
+        value = pair[1]
+        if not value:                             # would match every file
+            continue
+        if len(value) >= probe_len:
+            indexed.setdefault(value[:probe_len], []).append(pair)
+        else:
+            unindexed.append(pair)
+    return probe_len, indexed, unindexed
 
 
 def _vault_pages(vault_dir: Path, top: str) -> list[tuple[str, str, str]]:
@@ -1012,14 +1035,24 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
                        owner.get(name))
 
     # ---- nothing forbidden anywhere under the vault -------------------------
-    forbidden = _forbidden_values(conn, sorted(expected))
-    if forbidden:
+    probe_len, indexed, unindexed = _forbidden_values(conn, sorted(expected))
+    if indexed or unindexed:
         for path in sorted(vault_dir.rglob("*")):
             rel_parts = path.relative_to(vault_dir).parts
             if not path.is_file() or ".git" in rel_parts:
                 continue
             text = path.read_text(encoding="utf-8", errors="ignore")
-            for kind in sorted({k for k, value in forbidden if value and value in text}):
+            candidates = set(unindexed)
+            # In chunks, so a large file in the vault costs bounded memory
+            # instead of one window per character all at once. Each chunk keeps
+            # the tail a probe needs to be found across the seam.
+            for start in range(0, max(len(text) - probe_len + 1, 1), 1 << 16):
+                chunk = text[start:start + (1 << 16) + probe_len - 1]
+                windows = {chunk[i:i + probe_len]
+                           for i in range(len(chunk) - probe_len + 1)}
+                for probe in windows & indexed.keys():
+                    candidates.update(indexed[probe])
+            for kind in sorted({k for k, value in candidates if value in text}):
                 report("meeting.leakage.forbidden-content", "/".join(rel_parts),
                        f"{kind} from the ledger appears in this file")
 
