@@ -257,6 +257,87 @@ def test_two_meeting_settings_naming_one_directory_are_refused(
     assert "TEAMMEM_MEETING_INBOX" in message and "TEAMMEM_MEETING_ARCHIVE" in message
 
 
+def test_symlinked_parents_cannot_alias_two_configured_meeting_directories(
+    tmp_path, empty_env_file
+):
+    physical = tmp_path / "physical"
+    shared = physical / "shared"
+    shared.mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    cfg = Config.load(env=_meeting_env(
+        tmp_path,
+        TEAMMEM_MEETING_INBOX=str(shared),
+        TEAMMEM_MEETING_ARCHIVE=str(alias / "shared"),
+    ), env_file=empty_env_file)
+
+    with pytest.raises(ValueError) as failure:
+        validate_meeting_settings(cfg)
+
+    message = str(failure.value)
+    assert "TEAMMEM_MEETING_INBOX" in message
+    assert "TEAMMEM_MEETING_ARCHIVE" in message
+
+
+def test_a_path_that_resolves_into_the_vault_is_refused_before_it_is_created(
+    tmp_path, empty_env_file
+):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    alias = tmp_path / "outside-looking-alias"
+    alias.symlink_to(vault, target_is_directory=True)
+    receipts = alias / "receipts"
+    cfg = Config.load(env=_meeting_env(
+        tmp_path, TEAMMEM_MEETING_RECEIPTS=str(receipts)),
+        env_file=empty_env_file)
+
+    with pytest.raises(ValueError) as failure:
+        validate_meeting_settings(cfg)
+
+    message = str(failure.value)
+    assert "TEAMMEM_MEETING_RECEIPTS" in message
+    assert "TEAMMEM_VAULT" in message
+    assert not (vault / "receipts").exists()
+
+
+def test_a_missing_child_beneath_a_symlinked_ancestor_is_resolved_before_comparison(
+    tmp_path, empty_env_file
+):
+    physical = tmp_path / "physical"
+    physical.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    future = physical / "future"
+    cfg = Config.load(env=_meeting_env(
+        tmp_path,
+        TEAMMEM_MEETING_INBOX=str(future),
+        TEAMMEM_MEETING_ARCHIVE=str(alias / "future" / "done"),
+    ), env_file=empty_env_file)
+
+    with pytest.raises(ValueError) as failure:
+        validate_meeting_settings(cfg)
+
+    message = str(failure.value)
+    assert "TEAMMEM_MEETING_INBOX" in message
+    assert "TEAMMEM_MEETING_ARCHIVE" in message
+    assert not future.exists()
+
+
+def test_configured_paths_are_compared_case_normalized(tmp_path, empty_env_file):
+    cfg = Config.load(env=_meeting_env(
+        tmp_path,
+        TEAMMEM_MEETING_INBOX=str(tmp_path / "Meeting-Inbox"),
+        TEAMMEM_MEETING_ARCHIVE=str(tmp_path / "meeting-inbox"),
+    ), env_file=empty_env_file)
+
+    with pytest.raises(ValueError) as failure:
+        validate_meeting_settings(cfg)
+
+    message = str(failure.value)
+    assert "TEAMMEM_MEETING_INBOX" in message
+    assert "TEAMMEM_MEETING_ARCHIVE" in message
+
+
 def test_a_meeting_directory_nested_in_another_is_refused(tmp_path, empty_env_file):
     # the archive under the inbox is the concrete hazard: the importer walks the
     # inbox, so it would re-read everything it just archived

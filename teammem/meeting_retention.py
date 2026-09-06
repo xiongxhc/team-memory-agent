@@ -250,6 +250,18 @@ def _sweep_revived(
         for meeting in list_meetings(conn)
     }
     swept: list[tuple[str, int]] = []
+
+    def symlink_failure(occurrence_id: str, revision: int, detail: str) -> None:
+        if any(
+            failure.occurrence_id == occurrence_id
+            and failure.stage == "symlink"
+            and (revision == 0 or failure.revision == revision)
+            for failure in failed
+        ):
+            return
+        failed.append(RetentionFailure(
+            occurrence_id, revision, "symlink", detail))
+
     for segment in sorted(store.iterdir()):
         occurrence_id = known.get(segment.name)
         if occurrence_id is None:
@@ -258,13 +270,25 @@ def _sweep_revived(
         # must never abort the run: one unreachable directory costs that
         # directory. Revision 0 says the fault was above any single revision.
         try:
-            entries = ([] if segment.is_symlink() or not segment.is_dir()
-                       else sorted(segment.iterdir()))
+            if segment.is_symlink():
+                symlink_failure(
+                    occurrence_id, 0,
+                    "the audio occurrence entry is a symlink")
+                continue
+            entries = [] if not segment.is_dir() else sorted(segment.iterdir())
         except OSError as error:
             failed.append(RetentionFailure(occurrence_id, 0, "sweep", str(error)))
             continue
         for revision_dir in entries:
             try:
+                if revision_dir.is_symlink():
+                    revision = (
+                        int(revision_dir.name)
+                        if revision_dir.name.isdigit() else 0)
+                    symlink_failure(
+                        occurrence_id, revision,
+                        "the audio revision entry is a symlink")
+                    continue
                 found = _sweep_revision(
                     conn, store, occurrence_id, revision_dir, dry_run=dry_run)
             except OSError as error:
@@ -287,12 +311,12 @@ def _sweep_revision(
     dry_run: bool,
 ) -> tuple[str, int] | None:
     """Remove one revision's ciphertext when its row already says it is gone."""
-    if revision_dir.is_symlink() or not revision_dir.name.isdigit():
+    if not revision_dir.name.isdigit():
         return None
     path = revision_dir / AUDIO_FILENAME
+    revision = int(revision_dir.name)
     if path.is_symlink() or not path.is_file():
         return None
-    revision = int(revision_dir.name)
     meeting = get_meeting(conn, occurrence_id, revision=revision)
     audio = meeting["audio"] if meeting else None
     if audio is None or audio["deleted_at"] is None:

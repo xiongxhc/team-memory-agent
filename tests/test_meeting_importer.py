@@ -66,6 +66,7 @@ class _Tree:
         self.archive = tmp_path / "meeting-archive"
         self.quarantine = tmp_path / "meeting-quarantine"
         self.audio = tmp_path / "audio-store"
+        self.vault = tmp_path / "vault"
         self.inbox.mkdir()
 
     def paths(self) -> tuple[Path, Path, Path, Path]:
@@ -73,7 +74,8 @@ class _Tree:
 
 
 def _run(conn, tree: _Tree, *, dry_run: bool = False, now: str = NOW) -> MeetingImportResult:
-    return import_meeting_inbox(conn, *tree.paths(), now=now, dry_run=dry_run)
+    return import_meeting_inbox(
+        conn, *tree.paths(), vault_dir=tree.vault, now=now, dry_run=dry_run)
 
 
 def _db(tmp_path: Path):
@@ -496,6 +498,82 @@ def test_symlinked_audio_pointing_outside_the_inbox_is_quarantined(tmp_path):
     assert list_meetings(conn) == []
     assert elsewhere.is_file()                                      # never followed, never moved
     assert not tree.audio.exists()
+
+
+def test_a_symlinked_audio_occurrence_directory_is_not_followed(tmp_path):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    write_meeting_bundle(tree.inbox, payload)
+    outside = tmp_path / "outside-occurrence"
+    outside.mkdir()
+    tree.audio.mkdir()
+    occurrence = tree.audio / occurrence_path_segment(payload["occurrence_id"])
+    occurrence.symlink_to(outside, target_is_directory=True)
+
+    result = _run(conn, tree)
+
+    assert _outcomes(result) == [("quarantined", "path_escape")]
+    assert list_meetings(conn) == []
+    assert list(outside.iterdir()) == []
+    assert occurrence.is_symlink()
+
+
+def test_a_symlinked_audio_revision_directory_is_not_followed(tmp_path):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    write_meeting_bundle(tree.inbox, payload)
+    outside = tmp_path / "outside-revision"
+    outside.mkdir()
+    occurrence = tree.audio / occurrence_path_segment(payload["occurrence_id"])
+    occurrence.mkdir(parents=True)
+    revision = occurrence / str(payload["revision"])
+    revision.symlink_to(outside, target_is_directory=True)
+
+    result = _run(conn, tree)
+
+    assert _outcomes(result) == [("quarantined", "path_escape")]
+    assert list_meetings(conn) == []
+    assert list(outside.iterdir()) == []
+    assert revision.is_symlink()
+
+
+def test_audio_moved_into_the_vault_before_commit_is_removed_and_not_recorded(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    write_meeting_bundle(tree.inbox, payload)
+    tree.vault.mkdir()
+    revision = audio_revision_dir(
+        tree.audio, payload["occurrence_id"], payload["revision"])
+    captured = tree.vault / "captured-revision"
+
+    from teammem import meeting_importer
+
+    real_replace = os.replace
+    moved = False
+
+    def move_revision_after_adoption(source, destination, *args, **kwargs):
+        nonlocal moved
+        result = real_replace(source, destination, *args, **kwargs)
+        if Path(destination).name == "audio.enc" and not moved:
+            moved = True
+            revision.rename(captured)
+            revision.symlink_to(captured, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(meeting_importer.os, "replace", move_revision_after_adoption)
+
+    result = _run(conn, tree)
+
+    assert moved is True
+    assert _outcomes(result) == [("quarantined", "path_escape")]
+    assert list_meetings(conn) == []
+    assert not (captured / "audio.enc").exists()
+    assert not list(tree.vault.rglob("audio.enc"))
 
 
 def test_no_raw_colon_or_slash_from_a_meeting_id_appears_in_any_created_path(tmp_path):

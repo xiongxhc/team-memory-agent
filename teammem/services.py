@@ -921,7 +921,8 @@ def execute_process_meetings(
     today = _utc_day(now)
     imported = import_meeting_inbox(
         conn, cfg.meeting_inbox, cfg.meeting_archive, cfg.meeting_quarantine,
-        cfg.meeting_audio_store, now=now, dry_run=dry_run,
+        cfg.meeting_audio_store, vault_dir=cfg.vault_dir, now=now,
+        dry_run=dry_run,
     )
     unpublished = [
         meeting["occurrence_id"] for meeting in list_meetings(conn)

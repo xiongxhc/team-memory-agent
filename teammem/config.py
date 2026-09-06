@@ -169,8 +169,48 @@ _GIT_REF = re.compile(r"refs/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+")
 _GIT_REMOTE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
+def _path_key(path: Path) -> tuple[str, ...]:
+    """A filesystem-comparison key, independent of spelling and case."""
+    return tuple(os.path.normcase(part).casefold() for part in Path(path).parts)
+
+
 def _nested(inner: Path, outer: Path) -> bool:
-    return inner != outer and outer in inner.parents
+    inner_key = _path_key(inner)
+    outer_key = _path_key(outer)
+    return (
+        len(inner_key) > len(outer_key)
+        and inner_key[:len(outer_key)] == outer_key
+    )
+
+
+def _physical_path(path: Path) -> Path:
+    """Resolve the existing prefix of `path`, preserving a missing suffix.
+
+    `Path.resolve(strict=False)` can change meaning when a missing component is
+    created later. Resolve only the nearest existing ancestor instead, then
+    append the components that do not exist yet without following a future
+    link at those names.
+    """
+    absolute = Path(os.path.abspath(Path(path).expanduser()))
+    missing: list[str] = []
+    current = absolute
+    while not os.path.lexists(current):
+        parent = current.parent
+        if parent == current:
+            break
+        missing.append(current.name)
+        current = parent
+    resolved = current.resolve(strict=True)
+    for component in reversed(missing):
+        resolved /= component
+    return resolved
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    """Whether `path` is equal to or below `root` after caller resolution."""
+    path_key = _path_key(path)
+    root_key = _path_key(root)
+    return len(path_key) >= len(root_key) and path_key[:len(root_key)] == root_key
 
 
 def validate_meeting_settings(cfg: "Config") -> None:
@@ -183,9 +223,9 @@ def validate_meeting_settings(cfg: "Config") -> None:
     re-read on the next scan, and a receipt or a bundle inside the vault would be
     published. Distinctness therefore means neither equal nor nested.
 
-    Shape only — no filesystem is touched here, so a `Config.load` on a machine
-    that has not created the directories yet still succeeds, and the daily
-    pipeline never fails on a meeting directory's permissions.
+    Filesystem metadata is read but never mutated here. A `Config.load` on a
+    machine that has not created the directories yet still succeeds, and the
+    daily pipeline never fails on a meeting directory's permissions.
     """
     from .meeting_publish import validate_web_base
 
@@ -217,9 +257,15 @@ def validate_meeting_settings(cfg: "Config") -> None:
     # exempt it.
     named.append(("TEAMMEM_VAULT", cfg.vault_dir if cfg.vault_dir.is_absolute()
                   else Path.cwd() / cfg.vault_dir))
-    for position, (key, path) in enumerate(named):
-        for other_key, other in named[position + 1:]:
-            if path == other:
+    physical = []
+    for key, path in named:
+        try:
+            physical.append((key, _physical_path(path)))
+        except (OSError, RuntimeError) as failure:
+            raise ValueError(f"{key} cannot be resolved safely: {path}") from failure
+    for position, (key, path) in enumerate(physical):
+        for other_key, other in physical[position + 1:]:
+            if _path_key(path) == _path_key(other):
                 raise ValueError(
                     f"{key} and {other_key} name the same directory"
                 )

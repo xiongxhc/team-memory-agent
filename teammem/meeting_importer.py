@@ -34,6 +34,7 @@ TeamMem never holds the recording key and never decrypts audio; it only ever
 copies and hashes opaque bytes.
 """
 
+import errno
 import hashlib
 import json
 import logging
@@ -41,9 +42,11 @@ import os
 import secrets
 import shutil
 import sqlite3
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from .config import _path_within, _physical_path
 from .meeting_bundles import (
     AUDIO_FILENAME,
     MANIFEST_FILENAME,
@@ -71,6 +74,13 @@ _COPY_CHUNK = 1024 * 1024
 # Windows defines no O_NOFOLLOW; 0 there leaves the copy exactly as it was
 # rather than dropping the protection everywhere else.
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | _NOFOLLOW
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_FILE_FLAGS = _NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 OUTCOMES = ("accepted", "unchanged", "activated", "quarantined")
 
@@ -179,6 +189,56 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _open_audio_directory(
+    store: Path, occurrence_id: str, revision: int
+) -> tuple[Path, int | None]:
+    """Create/open the two managed descendants without following either one."""
+    directory = audio_revision_dir(store, occurrence_id, revision)
+    if os.name == "nt":
+        # Python exposes no descriptor-relative mkdir on Windows. Check every
+        # managed component, including junction/reparse metadata, before use;
+        # `_verified_audio_path` still proves the final physical destination.
+        for path in (store, directory.parent, directory):
+            try:
+                path.mkdir(parents=path == store)
+            except FileExistsError:
+                pass
+            metadata = os.lstat(path)
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or getattr(metadata, "st_reparse_tag", 0)
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
+                raise _Rejected("path_escape")
+        return directory, None
+
+    try:
+        store.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(store, _DIRECTORY_FLAGS)
+    except OSError as error:
+        if error.errno in {errno.EEXIST, errno.ELOOP, errno.ENOTDIR}:
+            raise _Rejected("path_escape") from error
+        raise
+    try:
+        for name in (directory.parent.name, directory.name):
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            try:
+                child = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise _Rejected("path_escape") from error
+                raise
+            os.close(descriptor)
+            descriptor = child
+        return directory, descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _write_atomic(path: Path, data: bytes) -> None:
     temporary = path.parent / f".{path.name}.{secrets.token_hex(8)}"
     try:
@@ -201,7 +261,7 @@ def _write_all(fd: int, data: bytes) -> None:
         offset += os.write(fd, data[offset:])
 
 
-def _copy_file(source: Path, destination: Path) -> None:
+def _copy_file(source: Path, destination: Path, *, directory_fd: int | None = None) -> None:
     """Copy opaque bytes into a new file and fsync it.
 
     The source is opened `O_NOFOLLOW`. `load_meeting_bundle` already refused a
@@ -213,7 +273,13 @@ def _copy_file(source: Path, destination: Path) -> None:
     """
     source_fd = os.open(source, os.O_RDONLY | _NOFOLLOW)
     try:
-        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        target = destination.name if directory_fd is not None else destination
+        fd = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_FLAGS,
+            0o600,
+            dir_fd=directory_fd,
+        )
         try:
             with os.fdopen(source_fd, "rb", closefd=False) as handle:
                 while chunk := handle.read(_COPY_CHUNK):
@@ -225,15 +291,23 @@ def _copy_file(source: Path, destination: Path) -> None:
         os.close(source_fd)
 
 
-def _digest_file(path: Path) -> tuple[str, int]:
-    """`(sha256:<hex>, size)` read back from disk, not from what was written."""
+def _digest_descriptor(descriptor: int) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
-    with open(path, "rb") as handle:
-        while chunk := handle.read(_COPY_CHUNK):
-            digest.update(chunk)
-            size += len(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, _COPY_CHUNK):
+        digest.update(chunk)
+        size += len(chunk)
     return "sha256:" + digest.hexdigest(), size
+
+
+def _digest_file(path: Path) -> tuple[str, int]:
+    """`(sha256:<hex>, size)` read back from disk, not from what was written."""
+    descriptor = os.open(path, os.O_RDONLY | _FILE_FLAGS)
+    try:
+        return _digest_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _unlink(path: Path) -> None:
@@ -257,45 +331,135 @@ def _prune_empty(path: Path, stop: Path) -> None:
 # --- audio adoption ---------------------------------------------------------
 
 
-def _stage_audio(bundle: MeetingBundle, audio_store: Path) -> tuple[StagedAudio, Path | None]:
+def _verified_audio_path(
+    descriptor: int,
+    final: Path,
+    store: Path,
+    vault: Path,
+) -> Path:
+    """Prove the opened ciphertext is the safe physical path being recorded."""
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise _Rejected("audio_conflict")
+    try:
+        physical = _physical_path(final)
+        path_metadata = os.stat(physical, follow_symlinks=False)
+    except (OSError, RuntimeError) as error:
+        raise _Rejected("path_escape") from error
+    if (
+        not _path_within(physical, store)
+        or _path_within(physical, vault)
+        or (metadata.st_dev, metadata.st_ino)
+        != (path_metadata.st_dev, path_metadata.st_ino)
+    ):
+        raise _Rejected("path_escape")
+    return physical
+
+
+def _stage_audio(
+    bundle: MeetingBundle,
+    audio_store: Path,
+    vault_dir: Path,
+) -> tuple[StagedAudio, Path | None]:
     """Publish the encrypted audio and describe it.
 
     Returns the `StagedAudio` to hand to the store plus the final path *if this
     call created it*. That second value is the only thing the failure path is
     ever allowed to delete: audio already present belongs to a stored revision.
     """
-    directory = audio_revision_dir(audio_store, bundle.occurrence_id, bundle.revision)
+    try:
+        store = _physical_path(audio_store)
+        vault = _physical_path(vault_dir)
+    except (OSError, RuntimeError) as error:
+        raise _Rejected("path_escape") from error
+    if _path_within(store, vault) or _path_within(vault, store):
+        raise _Rejected("path_escape")
+
+    directory, directory_fd = _open_audio_directory(
+        store, bundle.occurrence_id, bundle.revision)
     final = directory / AUDIO_FILENAME
     declared_sha = bundle.payload["audio"]["sha256"]
     declared_bytes = bundle.payload["audio"]["bytes"]
-
-    if final.is_symlink():
-        raise _Rejected("audio_conflict")
-    if final.exists():
-        digest, size = _digest_file(final)
-        if digest == declared_sha and size == declared_bytes:
-            return StagedAudio(stored_path=str(final), sha256=digest, bytes=size), None
-        raise _Rejected("audio_conflict")
-
-    directory.mkdir(parents=True, exist_ok=True)
     staging = directory / f".{AUDIO_FILENAME}.{secrets.token_hex(8)}"
+    final_name = final.name if directory_fd is not None else final
+    staging_name = staging.name if directory_fd is not None else staging
+    created = False
     try:
-        _copy_file(bundle.audio_path, staging)
-        _fsync_dir(directory)
-        digest, size = _digest_file(staging)
+        if final.is_symlink():
+            raise _Rejected("audio_conflict")
+        try:
+            final_fd = os.open(
+                final_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=directory_fd)
+        except FileNotFoundError:
+            final_fd = None
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise _Rejected("audio_conflict") from error
+            raise
+        if final_fd is not None:
+            try:
+                digest, size = _digest_descriptor(final_fd)
+                physical = _verified_audio_path(final_fd, final, store, vault)
+            finally:
+                os.close(final_fd)
+            if digest == declared_sha and size == declared_bytes:
+                return StagedAudio(
+                    stored_path=str(physical), sha256=digest, bytes=size), None
+            raise _Rejected("audio_conflict")
+
+        _copy_file(bundle.audio_path, staging, directory_fd=directory_fd)
+        if directory_fd is None:
+            _fsync_dir(directory)
+        else:
+            os.fsync(directory_fd)
+        staging_fd = os.open(
+            staging_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=directory_fd)
+        try:
+            digest, size = _digest_descriptor(staging_fd)
+        finally:
+            os.close(staging_fd)
         if digest != declared_sha or size != declared_bytes:
             raise _Rejected("audio_hash_mismatch")
-        os.replace(staging, final)
-        _fsync_dir(directory)
+        if directory_fd is None:
+            os.replace(staging, final)
+        else:
+            os.replace(
+                staging.name,
+                final.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        created = True
+        if directory_fd is None:
+            _fsync_dir(directory)
+        else:
+            os.fsync(directory_fd)
+        final_fd = os.open(
+            final_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=directory_fd)
+        try:
+            physical = _verified_audio_path(final_fd, final, store, vault)
+        finally:
+            os.close(final_fd)
     except BaseException:
-        _unlink(staging)
-        _prune_empty(directory, Path(audio_store))
+        for path in (staging, final) if created else (staging,):
+            target = path.name if directory_fd is not None else path
+            try:
+                os.unlink(target, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        if directory_fd is not None:
+            os.close(directory_fd)
+            directory_fd = None
+        _prune_empty(directory, store)
         raise
-    return StagedAudio(stored_path=str(final), sha256=digest, bytes=size), final
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+    return StagedAudio(stored_path=str(physical), sha256=digest, bytes=size), physical
 
 
 def _discard_staged(
-    conn: sqlite3.Connection, created: Path | None, bundle: MeetingBundle, audio_store: Path
+    conn: sqlite3.Connection, created: Path | None, bundle: MeetingBundle
 ) -> None:
     """Remove audio this run staged, unless a database row now references it."""
     if created is None:
@@ -304,7 +468,7 @@ def _discard_staged(
         if row["revision"] == bundle.revision:
             return                                          # the revision landed after all
     _unlink(created)
-    _prune_empty(created.parent, Path(audio_store))
+    _prune_empty(created.parent, created.parents[2])
 
 
 # --- archive and quarantine -------------------------------------------------
@@ -470,6 +634,7 @@ def import_meeting_inbox(
     quarantine: Path,
     audio_store: Path,
     *,
+    vault_dir: Path,
     now: str,
     dry_run: bool = False,
 ) -> MeetingImportResult:
@@ -526,7 +691,7 @@ def import_meeting_inbox(
 
         before = _current_revision(conn, bundle.occurrence_id)
         try:
-            staged, created = _stage_audio(bundle, audio_store)
+            staged, created = _stage_audio(bundle, audio_store, vault_dir)
         except _Rejected as exc:
             _quarantine_bundle(candidate, quarantine, exc.code, bundle=bundle)
             record(bundle.occurrence_id, "quarantined", exc.code, candidate.label)
@@ -543,7 +708,7 @@ def import_meeting_inbox(
                 imported_at=now,
             )
         except MeetingStoreError as exc:
-            _discard_staged(conn, created, bundle, audio_store)
+            _discard_staged(conn, created, bundle)
             code = _store_reason(exc)
             _quarantine_bundle(candidate, quarantine, code, bundle=bundle)
             record(bundle.occurrence_id, "quarantined", code, candidate.label)
@@ -551,7 +716,7 @@ def import_meeting_inbox(
         except BaseException:
             # An environmental fault, not a bad bundle: undo our own staging and
             # leave the inbox exactly as it was so a rescan can retry it.
-            _discard_staged(conn, created, bundle, audio_store)
+            _discard_staged(conn, created, bundle)
             raise
 
         if stored.status == "unchanged":

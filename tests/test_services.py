@@ -4,7 +4,7 @@ import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from teammem.config import Config
+from teammem.config import Config, validate_meeting_settings
 from teammem.events import Event
 from teammem.identity import IdentityMaps
 from teammem.services import (
@@ -733,6 +733,7 @@ from teammem.services import (
     execute_process_meetings,
     meeting_alert_path,
     meeting_receipt_path,
+    prepare_meeting_dirs,
     run_process_meetings,
 )
 from teammem.vaultgit import commit_all
@@ -1003,6 +1004,34 @@ def test_a_group_readable_meeting_directory_is_refused(bench):
     assert not bench.cfg.meeting_archive.exists()
     assert not bench.cfg.meeting_quarantine.exists()
     assert bench.managed() == {}
+
+
+def test_audio_adoption_rechecks_that_the_store_is_outside_the_vault(bench):
+    safe_parent = bench.tmp_path / "safe-audio-parent"
+    safe_parent.mkdir()
+    alias = bench.tmp_path / "audio-parent-alias"
+    alias.symlink_to(safe_parent, target_is_directory=True)
+    bench.cfg.meeting_audio_store = alias / "store"
+    validate_meeting_settings(bench.cfg)
+    prepare_meeting_dirs(bench.cfg)
+
+    (safe_parent / "store").rmdir()
+    alias.unlink()
+    alias.symlink_to(bench.vault, target_is_directory=True)
+    payload = _payload()
+    bench.drop(payload)
+    conn = open_db(bench.cfg.db_path)
+
+    result = execute_process_meetings(
+        bench.cfg, bench.ids, now=MEETING_NOW, conn=conn)
+
+    assert result.imported.quarantined == 1
+    assert result.imported.details == (
+        (payload["occurrence_id"], "quarantined", "path_escape"),
+    )
+    assert get_meeting(conn, payload["occurrence_id"]) is None
+    assert not (bench.vault / "store").exists()
+    assert result.receipts == ()
 
 
 def test_the_result_names_every_occurrence_and_why_it_failed(bench, monkeypatch):

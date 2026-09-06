@@ -114,6 +114,7 @@ def _import(conn, tmp_path: Path, payload: dict) -> None:
         tmp_path / "meeting-archive",
         tmp_path / "meeting-quarantine",
         _store(tmp_path),
+        vault_dir=tmp_path / "vault",
         now=IMPORTED_AT,
     )
     assert result.quarantined == 0, result.details
@@ -330,6 +331,50 @@ def test_revived_audio_from_a_replayed_bundle_is_removed_again(tmp_path):
     stored = get_meeting(conn, payload["occurrence_id"])["audio"]
     assert stored["deleted_at"] == EXPIRY           # a replay never moves the decision
     assert stored["sha256"] == payload["audio"]["sha256"]
+
+
+@pytest.mark.parametrize(("link_level", "failure_revision"), [
+    ("occurrence", 0),
+    ("revision", 3),
+])
+def test_a_revived_audio_symlink_is_visible_without_blocking_another_due_deletion(
+    tmp_path, link_level, failure_revision
+):
+    conn = _db(tmp_path)
+    revived = _payload(day="2026-08-20")
+    due = _payload(day="2026-08-21")
+    _import(conn, tmp_path, revived)
+    _import(conn, tmp_path, due)
+    revived_bytes = _audio(tmp_path, revived).read_bytes()
+    assert _expire(conn, tmp_path, "2026-09-03T14:52:00Z").deleted == (
+        (revived["occurrence_id"], 3),
+    )
+
+    occurrence = _store(tmp_path) / occurrence_path_segment(revived["occurrence_id"])
+    if link_level == "occurrence":
+        outside = tmp_path / "revived-occurrence"
+        external_audio = outside / "3" / "audio.enc"
+        external_audio.parent.mkdir(parents=True)
+        external_audio.write_bytes(revived_bytes)
+        occurrence.symlink_to(outside, target_is_directory=True)
+    else:
+        occurrence.mkdir()
+        outside = tmp_path / "revived-revision"
+        outside.mkdir()
+        external_audio = outside / "audio.enc"
+        external_audio.write_bytes(revived_bytes)
+        (occurrence / "3").symlink_to(outside, target_is_directory=True)
+
+    result = _expire(conn, tmp_path, "2026-09-04T14:52:00Z")
+
+    assert result.deleted == ((due["occurrence_id"], 3),)
+    assert not _audio(tmp_path, due).exists()
+    assert external_audio.exists()
+    assert [
+        (failure.occurrence_id, failure.revision, failure.stage)
+        for failure in result.failed
+    ] == [(revived["occurrence_id"], failure_revision, "symlink")]
+    assert result.exit_code == 1
 
 
 # --- what survives ----------------------------------------------------------
