@@ -42,6 +42,10 @@ MINIMAL = FIXTURES / "teammem-meeting-v1.minimal.json"
 IMPORTED_AT = "2026-09-02T16:00:00Z"
 
 
+def _allow_commit() -> None:
+    """Store-only tests have no adopted filesystem state to revalidate."""
+
+
 def _payload(path: Path, *, day: str | None = None) -> dict:
     """Load a fixture, optionally shifting its whole meeting day.
 
@@ -71,7 +75,14 @@ def _staged(bundle) -> StagedAudio:
     )
 
 
-def _import(conn, bundle, *, imported_at: str = IMPORTED_AT, audio: StagedAudio | None = None):
+def _import(
+    conn,
+    bundle,
+    *,
+    imported_at: str = IMPORTED_AT,
+    audio: StagedAudio | None = None,
+    before_commit=_allow_commit,
+):
     return import_meeting_revision(
         conn,
         payload=bundle.payload,
@@ -80,6 +91,7 @@ def _import(conn, bundle, *, imported_at: str = IMPORTED_AT, audio: StagedAudio 
         artifact_hash=bundle.artifact_hash,
         audio=audio if audio is not None else _staged(bundle),
         imported_at=imported_at,
+        before_commit=before_commit,
     )
 
 
@@ -370,6 +382,7 @@ def test_an_artifact_hash_already_held_by_another_revision_is_rejected(tmp_path)
             artifact_hash=bundle.artifact_hash,
             audio=_staged(bundle),
             imported_at=IMPORTED_AT,
+            before_commit=_allow_commit,
         )
     assert _counts(conn) == before
 
@@ -456,6 +469,24 @@ def test_import_keeps_a_callers_enabled_foreign_keys_enabled(tmp_path):
 # --- transactionality -------------------------------------------------------
 
 
+def test_import_requires_an_explicit_before_commit_guard(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    bundle = _bundle(tmp_path, _payload(COMPLETE))
+
+    with pytest.raises(TypeError, match="before_commit"):
+        import_meeting_revision(
+            conn,
+            payload=bundle.payload,
+            occurrence_id=bundle.occurrence_id,
+            revision=bundle.revision,
+            artifact_hash=bundle.artifact_hash,
+            audio=_staged(bundle),
+            imported_at=IMPORTED_AT,
+        )
+
+    assert _counts(conn) == {table: 0 for table in MEETING_TABLES}
+
+
 def test_a_failure_partway_through_child_inserts_writes_nothing(tmp_path, monkeypatch):
     conn = open_db(tmp_path / "l.db")
     bundle = _bundle(tmp_path, _payload(COMPLETE))
@@ -474,6 +505,33 @@ def test_a_failure_partway_through_child_inserts_writes_nothing(tmp_path, monkey
     assert conn.execute("SELECT COUNT(*) FROM meeting_artifacts").fetchone()[0] == 0
     assert get_meeting(conn, bundle.occurrence_id) is None
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_before_commit_guard_sees_the_inserted_rows_and_refusal_rolls_them_back(
+    tmp_path,
+):
+    conn = open_db(tmp_path / "l.db")
+    bundle = _bundle(tmp_path, _payload(COMPLETE))
+    observed = None
+
+    def refuse_commit():
+        nonlocal observed
+        observed = {
+            "artifacts": conn.execute(
+                "SELECT COUNT(*) FROM meeting_artifacts").fetchone()[0],
+            "audio": conn.execute(
+                "SELECT COUNT(*) FROM meeting_audio").fetchone()[0],
+            "meetings": conn.execute(
+                "SELECT COUNT(*) FROM meetings").fetchone()[0],
+        }
+        raise RuntimeError("filesystem containment changed before commit")
+
+    with pytest.raises(RuntimeError, match="filesystem containment changed"):
+        _import(conn, bundle, before_commit=refuse_commit)
+
+    assert observed == {"artifacts": 1, "audio": 1, "meetings": 1}
+    assert _counts(conn) == {table: 0 for table in MEETING_TABLES}
+    assert conn.in_transaction is False
 
 
 def test_a_failed_higher_revision_leaves_the_previous_revision_current(tmp_path, monkeypatch):
@@ -607,6 +665,7 @@ def test_an_artifact_hash_that_does_not_match_the_payload_is_rejected(tmp_path):
             artifact_hash="sha256:" + "0" * 64,
             audio=_staged(bundle),
             imported_at=IMPORTED_AT,
+            before_commit=_allow_commit,
         )
     assert not isinstance(caught.value, (MeetingRevisionConflict, MeetingRevisionSuperseded))
     assert _counts(conn) == {table: 0 for table in MEETING_TABLES}
@@ -627,6 +686,7 @@ def test_a_replay_carrying_a_doctored_hash_is_rejected_not_treated_as_unchanged(
             artifact_hash="sha256:" + "f" * 64,
             audio=_staged(bundle),
             imported_at="2026-09-03T08:00:00Z",
+            before_commit=_allow_commit,
         )
     # The recompute has to run ahead of the replay branch, or this would have
     # been waved through with status "unchanged".

@@ -55,6 +55,10 @@ HEADINGS = [
 ]
 
 
+def _allow_commit() -> None:
+    """Renderer tests store facts without adopting filesystem audio."""
+
+
 # --- fixtures ---------------------------------------------------------------
 
 
@@ -98,6 +102,7 @@ def _import(conn, payload: dict) -> str:
             bytes=payload["audio"]["bytes"],
         ),
         imported_at=IMPORTED_AT,
+        before_commit=_allow_commit,
     )
     return occurrence_id
 

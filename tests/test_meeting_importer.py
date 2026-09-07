@@ -576,6 +576,42 @@ def test_audio_moved_into_the_vault_before_commit_is_removed_and_not_recorded(
     assert not list(tree.vault.rglob("audio.enc"))
 
 
+def test_audio_moved_at_the_store_boundary_is_removed_before_commit(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    write_meeting_bundle(tree.inbox, payload)
+    tree.vault.mkdir()
+    revision = audio_revision_dir(
+        tree.audio, payload["occurrence_id"], payload["revision"])
+    captured = tree.vault / "captured-revision"
+
+    from teammem import meeting_importer
+
+    real_import = meeting_importer.import_meeting_revision
+    moved = False
+
+    def move_revision_after_adoption(*args, **kwargs):
+        nonlocal moved
+        revision.rename(captured)
+        revision.symlink_to(captured, target_is_directory=True)
+        moved = True
+        return real_import(*args, **kwargs)
+
+    monkeypatch.setattr(
+        meeting_importer, "import_meeting_revision", move_revision_after_adoption)
+
+    result = _run(conn, tree)
+
+    assert moved is True
+    assert _outcomes(result) == [("quarantined", "path_escape")]
+    assert list_meetings(conn) == []
+    assert not (captured / "audio.enc").exists()
+    assert not list(tree.vault.rglob("audio.enc"))
+
+
 def test_no_raw_colon_or_slash_from_a_meeting_id_appears_in_any_created_path(tmp_path):
     conn = _db(tmp_path)
     tree = _Tree(tmp_path)

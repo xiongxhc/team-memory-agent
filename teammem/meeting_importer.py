@@ -191,7 +191,7 @@ def _fsync_dir(path: Path) -> None:
 
 def _open_audio_directory(
     store: Path, occurrence_id: str, revision: int
-) -> tuple[Path, int | None]:
+) -> tuple[Path, int | None, int | None]:
     """Create/open the two managed descendants without following either one."""
     directory = audio_revision_dir(store, occurrence_id, revision)
     if os.name == "nt":
@@ -210,33 +210,38 @@ def _open_audio_directory(
                 or not stat.S_ISDIR(metadata.st_mode)
             ):
                 raise _Rejected("path_escape")
-        return directory, None
+        return directory, None, None
 
     try:
         store.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(store, _DIRECTORY_FLAGS)
+        store_fd = os.open(store, _DIRECTORY_FLAGS)
     except OSError as error:
         if error.errno in {errno.EEXIST, errno.ELOOP, errno.ENOTDIR}:
             raise _Rejected("path_escape") from error
         raise
+    descriptors = []
+    parent_fd = store_fd
     try:
         for name in (directory.parent.name, directory.name):
             try:
-                os.mkdir(name, mode=0o700, dir_fd=descriptor)
+                os.mkdir(name, mode=0o700, dir_fd=parent_fd)
             except FileExistsError:
                 pass
             try:
-                child = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
             except OSError as error:
                 if error.errno in {errno.ELOOP, errno.ENOTDIR}:
                     raise _Rejected("path_escape") from error
                 raise
-            os.close(descriptor)
-            descriptor = child
-        return directory, descriptor
+            descriptors.append(child_fd)
+            parent_fd = child_fd
+        return directory, descriptors[0], descriptors[1]
     except BaseException:
-        os.close(descriptor)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
         raise
+    finally:
+        os.close(store_fd)
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
@@ -356,16 +361,61 @@ def _verified_audio_path(
     return physical
 
 
+@dataclass
+class _AdoptedAudio:
+    """Open ownership of one verified ciphertext through its ledger commit."""
+
+    staged: StagedAudio
+    final: Path
+    configured_store: Path
+    configured_vault: Path
+    created: bool
+    final_fd: int | None
+    occurrence_fd: int | None
+    revision_fd: int | None
+
+    def before_commit(self) -> None:
+        if self.final_fd is None:
+            raise _Rejected("path_escape")
+        try:
+            store = _physical_path(self.configured_store)
+            vault = _physical_path(self.configured_vault)
+        except (OSError, RuntimeError) as error:
+            raise _Rejected("path_escape") from error
+        if _path_within(store, vault) or _path_within(vault, store):
+            raise _Rejected("path_escape")
+        _verified_audio_path(self.final_fd, self.final, store, vault)
+
+    def unlink_created(self) -> None:
+        if not self.created:
+            return
+        if self.revision_fd is None and self.final_fd is not None:
+            os.close(self.final_fd)
+            self.final_fd = None
+        target = self.final.name if self.revision_fd is not None else self.final
+        try:
+            os.unlink(target, dir_fd=self.revision_fd)
+        except FileNotFoundError:
+            pass
+
+    def close(self) -> None:
+        for field in ("final_fd", "revision_fd", "occurrence_fd"):
+            descriptor = getattr(self, field)
+            if descriptor is not None:
+                os.close(descriptor)
+                setattr(self, field, None)
+
+
 def _stage_audio(
     bundle: MeetingBundle,
     audio_store: Path,
     vault_dir: Path,
-) -> tuple[StagedAudio, Path | None]:
+) -> _AdoptedAudio:
     """Publish the encrypted audio and describe it.
 
-    Returns the `StagedAudio` to hand to the store plus the final path *if this
-    call created it*. That second value is the only thing the failure path is
-    ever allowed to delete: audio already present belongs to a stored revision.
+    The returned owner keeps the adopted file and managed directories open
+    until the store transaction commits. Only a file this call created may be
+    removed on failure; audio already present belongs to a stored revision.
     """
     try:
         store = _physical_path(audio_store)
@@ -375,21 +425,22 @@ def _stage_audio(
     if _path_within(store, vault) or _path_within(vault, store):
         raise _Rejected("path_escape")
 
-    directory, directory_fd = _open_audio_directory(
+    directory, occurrence_fd, revision_fd = _open_audio_directory(
         store, bundle.occurrence_id, bundle.revision)
     final = directory / AUDIO_FILENAME
     declared_sha = bundle.payload["audio"]["sha256"]
     declared_bytes = bundle.payload["audio"]["bytes"]
     staging = directory / f".{AUDIO_FILENAME}.{secrets.token_hex(8)}"
-    final_name = final.name if directory_fd is not None else final
-    staging_name = staging.name if directory_fd is not None else staging
+    final_name = final.name if revision_fd is not None else final
+    staging_name = staging.name if revision_fd is not None else staging
     created = False
+    final_fd = None
     try:
         if final.is_symlink():
             raise _Rejected("audio_conflict")
         try:
             final_fd = os.open(
-                final_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=directory_fd)
+                final_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=revision_fd)
         except FileNotFoundError:
             final_fd = None
         except OSError as error:
@@ -397,78 +448,85 @@ def _stage_audio(
                 raise _Rejected("audio_conflict") from error
             raise
         if final_fd is not None:
-            try:
-                digest, size = _digest_descriptor(final_fd)
-                physical = _verified_audio_path(final_fd, final, store, vault)
-            finally:
-                os.close(final_fd)
-            if digest == declared_sha and size == declared_bytes:
-                return StagedAudio(
-                    stored_path=str(physical), sha256=digest, bytes=size), None
-            raise _Rejected("audio_conflict")
-
-        _copy_file(bundle.audio_path, staging, directory_fd=directory_fd)
-        if directory_fd is None:
-            _fsync_dir(directory)
-        else:
-            os.fsync(directory_fd)
-        staging_fd = os.open(
-            staging_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=directory_fd)
-        try:
-            digest, size = _digest_descriptor(staging_fd)
-        finally:
-            os.close(staging_fd)
-        if digest != declared_sha or size != declared_bytes:
-            raise _Rejected("audio_hash_mismatch")
-        if directory_fd is None:
-            os.replace(staging, final)
-        else:
-            os.replace(
-                staging.name,
-                final.name,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-            )
-        created = True
-        if directory_fd is None:
-            _fsync_dir(directory)
-        else:
-            os.fsync(directory_fd)
-        final_fd = os.open(
-            final_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=directory_fd)
-        try:
+            digest, size = _digest_descriptor(final_fd)
             physical = _verified_audio_path(final_fd, final, store, vault)
-        finally:
-            os.close(final_fd)
+            if digest != declared_sha or size != declared_bytes:
+                raise _Rejected("audio_conflict")
+        else:
+            _copy_file(bundle.audio_path, staging, directory_fd=revision_fd)
+            if revision_fd is None:
+                _fsync_dir(directory)
+            else:
+                os.fsync(revision_fd)
+            staging_fd = os.open(
+                staging_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=revision_fd)
+            try:
+                digest, size = _digest_descriptor(staging_fd)
+            finally:
+                os.close(staging_fd)
+            if digest != declared_sha or size != declared_bytes:
+                raise _Rejected("audio_hash_mismatch")
+            if revision_fd is None:
+                os.replace(staging, final)
+            else:
+                os.replace(
+                    staging.name,
+                    final.name,
+                    src_dir_fd=revision_fd,
+                    dst_dir_fd=revision_fd,
+                )
+            created = True
+            if revision_fd is None:
+                _fsync_dir(directory)
+            else:
+                os.fsync(revision_fd)
+            final_fd = os.open(
+                final_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=revision_fd)
+            physical = _verified_audio_path(final_fd, final, store, vault)
+        adopted = _AdoptedAudio(
+            staged=StagedAudio(
+                stored_path=str(physical), sha256=digest, bytes=size),
+            final=physical,
+            configured_store=Path(audio_store),
+            configured_vault=Path(vault_dir),
+            created=created,
+            final_fd=final_fd,
+            occurrence_fd=occurrence_fd,
+            revision_fd=revision_fd,
+        )
+        final_fd = occurrence_fd = revision_fd = None
+        return adopted
     except BaseException:
         for path in (staging, final) if created else (staging,):
-            target = path.name if directory_fd is not None else path
+            target = path.name if revision_fd is not None else path
             try:
-                os.unlink(target, dir_fd=directory_fd)
+                os.unlink(target, dir_fd=revision_fd)
             except FileNotFoundError:
                 pass
-        if directory_fd is not None:
-            os.close(directory_fd)
-            directory_fd = None
         _prune_empty(directory, store)
         raise
     finally:
-        if directory_fd is not None:
-            os.close(directory_fd)
-    return StagedAudio(stored_path=str(physical), sha256=digest, bytes=size), physical
+        for descriptor in (final_fd, revision_fd, occurrence_fd):
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def _discard_staged(
-    conn: sqlite3.Connection, created: Path | None, bundle: MeetingBundle
+    conn: sqlite3.Connection,
+    adopted: _AdoptedAudio,
+    bundle: MeetingBundle,
+    *,
+    guard_refused: bool = False,
 ) -> None:
     """Remove audio this run staged, unless a database row now references it."""
-    if created is None:
+    if not adopted.created:
         return
-    for row in list_meeting_revisions(conn, bundle.occurrence_id):
-        if row["revision"] == bundle.revision:
-            return                                          # the revision landed after all
-    _unlink(created)
-    _prune_empty(created.parent, created.parents[2])
+    if not guard_refused:
+        for row in list_meeting_revisions(conn, bundle.occurrence_id):
+            if row["revision"] == bundle.revision:
+                return                                      # the revision landed after all
+    adopted.unlink_created()
+    _prune_empty(adopted.final.parent, adopted.final.parents[2])
 
 
 # --- archive and quarantine -------------------------------------------------
@@ -691,7 +749,7 @@ def import_meeting_inbox(
 
         before = _current_revision(conn, bundle.occurrence_id)
         try:
-            staged, created = _stage_audio(bundle, audio_store, vault_dir)
+            adopted = _stage_audio(bundle, audio_store, vault_dir)
         except _Rejected as exc:
             _quarantine_bundle(candidate, quarantine, exc.code, bundle=bundle)
             record(bundle.occurrence_id, "quarantined", exc.code, candidate.label)
@@ -704,11 +762,18 @@ def import_meeting_inbox(
                 occurrence_id=bundle.occurrence_id,
                 revision=bundle.revision,
                 artifact_hash=bundle.artifact_hash,
-                audio=staged,
+                audio=adopted.staged,
                 imported_at=now,
+                before_commit=adopted.before_commit,
             )
+        except _Rejected as exc:
+            _discard_staged(
+                conn, adopted, bundle, guard_refused=True)
+            _quarantine_bundle(candidate, quarantine, exc.code, bundle=bundle)
+            record(bundle.occurrence_id, "quarantined", exc.code, candidate.label)
+            continue
         except MeetingStoreError as exc:
-            _discard_staged(conn, created, bundle)
+            _discard_staged(conn, adopted, bundle)
             code = _store_reason(exc)
             _quarantine_bundle(candidate, quarantine, code, bundle=bundle)
             record(bundle.occurrence_id, "quarantined", code, candidate.label)
@@ -716,8 +781,10 @@ def import_meeting_inbox(
         except BaseException:
             # An environmental fault, not a bad bundle: undo our own staging and
             # leave the inbox exactly as it was so a rescan can retry it.
-            _discard_staged(conn, created, bundle)
+            _discard_staged(conn, adopted, bundle)
             raise
+        finally:
+            adopted.close()
 
         if stored.status == "unchanged":
             outcome = "unchanged"

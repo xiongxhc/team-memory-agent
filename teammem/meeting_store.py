@@ -25,6 +25,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from .meeting_bundles import canonical_artifact_hash
 
@@ -408,6 +409,7 @@ def import_meeting_revision(
     artifact_hash: str,
     audio: StagedAudio,
     imported_at: str,
+    before_commit: Callable[[], None],
 ) -> RevisionImportResult:
     """Store one validated meeting revision and make it current if it is newer.
 
@@ -420,6 +422,11 @@ def import_meeting_revision(
     layer is genuinely content-addressed rather than trusting the caller's claim.
     A hash that does not match the payload is refused ahead of the replay check,
     so a doctored replay can never be waved through as unchanged.
+
+    `before_commit` runs after every insert and immediately before the commit.
+    It lets the importer revalidate filesystem state while this module remains
+    the sole owner of the SQL transaction. Callers without adopted filesystem
+    state must still make that decision explicit with a no-op callback.
 
     Replaying the same `(occurrence_id, revision, artifact_hash)` is a no-op.
     The same revision with a different hash raises `MeetingRevisionConflict`; a
@@ -498,6 +505,7 @@ def import_meeting_revision(
             _insert_gaps_and_warnings(conn, key, payload)
             _insert_audio(conn, key, payload, audio, expires_at)
             _activate_revision(conn, key, payload)
+            before_commit()
         except Exception:
             conn.rollback()
             raise
