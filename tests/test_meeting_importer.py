@@ -539,7 +539,7 @@ def test_a_symlinked_audio_revision_directory_is_not_followed(tmp_path):
     assert revision.is_symlink()
 
 
-def test_audio_moved_into_the_vault_before_commit_is_removed_and_not_recorded(
+def test_audio_moved_into_the_vault_before_commit_is_destroyed_and_not_recorded(
     tmp_path, monkeypatch
 ):
     conn = _db(tmp_path)
@@ -572,11 +572,10 @@ def test_audio_moved_into_the_vault_before_commit_is_removed_and_not_recorded(
     assert moved is True
     assert _outcomes(result) == [("quarantined", "path_escape")]
     assert list_meetings(conn) == []
-    assert not (captured / "audio.enc").exists()
-    assert not list(tree.vault.rglob("audio.enc"))
+    assert (captured / "audio.enc").stat().st_size == 0
 
 
-def test_audio_moved_at_the_store_boundary_is_removed_before_commit(
+def test_audio_moved_at_the_store_boundary_is_destroyed_before_commit(
     tmp_path, monkeypatch
 ):
     conn = _db(tmp_path)
@@ -608,8 +607,7 @@ def test_audio_moved_at_the_store_boundary_is_removed_before_commit(
     assert moved is True
     assert _outcomes(result) == [("quarantined", "path_escape")]
     assert list_meetings(conn) == []
-    assert not (captured / "audio.enc").exists()
-    assert not list(tree.vault.rglob("audio.enc"))
+    assert (captured / "audio.enc").stat().st_size == 0
 
 
 def test_moved_audio_is_destroyed_without_unlinking_its_replacement(
@@ -649,6 +647,110 @@ def test_moved_audio_is_destroyed_without_unlinking_its_replacement(
     remaining_adopted_bytes = captured.stat().st_size if captured.exists() else 0
     replacement_after = final.read_bytes() if final.exists() else None
     assert (remaining_adopted_bytes, replacement_after) == (0, replacement)
+
+
+def test_cleanup_does_not_unlink_a_replacement_installed_at_removal(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    write_meeting_bundle(tree.inbox, payload)
+    tree.vault.mkdir()
+    revision = audio_revision_dir(
+        tree.audio, payload["occurrence_id"], payload["revision"])
+    captured = tree.vault / "captured-revision"
+    managed = captured / "audio.enc"
+    zeroed = captured / "zeroed-adopted.enc"
+    replacement = b"replacement installed after identity lookup"
+
+    from teammem import meeting_importer
+
+    real_import = meeting_importer.import_meeting_revision
+    real_unlink = os.unlink
+    swapped = False
+
+    def move_revision_after_adoption(*args, **kwargs):
+        revision.rename(captured)
+        revision.symlink_to(captured, target_is_directory=True)
+        return real_import(*args, **kwargs)
+
+    def replace_at_removal(path, *args, **kwargs):
+        nonlocal swapped
+        if (
+            Path(path).name == "audio.enc"
+            and kwargs.get("dir_fd") is not None
+            and not swapped
+        ):
+            managed.rename(zeroed)
+            managed.write_bytes(replacement)
+            swapped = True
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        meeting_importer, "import_meeting_revision", move_revision_after_adoption)
+    monkeypatch.setattr(meeting_importer.os, "unlink", replace_at_removal)
+
+    result = _run(conn, tree)
+
+    assert _outcomes(result) == [("quarantined", "path_escape")]
+    assert list_meetings(conn) == []
+    replacement_after = managed.read_bytes() if managed.exists() else None
+    assert not swapped or replacement_after == replacement
+    residue = zeroed if swapped else managed
+    assert residue.stat().st_size == 0
+
+
+def test_preowned_file_substituted_after_rename_is_never_truncated(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    source = write_meeting_bundle(tree.inbox, payload) / "audio.enc"
+    adopted_bytes = source.read_bytes()
+    tree.vault.mkdir()
+    final = _audio_file(tree, payload)
+    captured = tree.vault / "captured.enc"
+    preowned = tmp_path / "preowned.enc"
+    preowned_bytes = b"PREOWNED AUDIO MUST NOT BE TRUNCATED"
+    preowned.write_bytes(preowned_bytes)
+    replacement = b"unrelated replacement"
+
+    from teammem import meeting_importer
+
+    real_replace = os.replace
+    real_import = meeting_importer.import_meeting_revision
+    swapped = False
+
+    def substitute_preowned_after_rename(source_name, destination, *args, **kwargs):
+        nonlocal swapped
+        result = real_replace(source_name, destination, *args, **kwargs)
+        if Path(destination).name == "audio.enc" and not swapped:
+            final.rename(captured)
+            os.link(preowned, final)
+            swapped = True
+        return result
+
+    def replace_preowned_before_guard(*args, **kwargs):
+        final.unlink()
+        final.write_bytes(replacement)
+        return real_import(*args, **kwargs)
+
+    monkeypatch.setattr(
+        meeting_importer.os, "replace", substitute_preowned_after_rename)
+    monkeypatch.setattr(
+        meeting_importer, "import_meeting_revision", replace_preowned_before_guard)
+
+    result = _run(conn, tree)
+
+    assert swapped is True
+    assert _outcomes(result) == [("quarantined", "path_escape")]
+    assert list_meetings(conn) == []
+    assert preowned.read_bytes() == preowned_bytes
+    remaining_adopted_bytes = captured.stat().st_size if captured.exists() else 0
+    assert remaining_adopted_bytes == 0
+    assert adopted_bytes != preowned_bytes
 
 
 def test_no_raw_colon_or_slash_from_a_meeting_id_appears_in_any_created_path(tmp_path):
@@ -701,6 +803,52 @@ class _PatchedOS:
         if self._calls == self._fail_on:
             raise OSError(errno.ENOSPC, "No space left on device")
         return os.write(fd, data)
+
+
+class _WindowsRenameOS:
+    """Model Windows refusing a rename while its created file is open."""
+
+    name = "nt"
+
+    def __init__(self):
+        self._created = set()
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def open(self, path, flags, *args, **kwargs):
+        descriptor = os.open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL:
+            self._created.add(descriptor)
+        return descriptor
+
+    def close(self, descriptor):
+        self._created.discard(descriptor)
+        return os.close(descriptor)
+
+    def replace(self, source, destination, *args, **kwargs):
+        if self._created:
+            raise PermissionError(errno.EACCES, "open file cannot be renamed")
+        return os.replace(source, destination, *args, **kwargs)
+
+
+def test_windows_fallback_revalidates_ownership_after_the_rename(tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    write_meeting_bundle(tree.inbox, payload)
+
+    from teammem import meeting_importer
+
+    monkeypatch.setattr(meeting_importer, "os", _WindowsRenameOS())
+    try:
+        result = _run(conn, tree)
+    except PermissionError:
+        result = None
+
+    assert result is not None
+    assert _outcomes(result) == [("accepted", "ok")]
+    assert _audio_file(tree, payload).stat().st_size == payload["audio"]["bytes"]
 
 
 def test_disk_full_during_the_audio_copy_leaves_no_row_and_no_final_file(tmp_path, monkeypatch):

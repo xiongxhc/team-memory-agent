@@ -266,8 +266,8 @@ def _write_all(fd: int, data: bytes) -> None:
         offset += os.write(fd, data[offset:])
 
 
-def _copy_file(source: Path, destination: Path, *, directory_fd: int | None = None) -> None:
-    """Copy opaque bytes into a new file and fsync it.
+def _copy_file(source: Path, destination: Path, *, directory_fd: int | None = None) -> int:
+    """Copy opaque bytes into a new file and return its open, synced descriptor.
 
     The source is opened `O_NOFOLLOW`. `load_meeting_bundle` already refused a
     symlinked `audio.enc`, but that check ran in an earlier pass over the same
@@ -281,7 +281,7 @@ def _copy_file(source: Path, destination: Path, *, directory_fd: int | None = No
         target = destination.name if directory_fd is not None else destination
         fd = os.open(
             target,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_FLAGS,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | _FILE_FLAGS,
             0o600,
             dir_fd=directory_fd,
         )
@@ -290,10 +290,12 @@ def _copy_file(source: Path, destination: Path, *, directory_fd: int | None = No
                 while chunk := handle.read(_COPY_CHUNK):
                     _write_all(fd, chunk)
             os.fsync(fd)
-        finally:
+        except BaseException:
             os.close(fd)
+            raise
     finally:
         os.close(source_fd)
+    return fd
 
 
 def _digest_descriptor(descriptor: int) -> tuple[str, int]:
@@ -386,12 +388,14 @@ class _AdoptedAudio:
             raise _Rejected("path_escape")
         _verified_audio_path(self.final_fd, self.final, store, vault)
 
-    def discard_created(self) -> None:
+    def discard_created(self, *, remove_name: bool) -> None:
         if not self.created:
             return
-        adopted = os.fstat(self.final_fd)
         os.ftruncate(self.final_fd, 0)
         os.fsync(self.final_fd)
+        if not remove_name:
+            return
+        adopted = os.fstat(self.final_fd)
         target = self.final.name if self.revision_fd is not None else self.final
         try:
             current = os.stat(
@@ -439,8 +443,8 @@ def _stage_audio(
     declared_bytes = bundle.payload["audio"]["bytes"]
     staging = directory / f".{AUDIO_FILENAME}.{secrets.token_hex(8)}"
     final_name = final.name if revision_fd is not None else final
-    staging_name = staging.name if revision_fd is not None else staging
     created = False
+    owns_fd = False
     final_fd = None
     try:
         if final.is_symlink():
@@ -460,19 +464,25 @@ def _stage_audio(
             if digest != declared_sha or size != declared_bytes:
                 raise _Rejected("audio_conflict")
         else:
-            _copy_file(bundle.audio_path, staging, directory_fd=revision_fd)
+            final_fd = _copy_file(
+                bundle.audio_path, staging, directory_fd=revision_fd)
+            owns_fd = True
             if revision_fd is None:
                 _fsync_dir(directory)
             else:
                 os.fsync(revision_fd)
-            staging_fd = os.open(
-                staging_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=revision_fd)
-            try:
-                digest, size = _digest_descriptor(staging_fd)
-            finally:
-                os.close(staging_fd)
+            digest, size = _digest_descriptor(final_fd)
             if digest != declared_sha or size != declared_bytes:
                 raise _Rejected("audio_hash_mismatch")
+            staging_identity = None
+            if os.name == "nt":
+                # Ordinary Windows descriptors do not share delete access, so
+                # close for the rename and bind the writable reopen below to
+                # the identity captured from the descriptor we created.
+                staging_identity = os.fstat(final_fd)
+                os.close(final_fd)
+                final_fd = None
+                owns_fd = False
             if revision_fd is None:
                 os.replace(staging, final)
             else:
@@ -483,12 +493,25 @@ def _stage_audio(
                     dst_dir_fd=revision_fd,
                 )
             created = True
+            if staging_identity is not None:
+                try:
+                    final_fd = os.open(
+                        final_name, os.O_RDWR | _FILE_FLAGS,
+                        dir_fd=revision_fd)
+                except OSError as error:
+                    raise _Rejected("path_escape") from error
+                current = os.fstat(final_fd)
+                if (current.st_dev, current.st_ino) != (
+                    staging_identity.st_dev, staging_identity.st_ino
+                ):
+                    os.close(final_fd)
+                    final_fd = None
+                    raise _Rejected("path_escape")
+                owns_fd = True
             if revision_fd is None:
                 _fsync_dir(directory)
             else:
                 os.fsync(revision_fd)
-            final_fd = os.open(
-                final_name, os.O_RDWR | _FILE_FLAGS, dir_fd=revision_fd)
             physical = _verified_audio_path(final_fd, final, store, vault)
         adopted = _AdoptedAudio(
             staged=StagedAudio(
@@ -503,13 +526,21 @@ def _stage_audio(
         )
         final_fd = occurrence_fd = revision_fd = None
         return adopted
-    except BaseException:
-        for path in (staging, final) if created else (staging,):
-            target = path.name if revision_fd is not None else path
-            try:
-                os.unlink(target, dir_fd=revision_fd)
-            except FileNotFoundError:
-                pass
+    except BaseException as error:
+        if isinstance(error, _Rejected):
+            if owns_fd and final_fd is not None:
+                os.ftruncate(final_fd, 0)
+                os.fsync(final_fd)
+        else:
+            if final_fd is not None:
+                os.close(final_fd)
+                final_fd = None
+            for path in (staging, final) if created else (staging,):
+                target = path.name if revision_fd is not None else path
+                try:
+                    os.unlink(target, dir_fd=revision_fd)
+                except FileNotFoundError:
+                    pass
         _prune_empty(directory, store)
         raise
     finally:
@@ -532,7 +563,7 @@ def _discard_staged(
         for row in list_meeting_revisions(conn, bundle.occurrence_id):
             if row["revision"] == bundle.revision:
                 return                                      # the revision landed after all
-    adopted.discard_created()
+    adopted.discard_created(remove_name=not guard_refused)
     _prune_empty(adopted.final.parent, adopted.final.parents[2])
 
 
