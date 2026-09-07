@@ -612,6 +612,45 @@ def test_audio_moved_at_the_store_boundary_is_removed_before_commit(
     assert not list(tree.vault.rglob("audio.enc"))
 
 
+def test_moved_audio_is_destroyed_without_unlinking_its_replacement(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    source = write_meeting_bundle(tree.inbox, payload) / "audio.enc"
+    adopted_bytes = source.read_bytes()
+    tree.vault.mkdir()
+    final = _audio_file(tree, payload)
+    captured = tree.vault / "captured.enc"
+    replacement = b"unrelated replacement must survive"
+
+    from teammem import meeting_importer
+
+    real_import = meeting_importer.import_meeting_revision
+    moved = False
+
+    def move_file_after_adoption(*args, **kwargs):
+        nonlocal moved
+        final.rename(captured)
+        assert captured.read_bytes() == adopted_bytes
+        final.write_bytes(replacement)
+        moved = True
+        return real_import(*args, **kwargs)
+
+    monkeypatch.setattr(
+        meeting_importer, "import_meeting_revision", move_file_after_adoption)
+
+    result = _run(conn, tree)
+
+    assert moved is True
+    assert _outcomes(result) == [("quarantined", "path_escape")]
+    assert list_meetings(conn) == []
+    remaining_adopted_bytes = captured.stat().st_size if captured.exists() else 0
+    replacement_after = final.read_bytes() if final.exists() else None
+    assert (remaining_adopted_bytes, replacement_after) == (0, replacement)
+
+
 def test_no_raw_colon_or_slash_from_a_meeting_id_appears_in_any_created_path(tmp_path):
     conn = _db(tmp_path)
     tree = _Tree(tmp_path)

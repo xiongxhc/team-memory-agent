@@ -386,17 +386,24 @@ class _AdoptedAudio:
             raise _Rejected("path_escape")
         _verified_audio_path(self.final_fd, self.final, store, vault)
 
-    def unlink_created(self) -> None:
+    def discard_created(self) -> None:
         if not self.created:
             return
-        if self.revision_fd is None and self.final_fd is not None:
-            os.close(self.final_fd)
-            self.final_fd = None
+        adopted = os.fstat(self.final_fd)
+        os.ftruncate(self.final_fd, 0)
+        os.fsync(self.final_fd)
         target = self.final.name if self.revision_fd is not None else self.final
         try:
-            os.unlink(target, dir_fd=self.revision_fd)
+            current = os.stat(
+                target, dir_fd=self.revision_fd, follow_symlinks=False)
         except FileNotFoundError:
-            pass
+            return
+        if (current.st_dev, current.st_ino) != (adopted.st_dev, adopted.st_ino):
+            return
+        if self.revision_fd is None:
+            os.close(self.final_fd)
+            self.final_fd = None
+        os.unlink(target, dir_fd=self.revision_fd)
 
     def close(self) -> None:
         for field in ("final_fd", "revision_fd", "occurrence_fd"):
@@ -481,7 +488,7 @@ def _stage_audio(
             else:
                 os.fsync(revision_fd)
             final_fd = os.open(
-                final_name, os.O_RDONLY | _FILE_FLAGS, dir_fd=revision_fd)
+                final_name, os.O_RDWR | _FILE_FLAGS, dir_fd=revision_fd)
             physical = _verified_audio_path(final_fd, final, store, vault)
         adopted = _AdoptedAudio(
             staged=StagedAudio(
@@ -525,7 +532,7 @@ def _discard_staged(
         for row in list_meeting_revisions(conn, bundle.occurrence_id):
             if row["revision"] == bundle.revision:
                 return                                      # the revision landed after all
-    adopted.unlink_created()
+    adopted.discard_created()
     _prune_empty(adopted.final.parent, adopted.final.parents[2])
 
 
