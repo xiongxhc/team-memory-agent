@@ -6,11 +6,12 @@ state, and it does so in one fixed order per bundle:
 1. **Validate everything first.** `teammem.meeting_bundles.load_meeting_bundle`
    checks the payload, the manifest and the audio digest before this module
    touches anything. Nothing is mutated until that returns.
-2. **Publish the audio, verified.** The encrypted bytes are copied into a
-   staging file inside the destination directory, fsynced, hashed by reading
-   the staged copy back, checked against the payload, and only then moved into
-   their final name with `os.replace`. A crash can leave a staging file, never
-   a final-named partial one, so a database row can never point at half a file.
+2. **Publish the audio, verified.** On POSIX the encrypted bytes are copied into
+   a staging file, fsynced, verified, and atomically renamed. Windows creates
+   the final path exclusively so the exact created descriptor can remain open
+   through verification and commit. In both cases the database sees only a
+   complete verified file; failure can leave only unreferenced zero-byte
+   residue from the inode this invocation created.
 3. **Write the database.** `teammem.meeting_store.import_meeting_revision` owns
    every meeting SQL statement and runs its own `BEGIN IMMEDIATE`. This module
    writes none.
@@ -26,9 +27,10 @@ directory without its `READY` marker is not an error: the producer is still
 writing it, so it is skipped silently and left for the next scan.
 
 Environmental faults are not the producer's fault. A failed copy (a full disk)
-or an unexpected crash in the store cleans up the audio it staged, leaves the
-bundle in the inbox, and re-raises so the run stops instead of quarantining a
-bundle that was never wrong.
+or an unexpected crash in the store destroys bytes through the held created
+descriptor, leaves the bundle in the inbox, and re-raises so the run stops
+instead of quarantining a bundle that was never wrong. A zero-byte name may
+remain because cleanup never trusts a mutable pathname.
 
 TeamMem never holds the recording key and never decrypts audio; it only ever
 copies and hashes opaque bytes.
@@ -266,6 +268,12 @@ def _write_all(fd: int, data: bytes) -> None:
         offset += os.write(fd, data[offset:])
 
 
+def _zero_owned_descriptor(descriptor: int) -> None:
+    """Destroy bytes through an exclusive-created descriptor, never its name."""
+    os.ftruncate(descriptor, 0)
+    os.fsync(descriptor)
+
+
 def _copy_file(source: Path, destination: Path, *, directory_fd: int | None = None) -> int:
     """Copy opaque bytes into a new file and return its open, synced descriptor.
 
@@ -291,7 +299,10 @@ def _copy_file(source: Path, destination: Path, *, directory_fd: int | None = No
                     _write_all(fd, chunk)
             os.fsync(fd)
         except BaseException:
-            os.close(fd)
+            try:
+                _zero_owned_descriptor(fd)
+            finally:
+                os.close(fd)
             raise
     finally:
         os.close(source_fd)
@@ -388,26 +399,10 @@ class _AdoptedAudio:
             raise _Rejected("path_escape")
         _verified_audio_path(self.final_fd, self.final, store, vault)
 
-    def discard_created(self, *, remove_name: bool) -> None:
+    def discard_created(self) -> None:
         if not self.created:
             return
-        os.ftruncate(self.final_fd, 0)
-        os.fsync(self.final_fd)
-        if not remove_name:
-            return
-        adopted = os.fstat(self.final_fd)
-        target = self.final.name if self.revision_fd is not None else self.final
-        try:
-            current = os.stat(
-                target, dir_fd=self.revision_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        if (current.st_dev, current.st_ino) != (adopted.st_dev, adopted.st_ino):
-            return
-        if self.revision_fd is None:
-            os.close(self.final_fd)
-            self.final_fd = None
-        os.unlink(target, dir_fd=self.revision_fd)
+        _zero_owned_descriptor(self.final_fd)
 
     def close(self) -> None:
         for field in ("final_fd", "revision_fd", "occurrence_fd"):
@@ -425,8 +420,9 @@ def _stage_audio(
     """Publish the encrypted audio and describe it.
 
     The returned owner keeps the adopted file and managed directories open
-    until the store transaction commits. Only a file this call created may be
-    removed on failure; audio already present belongs to a stored revision.
+    until the store transaction commits. On failure, only the bytes reached
+    through that exclusive-created descriptor may be destroyed; audio already
+    present belongs to a stored revision and mutable names are never removed.
     """
     try:
         store = _physical_path(audio_store)
@@ -464,9 +460,11 @@ def _stage_audio(
             if digest != declared_sha or size != declared_bytes:
                 raise _Rejected("audio_conflict")
         else:
+            destination = final if os.name == "nt" else staging
             final_fd = _copy_file(
-                bundle.audio_path, staging, directory_fd=revision_fd)
+                bundle.audio_path, destination, directory_fd=revision_fd)
             owns_fd = True
+            created = os.name == "nt"
             if revision_fd is None:
                 _fsync_dir(directory)
             else:
@@ -474,44 +472,21 @@ def _stage_audio(
             digest, size = _digest_descriptor(final_fd)
             if digest != declared_sha or size != declared_bytes:
                 raise _Rejected("audio_hash_mismatch")
-            staging_identity = None
-            if os.name == "nt":
-                # Ordinary Windows descriptors do not share delete access, so
-                # close for the rename and bind the writable reopen below to
-                # the identity captured from the descriptor we created.
-                staging_identity = os.fstat(final_fd)
-                os.close(final_fd)
-                final_fd = None
-                owns_fd = False
-            if revision_fd is None:
-                os.replace(staging, final)
-            else:
-                os.replace(
-                    staging.name,
-                    final.name,
-                    src_dir_fd=revision_fd,
-                    dst_dir_fd=revision_fd,
-                )
-            created = True
-            if staging_identity is not None:
-                try:
-                    final_fd = os.open(
-                        final_name, os.O_RDWR | _FILE_FLAGS,
-                        dir_fd=revision_fd)
-                except OSError as error:
-                    raise _Rejected("path_escape") from error
-                current = os.fstat(final_fd)
-                if (current.st_dev, current.st_ino) != (
-                    staging_identity.st_dev, staging_identity.st_ino
-                ):
-                    os.close(final_fd)
-                    final_fd = None
-                    raise _Rejected("path_escape")
-                owns_fd = True
-            if revision_fd is None:
-                _fsync_dir(directory)
-            else:
-                os.fsync(revision_fd)
+            if os.name != "nt":
+                if revision_fd is None:
+                    os.replace(staging, final)
+                else:
+                    os.replace(
+                        staging.name,
+                        final.name,
+                        src_dir_fd=revision_fd,
+                        dst_dir_fd=revision_fd,
+                    )
+                created = True
+                if revision_fd is None:
+                    _fsync_dir(directory)
+                else:
+                    os.fsync(revision_fd)
             physical = _verified_audio_path(final_fd, final, store, vault)
         adopted = _AdoptedAudio(
             staged=StagedAudio(
@@ -526,22 +501,9 @@ def _stage_audio(
         )
         final_fd = occurrence_fd = revision_fd = None
         return adopted
-    except BaseException as error:
-        if isinstance(error, _Rejected):
-            if owns_fd and final_fd is not None:
-                os.ftruncate(final_fd, 0)
-                os.fsync(final_fd)
-        else:
-            if final_fd is not None:
-                os.close(final_fd)
-                final_fd = None
-            for path in (staging, final) if created else (staging,):
-                target = path.name if revision_fd is not None else path
-                try:
-                    os.unlink(target, dir_fd=revision_fd)
-                except FileNotFoundError:
-                    pass
-        _prune_empty(directory, store)
+    except BaseException:
+        if owns_fd and final_fd is not None:
+            _zero_owned_descriptor(final_fd)
         raise
     finally:
         for descriptor in (final_fd, revision_fd, occurrence_fd):
@@ -556,15 +518,14 @@ def _discard_staged(
     *,
     guard_refused: bool = False,
 ) -> None:
-    """Remove audio this run staged, unless a database row now references it."""
+    """Destroy created audio bytes unless a database row now references them."""
     if not adopted.created:
         return
     if not guard_refused:
         for row in list_meeting_revisions(conn, bundle.occurrence_id):
             if row["revision"] == bundle.revision:
                 return                                      # the revision landed after all
-    adopted.discard_created(remove_name=not guard_refused)
-    _prune_empty(adopted.final.parent, adopted.final.parents[2])
+    adopted.discard_created()
 
 
 # --- archive and quarantine -------------------------------------------------

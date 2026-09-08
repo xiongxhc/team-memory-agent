@@ -334,7 +334,7 @@ def test_lower_revision_after_a_higher_one_is_quarantined(tmp_path):
     assert get_meeting(conn, higher["occurrence_id"])["revision"] == 5
     assert [r["revision"] for r in list_meeting_revisions(conn, higher["occurrence_id"])] == [5]
     assert (tree.quarantine / occurrence_path_segment(higher["occurrence_id"]) / "4").is_dir()
-    assert not _audio_file(tree, lower).exists()          # nothing durable was staged for it
+    assert _audio_file(tree, lower).stat().st_size == 0   # only safe residue remains
 
 
 # --- invalid bundles --------------------------------------------------------
@@ -701,6 +701,50 @@ def test_cleanup_does_not_unlink_a_replacement_installed_at_removal(
     assert residue.stat().st_size == 0
 
 
+def test_store_failure_cleanup_does_not_unlink_a_replacement_installed_at_removal(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    write_meeting_bundle(tree.inbox, payload)
+    managed = _audio_file(tree, payload)
+    zeroed = managed.with_name("zeroed-adopted.enc")
+    replacement = b"replacement installed during store-failure cleanup"
+
+    from teammem import meeting_importer
+
+    real_unlink = os.unlink
+    swapped = False
+
+    def reject_store(*args, **kwargs):
+        raise meeting_importer.MeetingStoreError("forced store refusal")
+
+    def replace_at_removal(path, *args, **kwargs):
+        nonlocal swapped
+        if (
+            Path(path).name == "audio.enc"
+            and kwargs.get("dir_fd") is not None
+            and not swapped
+        ):
+            managed.rename(zeroed)
+            managed.write_bytes(replacement)
+            swapped = True
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(meeting_importer, "import_meeting_revision", reject_store)
+    monkeypatch.setattr(meeting_importer.os, "unlink", replace_at_removal)
+
+    result = _run(conn, tree)
+
+    assert _outcomes(result) == [("quarantined", "store_rejected")]
+    assert list_meetings(conn) == []
+    replacement_after = managed.read_bytes() if managed.exists() else None
+    assert not swapped or replacement_after == replacement
+    residue = zeroed if swapped else managed
+    assert residue.stat().st_size == 0
+
+
 def test_preowned_file_substituted_after_rename_is_never_truncated(
     tmp_path, monkeypatch
 ):
@@ -805,13 +849,16 @@ class _PatchedOS:
         return os.write(fd, data)
 
 
-class _WindowsRenameOS:
-    """Model Windows refusing a rename while its created file is open."""
+class _WindowsCustodyAttackOS:
+    """Move created bytes if Windows custody is released before the store call."""
 
     name = "nt"
 
-    def __init__(self):
-        self._created = set()
+    def __init__(self, escaped: Path):
+        self.escaped = escaped
+        self.created = {}
+        self.store_started = False
+        self.attacked = False
 
     def __getattr__(self, name):
         return getattr(os, name)
@@ -819,39 +866,115 @@ class _WindowsRenameOS:
     def open(self, path, flags, *args, **kwargs):
         descriptor = os.open(path, flags, *args, **kwargs)
         if flags & os.O_EXCL:
-            self._created.add(descriptor)
+            self.created[descriptor] = Path(path)
         return descriptor
 
     def close(self, descriptor):
-        self._created.discard(descriptor)
-        return os.close(descriptor)
+        created = self.created.pop(descriptor, None)
+        result = os.close(descriptor)
+        if created is not None and not self.store_started:
+            created.rename(self.escaped)
+            created.write_bytes(b"preowned substitute")
+            self.attacked = True
+        return result
 
     def replace(self, source, destination, *args, **kwargs):
-        if self._created:
+        if self.created:
             raise PermissionError(errno.EACCES, "open file cannot be renamed")
         return os.replace(source, destination, *args, **kwargs)
 
 
-def test_windows_fallback_revalidates_ownership_after_the_rename(tmp_path, monkeypatch):
+def test_windows_keeps_the_exclusive_created_inode_through_the_store_commit(
+    tmp_path, monkeypatch
+):
     conn = _db(tmp_path)
     tree = _Tree(tmp_path)
     payload = _payload()
-    write_meeting_bundle(tree.inbox, payload)
+    source = write_meeting_bundle(tree.inbox, payload) / "audio.enc"
+    source_bytes = source.read_bytes()
+    escaped = tmp_path / "escaped-created-audio.enc"
 
     from teammem import meeting_importer
 
-    monkeypatch.setattr(meeting_importer, "os", _WindowsRenameOS())
-    try:
-        result = _run(conn, tree)
-    except PermissionError:
-        result = None
+    windows = _WindowsCustodyAttackOS(escaped)
+    real_import = meeting_importer.import_meeting_revision
 
-    assert result is not None
+    def mark_store_started(*args, **kwargs):
+        windows.store_started = True
+        return real_import(*args, **kwargs)
+
+    monkeypatch.setattr(meeting_importer, "os", windows)
+    monkeypatch.setattr(meeting_importer, "import_meeting_revision", mark_store_started)
+
+    result = _run(conn, tree)
+
     assert _outcomes(result) == [("accepted", "ok")]
-    assert _audio_file(tree, payload).stat().st_size == payload["audio"]["bytes"]
+    assert windows.attacked is False
+    assert not escaped.exists()
+    assert _audio_file(tree, payload).read_bytes() == source_bytes
 
 
-def test_disk_full_during_the_audio_copy_leaves_no_row_and_no_final_file(tmp_path, monkeypatch):
+class _StagingCleanupRaceOS:
+    """Replace a staging name as an injected post-copy fsync failure fires."""
+
+    def __init__(self, directory: Path, escaped: Path, replacement: bytes):
+        self.directory = directory
+        self.escaped = escaped
+        self.replacement = replacement
+        self.fsync_calls = 0
+        self.staging = None
+        self.swapped = False
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+    def fsync(self, descriptor):
+        self.fsync_calls += 1
+        if self.fsync_calls == 2:
+            [self.staging] = [
+                path for path in self.directory.iterdir()
+                if path.name.startswith(".audio.enc.")
+            ]
+            self.staging.rename(self.escaped)
+            self.staging.write_bytes(self.replacement)
+            self.swapped = True
+            raise OSError(errno.EIO, "injected directory fsync failure")
+        return os.fsync(descriptor)
+
+
+def test_environmental_cleanup_zeroes_only_the_held_staging_inode(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    directory = write_meeting_bundle(tree.inbox, payload)
+    revision = audio_revision_dir(
+        tree.audio, payload["occurrence_id"], payload["revision"])
+    escaped = tmp_path / "escaped-staging.enc"
+    replacement = b"replacement installed after the staging copy"
+
+    from teammem import meeting_importer
+
+    raced_os = _StagingCleanupRaceOS(revision, escaped, replacement)
+    monkeypatch.setattr(meeting_importer, "os", raced_os)
+
+    with pytest.raises(OSError) as excinfo:
+        _run(conn, tree)
+    assert excinfo.value.errno == errno.EIO
+
+    monkeypatch.undo()
+    assert raced_os.swapped is True
+    assert list_meetings(conn) == []
+    assert escaped.stat().st_size == 0
+    assert raced_os.staging.read_bytes() == replacement
+    assert (directory / "READY").is_file()
+    assert not tree.quarantine.exists()
+
+
+def test_disk_full_during_the_audio_copy_leaves_only_a_zero_byte_staging_residue(
+    tmp_path, monkeypatch
+):
     conn = _db(tmp_path)
     tree = _Tree(tmp_path)
     payload = _payload()
@@ -869,14 +992,16 @@ def test_disk_full_during_the_audio_copy_leaves_no_row_and_no_final_file(tmp_pat
     monkeypatch.undo()
     assert list_meetings(conn) == []
     assert not _audio_file(tree, payload).exists()                  # no final-named audio
-    assert _files(tree.audio) == []                                 # and no staging leftovers
+    [residue] = _files(tree.audio)
+    assert residue.name.startswith(".audio.enc.")
+    assert residue.stat().st_size == 0                              # only owned bytes were changed
     assert (directory / "READY").is_file()                          # the bundle stays for a retry
     assert not tree.quarantine.exists()               # ENOSPC is not the producer's fault
 
     assert _run(conn, tree).accepted == 1                           # a retry then succeeds
 
 
-def test_crash_before_db_commit_removes_the_staged_audio_and_a_rescan_succeeds(
+def test_crash_before_db_commit_leaves_only_a_zero_byte_final_residue(
     tmp_path, monkeypatch
 ):
     conn = _db(tmp_path)
@@ -900,15 +1025,9 @@ def test_crash_before_db_commit_removes_the_staged_audio_and_a_rescan_succeeds(
 
     assert observed["staged"] is True
     assert list_meetings(conn) == []
-    assert not observed["path"].exists()                           # the staged file was cleaned up
-    assert _files(tree.audio) == []
+    assert observed["path"].stat().st_size == 0                     # no ciphertext remains
+    assert _files(tree.audio) == [observed["path"]]                 # explicit safe residue
     assert (directory / "READY").is_file() and not tree.archive.exists()
-
-    monkeypatch.undo()
-    result = _run(conn, tree)                                       # the rescan is clean
-    assert result.accepted == 1
-    assert get_meeting(conn, payload["occurrence_id"]) is not None
-    assert observed["path"].is_file()
 
 
 def test_a_store_rejection_removes_only_the_audio_it_did_not_already_own(tmp_path):
