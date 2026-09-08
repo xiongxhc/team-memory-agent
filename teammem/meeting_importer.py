@@ -29,8 +29,9 @@ writing it, so it is skipped silently and left for the next scan.
 Environmental faults are not the producer's fault. A failed copy (a full disk)
 or an unexpected crash in the store destroys bytes through the held created
 descriptor, leaves the bundle in the inbox, and re-raises so the run stops
-instead of quarantining a bundle that was never wrong. A zero-byte name may
-remain because cleanup never trusts a mutable pathname.
+instead of quarantining a bundle that was never wrong. Windows marks the exact
+held inode for deletion through its native handle; POSIX may retain a zero-byte
+name because cleanup never trusts a mutable pathname.
 
 TeamMem never holds the recording key and never decrypts audio; it only ever
 copies and hashes opaque bytes.
@@ -274,6 +275,108 @@ def _zero_owned_descriptor(descriptor: int) -> None:
     os.fsync(descriptor)
 
 
+def _windows_file_libraries():
+    """Load the Windows APIs lazily so importing TeamMem stays portable."""
+    import ctypes
+    import msvcrt
+
+    return ctypes, ctypes.WinDLL("kernel32", use_last_error=True), msvcrt
+
+
+def _open_windows_file(path: Path, disposition: int) -> int:
+    """Open a renameable file and transfer its native handle to one fd."""
+    ctypes, kernel32, msvcrt = _windows_file_libraries()
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x80000000 | 0x40000000 | 0x00010000,  # GENERIC_READ | WRITE | DELETE
+        0x00000001 | 0x00000002 | 0x00000004,  # share READ | WRITE | DELETE
+        None, disposition,
+        0x00000080 | 0x00200000, None,          # NORMAL | OPEN_REPARSE_POINT
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        mapped = (
+            errno.EEXIST if error in {80, 183}
+            else errno.ENOENT if error in {2, 3}
+            else error
+        )
+        raise OSError(mapped, "CreateFileW failed", str(path))
+    try:
+        return msvcrt.open_osfhandle(
+            handle, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _open_windows_exclusive(path: Path) -> int:
+    return _open_windows_file(path, 1)           # CREATE_NEW (O_EXCL)
+
+
+def _open_windows_existing(path: Path) -> int:
+    return _open_windows_file(path, 3)           # OPEN_EXISTING
+
+
+def _delete_windows_owned_descriptor(descriptor: int) -> None:
+    """Mark the fd's exact Windows file object for deletion when it closes."""
+    ctypes, kernel32, msvcrt = _windows_file_libraries()
+    kernel32.SetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+    ]
+    kernel32.SetFileInformationByHandle.restype = ctypes.c_int
+    info = ctypes.c_ubyte(1)
+    handle = msvcrt.get_osfhandle(descriptor)     # borrowed: the fd remains sole owner
+    if not kernel32.SetFileInformationByHandle(
+        handle, 4, ctypes.cast(ctypes.byref(info), ctypes.c_void_p),
+        ctypes.sizeof(info),                     # FileDispositionInfo
+    ):
+        raise OSError(ctypes.get_last_error(), "SetFileInformationByHandle failed")
+
+
+def _discard_owned_descriptor(descriptor: int) -> None:
+    _zero_owned_descriptor(descriptor)
+    if os.name == "nt":
+        _delete_windows_owned_descriptor(descriptor)
+
+
+def _discard_windows_staging_residues(directory: Path) -> None:
+    """Destroy only regular, single-link staging inodes through opened handles."""
+    if os.name != "nt":
+        return
+    prefix = f".{AUDIO_FILENAME}."
+    try:
+        paths = sorted(directory.iterdir())
+    except FileNotFoundError:
+        return
+    for path in paths:
+        if not path.name.startswith(prefix):
+            continue
+        if path.is_symlink():
+            raise OSError(errno.ELOOP, "meeting audio staging entry is a link", path)
+        try:
+            descriptor = _open_windows_existing(path)
+        except FileNotFoundError:
+            continue
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or getattr(metadata, "st_reparse_tag", 0)
+                or metadata.st_nlink != 1
+            ):
+                raise OSError(errno.EPERM, "meeting audio staging entry is not owned", path)
+            _discard_owned_descriptor(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def _copy_file(source: Path, destination: Path, *, directory_fd: int | None = None) -> int:
     """Copy opaque bytes into a new file and return its open, synced descriptor.
 
@@ -286,13 +389,18 @@ def _copy_file(source: Path, destination: Path, *, directory_fd: int | None = No
     """
     source_fd = os.open(source, os.O_RDONLY | _NOFOLLOW)
     try:
-        target = destination.name if directory_fd is not None else destination
-        fd = os.open(
-            target,
-            os.O_RDWR | os.O_CREAT | os.O_EXCL | _FILE_FLAGS,
-            0o600,
-            dir_fd=directory_fd,
-        )
+        if os.name == "nt":
+            if directory_fd is not None:
+                raise RuntimeError("Windows staging does not accept a directory fd")
+            fd = _open_windows_exclusive(destination)
+        else:
+            target = destination.name if directory_fd is not None else destination
+            fd = os.open(
+                target,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | _FILE_FLAGS,
+                0o600,
+                dir_fd=directory_fd,
+            )
         try:
             with os.fdopen(source_fd, "rb", closefd=False) as handle:
                 while chunk := handle.read(_COPY_CHUNK):
@@ -300,7 +408,7 @@ def _copy_file(source: Path, destination: Path, *, directory_fd: int | None = No
             os.fsync(fd)
         except BaseException:
             try:
-                _zero_owned_descriptor(fd)
+                _discard_owned_descriptor(fd)
             finally:
                 os.close(fd)
             raise
@@ -402,7 +510,7 @@ class _AdoptedAudio:
     def discard_created(self) -> None:
         if not self.created:
             return
-        _zero_owned_descriptor(self.final_fd)
+        _discard_owned_descriptor(self.final_fd)
 
     def close(self) -> None:
         for field in ("final_fd", "revision_fd", "occurrence_fd"):
@@ -460,11 +568,9 @@ def _stage_audio(
             if digest != declared_sha or size != declared_bytes:
                 raise _Rejected("audio_conflict")
         else:
-            destination = final if os.name == "nt" else staging
             final_fd = _copy_file(
-                bundle.audio_path, destination, directory_fd=revision_fd)
+                bundle.audio_path, staging, directory_fd=revision_fd)
             owns_fd = True
-            created = os.name == "nt"
             if revision_fd is None:
                 _fsync_dir(directory)
             else:
@@ -472,21 +578,20 @@ def _stage_audio(
             digest, size = _digest_descriptor(final_fd)
             if digest != declared_sha or size != declared_bytes:
                 raise _Rejected("audio_hash_mismatch")
-            if os.name != "nt":
-                if revision_fd is None:
-                    os.replace(staging, final)
-                else:
-                    os.replace(
-                        staging.name,
-                        final.name,
-                        src_dir_fd=revision_fd,
-                        dst_dir_fd=revision_fd,
-                    )
-                created = True
-                if revision_fd is None:
-                    _fsync_dir(directory)
-                else:
-                    os.fsync(revision_fd)
+            if revision_fd is None:
+                os.replace(staging, final)
+            else:
+                os.replace(
+                    staging.name,
+                    final.name,
+                    src_dir_fd=revision_fd,
+                    dst_dir_fd=revision_fd,
+                )
+            created = True
+            if revision_fd is None:
+                _fsync_dir(directory)
+            else:
+                os.fsync(revision_fd)
             physical = _verified_audio_path(final_fd, final, store, vault)
         adopted = _AdoptedAudio(
             staged=StagedAudio(
@@ -503,7 +608,7 @@ def _stage_audio(
         return adopted
     except BaseException:
         if owns_fd and final_fd is not None:
-            _zero_owned_descriptor(final_fd)
+            _discard_owned_descriptor(final_fd)
         raise
     finally:
         for descriptor in (final_fd, revision_fd, occurrence_fd):

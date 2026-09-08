@@ -36,7 +36,13 @@ from .meeting_bundles import AUDIO_FILENAME, occurrence_path_segment, short_occu
 # spelling and where a prune must stop are each defined once, by the importer
 # that wrote the files. Re-deriving any of them here is how two answers to one
 # question drift apart.
-from .meeting_importer import _digest_file, _prune_empty, _write_atomic, audio_revision_dir
+from .meeting_importer import (
+    _digest_file,
+    _discard_windows_staging_residues,
+    _prune_empty,
+    _write_atomic,
+    audio_revision_dir,
+)
 from .meeting_store import (
     MEETING_AUDIO_WARN_DAYS,
     audio_due_for_expiry,
@@ -213,6 +219,11 @@ def _expire_one(
         failed.append(RetentionFailure(*key, "unlink", str(error)))
         return
     if inside:
+        try:
+            _discard_windows_staging_residues(path.parent)
+        except OSError as error:
+            failed.append(RetentionFailure(*key, "unlink", str(error)))
+            return
         # Pruning walks up until it reaches the store root. A path from an older
         # store has no such stop, so its empty directories are left to the
         # operator who moved them rather than climbed by this job.

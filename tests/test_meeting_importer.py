@@ -10,9 +10,12 @@ import errno
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -23,6 +26,7 @@ from teammem.meeting_importer import (
     audio_revision_dir,
     import_meeting_inbox,
 )
+from teammem.meeting_retention import expire_meeting_audio
 from teammem.meeting_store import get_meeting, list_meeting_revisions, list_meetings
 from teammem.store import open_db
 from tests.test_meeting_bundles import write_meeting_bundle
@@ -859,6 +863,7 @@ class _WindowsCustodyAttackOS:
         self.created = {}
         self.store_started = False
         self.attacked = False
+        self.renamed_while_open = False
 
     def __getattr__(self, name):
         return getattr(os, name)
@@ -867,6 +872,14 @@ class _WindowsCustodyAttackOS:
         descriptor = os.open(path, flags, *args, **kwargs)
         if flags & os.O_EXCL:
             self.created[descriptor] = Path(path)
+        return descriptor
+
+    def open_exclusive(self, path):
+        return self.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+
+    def open_existing(self, path):
+        descriptor = os.open(path, os.O_RDWR)
+        self.created[descriptor] = Path(path)
         return descriptor
 
     def close(self, descriptor):
@@ -879,9 +892,28 @@ class _WindowsCustodyAttackOS:
         return result
 
     def replace(self, source, destination, *args, **kwargs):
-        if self.created:
-            raise PermissionError(errno.EACCES, "open file cannot be renamed")
-        return os.replace(source, destination, *args, **kwargs)
+        self.renamed_while_open |= bool(self.created)
+        result = os.replace(source, destination, *args, **kwargs)
+        source_path = Path(source)
+        destination_path = Path(destination)
+        for descriptor, created in tuple(self.created.items()):
+            if created == source_path:
+                self.created[descriptor] = destination_path
+        return result
+
+    def delete_owned(self, descriptor):
+        created = self.created.pop(descriptor)
+        created.unlink()
+
+
+def _force_windows(monkeypatch, module, windows):
+    monkeypatch.setattr(module, "os", windows)
+    monkeypatch.setattr(
+        module, "_open_windows_exclusive", windows.open_exclusive)
+    monkeypatch.setattr(
+        module, "_open_windows_existing", windows.open_existing)
+    monkeypatch.setattr(
+        module, "_delete_windows_owned_descriptor", windows.delete_owned)
 
 
 def test_windows_keeps_the_exclusive_created_inode_through_the_store_commit(
@@ -903,15 +935,238 @@ def test_windows_keeps_the_exclusive_created_inode_through_the_store_commit(
         windows.store_started = True
         return real_import(*args, **kwargs)
 
-    monkeypatch.setattr(meeting_importer, "os", windows)
+    _force_windows(monkeypatch, meeting_importer, windows)
     monkeypatch.setattr(meeting_importer, "import_meeting_revision", mark_store_started)
 
     result = _run(conn, tree)
 
     assert _outcomes(result) == [("accepted", "ok")]
+    assert windows.renamed_while_open is True
     assert windows.attacked is False
     assert not escaped.exists()
     assert _audio_file(tree, payload).read_bytes() == source_bytes
+
+
+def _native_windows_fakes(monkeypatch, module, *, failure=None):
+    import ctypes
+
+    kernel32 = SimpleNamespace(
+        CreateFileW=Mock(return_value=0x1234),
+        CloseHandle=Mock(return_value=1),
+        SetFileInformationByHandle=Mock(return_value=1),
+    )
+    msvcrt = SimpleNamespace(
+        open_osfhandle=Mock(return_value=71, side_effect=failure),
+        get_osfhandle=Mock(return_value=0x1234),
+    )
+    monkeypatch.setattr(
+        module, "_windows_file_libraries", lambda: (ctypes, kernel32, msvcrt))
+    return ctypes, kernel32, msvcrt
+
+
+def test_windows_staging_open_requests_atomic_rename_sharing_and_transfers_handle(
+    tmp_path, monkeypatch
+):
+    from teammem import meeting_importer
+
+    _ctypes, kernel32, msvcrt = _native_windows_fakes(
+        monkeypatch, meeting_importer)
+
+    descriptor = meeting_importer._open_windows_exclusive(tmp_path / ".audio.enc.token")
+
+    assert descriptor == 71
+    assert kernel32.CreateFileW.call_args_list == [call(
+        str(tmp_path / ".audio.enc.token"),
+        0x80000000 | 0x40000000 | 0x00010000,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        1,
+        0x00000080 | 0x00200000,
+        None,
+    )]
+    assert msvcrt.open_osfhandle.call_args_list == [
+        call(0x1234, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    ]
+    kernel32.CloseHandle.assert_not_called()
+
+
+def test_windows_owned_descriptor_deletion_borrows_the_transferred_handle(
+    monkeypatch
+):
+    from teammem import meeting_importer
+
+    ctypes, kernel32, msvcrt = _native_windows_fakes(
+        monkeypatch, meeting_importer)
+    observed = {}
+
+    def capture_disposition(_handle, _information_class, info, _size):
+        observed["delete_file"] = ctypes.cast(
+            info, ctypes.POINTER(ctypes.c_ubyte)).contents.value
+        return 1
+
+    kernel32.SetFileInformationByHandle.side_effect = capture_disposition
+
+    meeting_importer._delete_windows_owned_descriptor(71)
+
+    msvcrt.get_osfhandle.assert_called_once_with(71)
+    [(handle, information_class, info, size)] = (
+        [item.args for item in kernel32.SetFileInformationByHandle.call_args_list]
+    )
+    assert (handle, information_class, size) == (
+        0x1234, 4, ctypes.sizeof(ctypes.c_ubyte))
+    assert info.value is not None and observed == {"delete_file": 1}
+    kernel32.CloseHandle.assert_not_called()
+
+
+def test_windows_staging_open_closes_the_os_handle_once_if_fd_transfer_fails(
+    tmp_path, monkeypatch
+):
+    from teammem import meeting_importer
+
+    _ctypes, kernel32, _msvcrt = _native_windows_fakes(
+        monkeypatch,
+        meeting_importer,
+        failure=OSError(errno.EMFILE, "too many descriptors"),
+    )
+
+    with pytest.raises(OSError) as excinfo:
+        meeting_importer._open_windows_exclusive(tmp_path / ".audio.enc.token")
+
+    assert excinfo.value.errno == errno.EMFILE
+    kernel32.CloseHandle.assert_called_once_with(0x1234)
+
+
+def test_windows_staging_cleanup_tolerates_a_removed_revision_directory(
+    tmp_path, monkeypatch
+):
+    from teammem import meeting_importer
+
+    windows = _WindowsCustodyAttackOS(tmp_path / "must-not-escape.enc")
+    _force_windows(monkeypatch, meeting_importer, windows)
+
+    meeting_importer._discard_windows_staging_residues(tmp_path / "missing")
+
+
+def test_handled_windows_store_failure_can_retry_without_a_final_audio_conflict(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    source = write_meeting_bundle(tree.inbox, payload) / "audio.enc"
+    source_bytes = source.read_bytes()
+
+    from teammem import meeting_importer
+
+    windows = _WindowsCustodyAttackOS(tmp_path / "must-not-escape.enc")
+    real_import = meeting_importer.import_meeting_revision
+
+    def fail_store(*args, **kwargs):
+        raise RuntimeError("injected handled store failure")
+
+    _force_windows(monkeypatch, meeting_importer, windows)
+    monkeypatch.setattr(meeting_importer, "import_meeting_revision", fail_store)
+
+    with pytest.raises(RuntimeError, match="injected handled store failure"):
+        _run(conn, tree)
+    assert list_meetings(conn) == []
+    assert _files(tree.audio) == []
+    assert (source.parent / "READY").is_file()
+
+    def succeed_store(*args, **kwargs):
+        windows.store_started = True
+        return real_import(*args, **kwargs)
+
+    monkeypatch.setattr(meeting_importer, "import_meeting_revision", succeed_store)
+    result = _run(conn, tree)
+
+    assert _outcomes(result) == [("accepted", "ok")]
+    assert _audio_file(tree, payload).read_bytes() == source_bytes
+    assert get_meeting(conn, payload["occurrence_id"])["revision"] == payload["revision"]
+    assert [path for path in _files(tree.audio) if path.name != "audio.enc"] == []
+
+
+class _WindowsCrashDuringCopyOS(_WindowsCustodyAttackOS):
+    def __init__(self):
+        super().__init__(Path("unused-escape"))
+        self.write_calls = 0
+
+    def write(self, descriptor, data):
+        self.write_calls += 1
+        if self.write_calls == 2:
+            os._exit(23)
+        return os.write(descriptor, data)
+
+
+def test_abrupt_windows_copy_exit_exposes_only_staging_and_a_retry_succeeds(
+    tmp_path, monkeypatch
+):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("abrupt-exit harness requires fork; native Windows is not claimed")
+    db_path = tmp_path / "ledger.db"
+    _db(tmp_path).close()
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    source = write_meeting_bundle(tree.inbox, payload) / "audio.enc"
+    source_bytes = source.read_bytes()
+
+    def crash_mid_copy():
+        from teammem import meeting_importer
+
+        windows = _WindowsCrashDuringCopyOS()
+        meeting_importer.os = windows
+        meeting_importer._COPY_CHUNK = 512
+        meeting_importer._open_windows_exclusive = windows.open_exclusive
+        connection = open_db(db_path)
+        import_meeting_inbox(
+            connection,
+            *tree.paths(),
+            vault_dir=tree.vault,
+            now=NOW,
+        )
+
+    process = multiprocessing.get_context("fork").Process(target=crash_mid_copy)
+    process.start()
+    process.join(10)
+    assert process.exitcode == 23
+
+    conn = open_db(db_path)
+    final = _audio_file(tree, payload)
+    staging = [path for path in _files(tree.audio) if path.name.startswith(".audio.enc.")]
+    assert not final.exists()
+    assert len(staging) == 1 and staging[0].stat().st_size == 512
+    assert list_meetings(conn) == []
+
+    from teammem import meeting_importer
+
+    windows = _WindowsCustodyAttackOS(tmp_path / "must-not-escape.enc")
+    _force_windows(monkeypatch, meeting_importer, windows)
+
+    real_import = meeting_importer.import_meeting_revision
+
+    def mark_store_started(*args, **kwargs):
+        windows.store_started = True
+        return real_import(*args, **kwargs)
+
+    monkeypatch.setattr(meeting_importer, "import_meeting_revision", mark_store_started)
+
+    result = _run(conn, tree)
+
+    assert _outcomes(result) == [("accepted", "ok")]
+    assert final.read_bytes() == source_bytes
+    assert get_meeting(conn, payload["occurrence_id"])["revision"] == payload["revision"]
+
+    expired = expire_meeting_audio(
+        conn,
+        tree.audio,
+        now="2026-09-17T00:00:00Z",
+        alert_path=lambda _occurrence_id: tmp_path / "unused-alert.json",
+    )
+
+    assert expired.deleted == ((payload["occurrence_id"], payload["revision"]),)
+    assert expired.failed == ()
+    assert not final.exists()
+    assert not staging[0].exists()
 
 
 class _StagingCleanupRaceOS:
