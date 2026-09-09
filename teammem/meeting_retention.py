@@ -99,8 +99,8 @@ def _instant(value: str, field: str) -> datetime:
 
 
 def _stamp(moment: datetime) -> str:
-    """The whole-second UTC spelling every retention column already uses."""
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    """The fixed-width UTC microsecond spelling retention audit columns use."""
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def expire_meeting_audio(

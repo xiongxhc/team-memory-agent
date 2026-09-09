@@ -1333,7 +1333,7 @@ def test_alias_store_expiry_removes_final_and_windows_staging_before_marking(
     assert not stored.exists()
     assert not staging.exists()
     assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == (
-        "2026-09-17T00:00:00Z"
+        "2026-09-17T00:00:00.000000Z"
     )
 
 

@@ -447,7 +447,11 @@ expiry all stay queryable, with a deletion timestamp beside them. TeamMem never
 holds the recording key and never decrypts, so deleted bytes cannot be
 regenerated and the deadline is exact in both directions. Every revision expires
 on its own schedule, and two meetings with identical recordings are stored and
-deleted separately.
+deleted separately. TeamMem writes retention deadlines and new deletion audit
+timestamps as fixed-width UTC microseconds (for example,
+`2026-09-16T14:52:00.000000Z`). A deletion timestamp records when deletion
+actually happened; migration preserves that evidence instead of rewriting it to
+the deadline.
 
 When a meeting's current transcript is still incomplete and its recording is
 within `TEAMMEM_MEETING_WARN_DAYS` (default 3, `0` to warn about nothing) of

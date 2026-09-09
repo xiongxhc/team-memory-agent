@@ -163,6 +163,67 @@ def test_migration_preserves_populated_events_and_summaries(tmp_path):
     assert _counts(conn)["meetings"] == 0            # migration adds structure, not rows
 
 
+def _legacy_fractional_expiry_db(tmp_path: Path) -> Path:
+    """Build a populated database whose expiry values predate fractional retention."""
+    path = tmp_path / "legacy-fractional.db"
+    conn = open_db(path)
+    earlier = _payload(COMPLETE)
+    earlier["ended_at"] = "2026-09-02T14:52:00.125000Z"
+    _import(conn, _bundle(tmp_path, earlier, name="revision-3"))
+    later = _payload(COMPLETE)
+    later["revision"] = 4
+    later["ended_at"] = "2026-09-02T14:52:00.875000Z"
+    _import(conn, _bundle(tmp_path, later, name="revision-4"))
+    conn.execute(
+        "UPDATE meeting_audio SET audio_expires_at = '2026-09-16T14:52:00Z'"
+    )
+    conn.execute(
+        "UPDATE meeting_audio SET deleted_at = '2026-09-16T15:00:00.333333Z' "
+        "WHERE revision = 3"
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_migration_recomputes_each_revisions_fractional_expiry(tmp_path):
+    path = _legacy_fractional_expiry_db(tmp_path)
+
+    conn = open_db(path)
+
+    assert conn.execute(
+        "SELECT revision, audio_expires_at, deleted_at FROM meeting_audio ORDER BY revision"
+    ).fetchall() == [
+        (3, "2026-09-16T14:52:00.125000Z", "2026-09-16T15:00:00.333333Z"),
+        (4, "2026-09-16T14:52:00.875000Z", None),
+    ]
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_meeting_audio_expiry'"
+    ).fetchone() == ("idx_meeting_audio_expiry",)
+
+
+def test_fractional_expiry_migration_is_idempotent_and_leaves_import_ready(tmp_path):
+    path = _legacy_fractional_expiry_db(tmp_path)
+    conn = open_db(path)
+    migrated = conn.execute(
+        "SELECT revision, audio_expires_at, deleted_at FROM meeting_audio ORDER BY revision"
+    ).fetchall()
+
+    migrate_meetings(conn)
+
+    assert conn.execute(
+        "SELECT revision, audio_expires_at, deleted_at FROM meeting_audio ORDER BY revision"
+    ).fetchall() == migrated
+    assert conn.in_transaction is False
+    newest = _payload(COMPLETE)
+    newest["revision"] = 5
+    newest["ended_at"] = "2026-09-02T14:52:00.999999Z"
+    result = _import(conn, _bundle(tmp_path, newest, name="revision-5"))
+    assert result.status == "imported"
+    assert result.audio_expires_at == "2026-09-16T14:52:00.999999Z"
+
+
 # --- import: the happy path -------------------------------------------------
 
 
@@ -573,8 +634,10 @@ def test_audio_expires_fourteen_days_after_ended_at_not_when_the_payload_asks(tm
     result = _import(conn, bundle)
 
     ended = datetime(2026, 9, 2, 14, 52, tzinfo=timezone.utc)
-    expected = (ended + timedelta(days=MEETING_AUDIO_RETENTION_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    assert expected == "2026-09-16T14:52:00Z"
+    expected = (ended + timedelta(days=MEETING_AUDIO_RETENTION_DAYS)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    assert expected == "2026-09-16T14:52:00.000000Z"
     assert result.audio_expires_at == expected
     stored, declared = conn.execute(
         "SELECT audio_expires_at, declared_expires_at FROM meeting_audio").fetchone()
@@ -584,8 +647,36 @@ def test_audio_expires_fourteen_days_after_ended_at_not_when_the_payload_asks(tm
 
 
 def test_audio_expires_at_helper_matches_the_stored_value(tmp_path):
-    assert audio_expires_at("2026-09-02T14:52:00Z") == "2026-09-16T14:52:00Z"
-    assert audio_expires_at("2026-09-02T14:52:00.500000Z") == "2026-09-16T14:52:00Z"
+    assert audio_expires_at("2026-09-02T14:52:00Z") == "2026-09-16T14:52:00.000000Z"
+    assert audio_expires_at("2026-09-02T14:52:00.500000Z") == (
+        "2026-09-16T14:52:00.500000Z"
+    )
+
+
+def test_audio_due_for_expiry_uses_the_exact_fractional_boundary_for_every_revision(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    earlier = _payload(COMPLETE)
+    earlier["ended_at"] = "2026-09-02T14:52:00.500000Z"
+    earlier_bundle = _bundle(tmp_path, earlier, name="revision-3")
+    _import(conn, earlier_bundle)
+    later = _payload(COMPLETE)
+    later["revision"] = 4
+    later["ended_at"] = "2026-09-02T14:52:00.750000Z"
+    later_bundle = _bundle(tmp_path, later, name="revision-4")
+    _import(conn, later_bundle)
+
+    assert audio_due_for_expiry(conn, "2026-09-16T14:52:00.499999Z") == []
+    at = audio_due_for_expiry(conn, "2026-09-16T14:52:00.500000Z")
+    assert [(row["revision"], row["audio_expires_at"], row["is_current"]) for row in at] == [
+        (3, "2026-09-16T14:52:00.500000Z", False)
+    ]
+    after = audio_due_for_expiry(conn, "2026-09-16T14:52:00.500001Z")
+    assert [(row["revision"], row["is_current"]) for row in after] == [(3, False)]
+    current = audio_due_for_expiry(conn, "2026-09-16T14:52:00.750000Z")
+    assert [(row["revision"], row["is_current"]) for row in current] == [
+        (3, False),
+        (4, True),
+    ]
 
 
 def test_audio_due_for_expiry_lists_only_rows_at_or_past_their_expiry(tmp_path):
@@ -599,11 +690,11 @@ def test_audio_due_for_expiry_lists_only_rows_at_or_past_their_expiry(tmp_path):
     due = audio_due_for_expiry(conn, "2026-09-16T10:00:00Z")
     assert [(r["occurrence_id"], r["revision"]) for r in due] == [(minimal.occurrence_id, 1)]
     assert due[0]["stored_path"].endswith("audio.enc")
-    assert due[0]["audio_expires_at"] == "2026-09-16T09:22:00Z"
+    assert due[0]["audio_expires_at"] == "2026-09-16T09:22:00.000000Z"
 
     both = audio_due_for_expiry(conn, "2026-09-17T00:00:00Z")
     assert [r["audio_expires_at"] for r in both] == [
-        "2026-09-16T09:22:00Z", "2026-09-16T14:52:00Z"]
+        "2026-09-16T09:22:00.000000Z", "2026-09-16T14:52:00.000000Z"]
 
 
 def test_marking_audio_deleted_removes_it_from_the_expiry_queue(tmp_path):

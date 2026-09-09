@@ -351,16 +351,16 @@ def _parse_instant(value: str, field: str) -> datetime:
 
 
 def _format_instant(moment: datetime) -> str:
-    """The one spelling stored in retention columns: whole-second UTC.
+    """The one spelling stored in retention columns: UTC microseconds.
 
-    Fixed width keeps lexicographic comparison against a caller's `now` sound,
-    and truncating a fraction can only make expiry earlier, never later.
+    Fixed width keeps indexed lexicographic comparisons chronological without
+    discarding a fraction and making irreversible deletion happen early.
     """
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def audio_expires_at(ended_at: str) -> str:
-    """Authoritative audio retention: `ended_at` + 14 days, whole-second UTC."""
+    """Authoritative audio retention: `ended_at` + 14 days, exact to microseconds."""
     ended = _parse_instant(ended_at, "ended_at")
     return _format_instant(ended + timedelta(days=MEETING_AUDIO_RETENTION_DAYS))
 
@@ -369,13 +369,37 @@ def audio_expires_at(ended_at: str) -> str:
 
 
 def migrate_meetings(conn: sqlite3.Connection) -> None:
-    """Create the meeting tables if they are absent. Idempotent, additive.
+    """Create meeting tables and canonicalize stored retention deadlines.
 
     This is the same mechanism `open_db` already uses for `events` and
     `summaries`: one `CREATE TABLE IF NOT EXISTS` script, no version registry.
-    It never reads, rewrites, or constrains an existing table.
+    Legacy deadlines are recomputed from each revision's own `ended_at`, not
+    from the current projection. Only `audio_expires_at` is corrected;
+    `deleted_at` remains the audit evidence of when deletion actually occurred.
     """
     conn.executescript(_SCHEMA)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            "SELECT a.occurrence_id, a.revision, a.audio_expires_at, r.ended_at "
+            "FROM meeting_audio a JOIN meeting_revisions r "
+            "ON r.occurrence_id = a.occurrence_id AND r.revision = a.revision"
+        ).fetchall()
+        corrections = [
+            (expected, occurrence_id, revision)
+            for occurrence_id, revision, stored, ended_at in rows
+            if (expected := audio_expires_at(ended_at)) != stored
+        ]
+        conn.executemany(
+            "UPDATE meeting_audio SET audio_expires_at = ? "
+            "WHERE occurrence_id = ? AND revision = ?",
+            corrections,
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
 
 
 @contextmanager
@@ -1139,7 +1163,7 @@ def _read_audio(conn: sqlite3.Connection, key: tuple[str, int]) -> dict | None:
 def audio_due_for_expiry(conn: sqlite3.Connection, now: str) -> list[dict]:
     """Every still-present encrypted audio row whose expiry has arrived.
 
-    `now` is a UTC instant; it is normalized to the same whole-second spelling
+    `now` is a UTC instant; it is normalized to the same fixed-width spelling
     the expiry column uses, so the comparison is a sound string comparison.
     Superseded revisions are included — each revision's audio expires on its own
     schedule — and `is_current` says which projection a row belongs to.

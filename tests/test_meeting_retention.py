@@ -44,9 +44,10 @@ IMPORTED_AT = "2026-09-02T16:00:00Z"
 # The complete fixture ends at 2026-09-02T14:52:00Z, so TeamMem's own expiry is
 # that instant plus fourteen days. The fixture's own `audio.expires_at` claims
 # 2026-10-02 — thirty days — and is never authoritative.
-EXPIRY = "2026-09-16T14:52:00Z"
-JUST_BEFORE = "2026-09-16T14:51:59Z"
-LATER = "2026-09-20T09:00:00Z"
+EXPIRY = "2026-09-16T14:52:00.000000Z"
+JUST_BEFORE = "2026-09-16T14:51:59.000000Z"
+LATER = "2026-09-20T09:00:00.000000Z"
+FRACTIONAL_EXPIRY = "2026-09-16T14:52:00.500000Z"
 
 # A sentence that exists only inside the complete fixture's transcript.
 TRANSCRIPT_SENTENCE = (
@@ -168,6 +169,47 @@ def test_exactly_at_expiry_the_audio_is_deleted_and_the_row_marked(tmp_path):
     [custody] = _custody_files(_store(tmp_path))
     assert custody.read_bytes() == b""             # only the expired inode's name remains
     assert result.exit_code == 0
+
+
+def test_one_microsecond_before_fractional_expiry_the_audio_is_retained(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(ended_at="2026-09-02T14:52:00.500000Z")
+    _import(conn, tmp_path, payload)
+
+    result = _expire(conn, tmp_path, "2026-09-16T14:52:00.499999Z")
+
+    assert result.deleted == ()
+    assert _audio(tmp_path, payload).exists()
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] is None
+
+
+def test_exactly_at_fractional_expiry_records_the_actual_deletion_instant(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(ended_at="2026-09-02T14:52:00.500000Z")
+    _import(conn, tmp_path, payload)
+    occurrence_id = payload["occurrence_id"]
+    assert get_meeting(conn, occurrence_id)["audio"]["expires_at"] == FRACTIONAL_EXPIRY
+
+    result = _expire(conn, tmp_path, FRACTIONAL_EXPIRY)
+
+    assert result.deleted == ((occurrence_id, payload["revision"]),)
+    assert not _audio(tmp_path, payload).exists()
+    assert get_meeting(conn, occurrence_id)["audio"]["deleted_at"] == FRACTIONAL_EXPIRY
+
+
+def test_one_microsecond_after_fractional_expiry_records_the_actual_deletion_instant(tmp_path):
+    conn = _db(tmp_path)
+    payload = _payload(ended_at="2026-09-02T14:52:00.500000Z")
+    _import(conn, tmp_path, payload)
+    occurrence_id = payload["occurrence_id"]
+
+    result = _expire(conn, tmp_path, "2026-09-16T14:52:00.500001Z")
+
+    assert result.deleted == ((occurrence_id, payload["revision"]),)
+    assert not _audio(tmp_path, payload).exists()
+    assert get_meeting(conn, occurrence_id)["audio"]["deleted_at"] == (
+        "2026-09-16T14:52:00.500001Z"
+    )
 
 
 def test_a_second_run_after_expiry_deletes_nothing_and_keeps_the_first_timestamp(tmp_path):
@@ -558,7 +600,7 @@ def test_an_alert_does_not_delay_a_deletion_due_in_the_same_run(tmp_path, monkey
     assert result.deleted == ((due["occurrence_id"], due["revision"]),)
     assert not _audio(tmp_path, due).exists()
     assert get_meeting(conn, due["occurrence_id"])["audio"]["deleted_at"] == (
-        "2026-09-14T00:00:00Z"
+        "2026-09-14T00:00:00.000000Z"
     )
     assert [f.stage for f in result.failed] == ["alert"]
 
@@ -758,7 +800,7 @@ def test_an_alert_that_cannot_be_written_at_all_still_leaves_the_audio_deleted(
 
     assert not _audio(tmp_path, due).exists()
     assert get_meeting(conn, due["occurrence_id"])["audio"]["deleted_at"] == (
-        "2026-09-14T00:00:00Z"
+        "2026-09-14T00:00:00.000000Z"
     )
 
 

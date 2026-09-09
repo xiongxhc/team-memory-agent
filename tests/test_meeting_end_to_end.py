@@ -40,7 +40,7 @@ def _instant(value: str) -> datetime:
 
 
 def _stamp(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _vault_text(vault) -> str:
