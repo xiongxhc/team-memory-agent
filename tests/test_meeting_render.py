@@ -21,7 +21,8 @@ import pytest
 
 from teammem.events import Event
 from teammem.identity import IdentityMaps
-from teammem.meeting_bundles import canonical_artifact_hash, short_occurrence_id
+from teammem.meeting_bundles import (canonical_artifact_hash, load_meeting_bundle,
+                                     short_occurrence_id)
 from teammem.meeting_store import (StagedAudio, import_meeting_revision,
                                    list_meetings)
 from teammem import meeting_render
@@ -29,6 +30,7 @@ from teammem import render as render_module
 from teammem.render import (MANAGED, MEETING_INVARIANTS, render_vault,
                             verify_meeting_semantics, verify_vault)
 from teammem.store import insert_events, open_db
+from tests.test_meeting_bundles import write_meeting_bundle
 
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
 FIXTURES = Path(__file__).parent / "fixtures" / "meetings"
@@ -111,6 +113,16 @@ def _seeded(tmp_path, *payloads, name="l.db"):
     conn = open_db(tmp_path / name)
     for payload in payloads or (_payload(),):
         _import(conn, payload)
+    return conn
+
+
+def _validated_seeded(tmp_path, payload: dict, name="l.db"):
+    """Load the real on-disk bundle contract before placing it in the ledger."""
+    inbox = tmp_path / "meeting-inbox"
+    directory = write_meeting_bundle(inbox, payload)
+    bundle = load_meeting_bundle(directory, inbox)
+    conn = open_db(tmp_path / name)
+    _import(conn, bundle.payload)
     return conn
 
 
@@ -402,6 +414,73 @@ def test_person_and_week_indexes_link_the_note(tmp_path):
     top = (vault / "Meetings" / "README.md").read_text()
     assert f"[{WEEK}]({WEEK.replace(' ', '%20')}/README.md)" in top
     assert "[Meetings](Meetings/README.md)" in (vault / "README.md").read_text()
+
+
+@pytest.mark.parametrize(("title", "label"), [
+    ("Agenda [draft", r"Agenda \[draft"),
+    ("Agenda final]", r"Agenda final\]"),
+    ("Agenda \\ path", r"Agenda \\ path"),
+    ("Agenda [draft] \\ path", r"Agenda \[draft\] \\ path"),
+])
+def test_title_metacharacters_keep_every_note_link_valid_and_deterministic(
+        tmp_path, title, label):
+    payload = _retitle(_payload(), title)
+    conn = _validated_seeded(tmp_path, payload)
+    first = _render(tmp_path, conn, name="one")
+    second = _render(tmp_path, conn, name="two")
+    notes = [path for path in (first / "Meetings" / WEEK).glob("*.md")
+             if path.name != "README.md"]
+    assert len(notes) == 1
+    note = notes[0]
+    target = quote(note.name)
+
+    week_index = (note.parent / "README.md").read_text()
+    assert f"- [{label}]({target}) — " in week_index
+    backlink = f"[2026-09-02 14:00 — {label}](../../Meetings/{quote(WEEK)}/{target})"
+    for page in [
+        first / "Person" / "Ada Chen" / "README.md",
+        first / "Projects" / "project-atlas" / "README.md",
+    ]:
+        assert backlink in page.read_text()
+
+    left = {path.relative_to(first).as_posix(): path.read_bytes()
+            for path in _vault_files(first)}
+    right = {path.relative_to(second).as_posix(): path.read_bytes()
+             for path in _vault_files(second)}
+    assert left == right
+    assert verify_vault(
+        conn, IdentityMaps.load(CONFIG_DIR), first, TODAY, semantic=True
+    ) == {"missing": [], "unexpected": [], "differing": [], "semantic": []}
+
+
+def test_participant_and_project_metacharacters_are_escaped_only_in_link_labels(tmp_path):
+    payload = _retitle(_payload(), "Agenda [draft] \\ path")
+    person = "Ada [Lead] \\ Ops"
+    project = "project-[atlas]\\ops"
+    for value in [payload["organizer"], *payload["participants"],
+                  *(segment["speaker"] for segment in payload["transcript"]),
+                  *(item["owner"] for item in payload["action_items"] if item["owner"]),
+                  *payload["person_summaries"]]:
+        if value.get("person_id") == "ou_ada":
+            value["display_name"] = person
+    payload["projects"][0]["name"] = project
+
+    conn = _validated_seeded(tmp_path, payload)
+    vault = _render(tmp_path, conn)
+    note = next(path for path in (vault / "Meetings" / WEEK).glob("*.md")
+                if path.name != "README.md")
+    text = note.read_text()
+    assert "# Agenda [draft] \\ path\n" in text
+    assert (r"[Ada \[Lead\] - Ops](../../Person/Ada%20%5BLead%5D%20-%20Ops/README.md)"
+            in text)
+    assert (r"[project-\[atlas\]\\ops]"
+            r"(../../Projects/project-%5Batlas%5D-ops/README.md)" in text)
+    project_index = (vault / "Projects" / "README.md").read_text()
+    assert (r"[project-\[atlas\]\\ops](project-%5Batlas%5D-ops/README.md)"
+            in project_index)
+    assert verify_vault(
+        conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY, semantic=True
+    )["semantic"] == []
 
 
 def test_no_wikilinks_anywhere_under_meetings(tmp_path):
@@ -971,6 +1050,15 @@ def test_link_targets_carry_balanced_parentheses_to_any_depth():
         "b(c(d)e)f", "h.md"]
     assert render_module._md_links("[r]( x.md)") == []      # a space ends a target
     assert render_module._md_links("[u](https://x/a1)") == ["https://x/a1"]
+
+
+def test_link_labels_honor_escaped_delimiters_and_backslash_parity():
+    text = (r"[label \[draft\] \\ path](note.md) "
+            r"\[escaped opener](fake.md) "
+            r"\\[even opener](even.md) "
+            r"\\\[odd opener](also-fake.md) "
+            r"[two slashes\\](slashes.md)")
+    assert render_module._md_links(text) == ["note.md", "even.md", "slashes.md"]
 
 
 def test_activity_older_than_the_journal_window_raises_no_meeting_finding(tmp_path):

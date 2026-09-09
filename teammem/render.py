@@ -81,11 +81,13 @@ def _meeting_person(ids: IdentityMaps, person_id: str,
 
 
 def _person_link(name: str, up: int = 1) -> str:
-    return f"[{name}]({'../' * up}Person/{quote(name)}/README.md)"
+    return (f"[{meeting_render.escape_md_label(name)}]"
+            f"({'../' * up}Person/{quote(name)}/README.md)")
 
 
 def _project_link(proj: str, up: int = 1) -> str:
-    return f"[{proj}]({'../' * up}Projects/{quote(_project_fname(proj))}/README.md)"
+    return (f"[{meeting_render.escape_md_label(proj)}]"
+            f"({'../' * up}Projects/{quote(_project_fname(proj))}/README.md)")
 
 
 def _week_link(label: str, up: int = 1) -> str:
@@ -609,7 +611,7 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         for m, mine in weeks_mine:
             lbl = week_label(m)
             cutoff = _evidence_cutoff(mine)
-            navigation = f"\n[{proj}](README.md)"
+            navigation = f"\n[{meeting_render.escape_md_label(proj)}](README.md)"
             if m in week_of:
                 navigation += (f" · [{lbl} — Team]"
                                f"(../../Work%20Journal/{quote(lbl)}.md)")
@@ -647,7 +649,8 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         current_rows = [row for rows in current.values() for row in rows]
         pmd.append(f"\n{_evidence_notice(_evidence_cutoff(current_rows))}\n")
     for proj, rows in sorted(current.items(), key=lambda item: (-len(item[1]), item[0])):
-        pmd.append(f"- [{proj}]({quote(_project_fname(proj))}/README.md) — "
+        pmd.append(f"- [{meeting_render.escape_md_label(proj)}]"
+                   f"({quote(_project_fname(proj))}/README.md) — "
                    f"{_activity_summary(rows)}\n")
     if not current:
         pmd.append("- No mapped project activity.\n")
@@ -658,7 +661,7 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         for proj, (latest_m, latest_rows) in sorted(future.items()):
             lbl = week_label(latest_m)
             folder = quote(_project_fname(proj))
-            pmd.append(f"- [{proj}]({folder}/README.md) — "
+            pmd.append(f"- [{meeting_render.escape_md_label(proj)}]({folder}/README.md) — "
                        f"[{lbl}]({folder}/{quote(lbl)}.md) · "
                        f"{_activity_summary(latest_rows)}\n")
     earlier = [proj for proj in project_weeks
@@ -669,13 +672,14 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             latest_m, latest_rows = project_weeks[proj][0]
             lbl = week_label(latest_m)
             folder = quote(_project_fname(proj))
-            pmd.append(f"- [{proj}]({folder}/README.md) — latest "
+            pmd.append(f"- [{meeting_render.escape_md_label(proj)}]({folder}/README.md) — latest "
                        f"[{lbl}]({folder}/{quote(lbl)}.md) · "
                        f"{_activity_summary(latest_rows)}\n")
     if meeting_projects:
         pmd.append("\n## Discussed in meetings\n")
         for proj in meeting_projects:
-            pmd.append(f"- [{proj}]({quote(_project_fname(proj))}/README.md)\n")
+            pmd.append(f"- [{meeting_render.escape_md_label(proj)}]"
+                       f"({quote(_project_fname(proj))}/README.md)\n")
     _write(vault_dir / "Projects" / "README.md", "".join(pmd))
     files += 1
 
@@ -777,9 +781,21 @@ def _md_links(text: str) -> list[str]:
     fixed one, and a destination cut short at the wrong parenthesis reads as a
     link to a file that does not exist.
     """
+    def escaped(index: int) -> bool:
+        backslashes = 0
+        while index > 0 and text[index - 1] == "\\":
+            backslashes += 1
+            index -= 1
+        return backslashes % 2 == 1
+
     found, cursor = [], 0
     while (opened := text.find("[", cursor)) >= 0:
+        if escaped(opened):
+            cursor = opened + 1
+            continue
         closed = text.find("]", opened + 1)
+        while closed >= 0 and escaped(closed):
+            closed = text.find("]", closed + 1)
         if closed < 0:
             break
         if text[closed + 1:closed + 2] != "(":

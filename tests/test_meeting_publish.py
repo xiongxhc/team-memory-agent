@@ -22,7 +22,7 @@ from teammem.meeting_publish import (PublishRefused, blob_url, publish_meeting,
                                      receipt_bytes, validate_web_base)
 from teammem.vaultgit import commit_all, ensure_repo
 from tests.test_meeting_render import (CONFIG_DIR, NOTE, TODAY, WEEK, _import,
-                                       _payload, _seeded)
+                                       _payload, _seeded, _validated_seeded)
 
 WEB_BASE = "https://git.example.com/example-org/team-vault"
 REL = f"Meetings/{WEEK}/{NOTE}"
@@ -160,6 +160,30 @@ def test_publication_writes_a_receipt_naming_the_commit_the_remote_holds(bench):
     # and the remote really carries the note at that commit
     assert subprocess.run(["git", "-C", str(bare), "cat-file", "-e",
                            f"{out['vault_commit']}:{REL}"]).returncode == 0
+
+
+@pytest.mark.parametrize("title", [
+    "Agenda [draft",
+    "Agenda final]",
+    "Agenda \\ path",
+    "Agenda [draft] \\ path",
+])
+def test_title_metacharacters_publish_to_a_real_bare_remote(tmp_path, title):
+    payload = _payload()
+    payload["title"] = title
+    conn = _validated_seeded(tmp_path, payload)
+    vault, bare, branch = _vault(tmp_path)
+    receipt = tmp_path / "receipts" / "meeting.json"
+
+    out = _publish(conn, vault, receipt)
+
+    assert out["status"] == "published"
+    assert out["vault_commit"] == _remote_ref(bare, branch)
+    assert subprocess.run([
+        "git", "-C", str(bare), "cat-file", "-e",
+        f"{out['vault_commit']}:{out['markdown_path']}",
+    ]).returncode == 0
+    assert json.loads(receipt.read_text(encoding="utf-8")) == out
 
 
 def test_the_receipt_never_carries_a_local_path_or_anything_but_an_https_url(bench):

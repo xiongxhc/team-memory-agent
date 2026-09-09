@@ -54,6 +54,11 @@ NOTE_HEADINGS = (
 )
 
 
+def escape_md_label(value: str) -> str:
+    """Escape the metacharacters that can terminate an inline-link label."""
+    return value.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
 @dataclass(frozen=True)
 class VaultNaming:
     """The vault's naming and link conventions, owned by `render.py`.
@@ -380,7 +385,7 @@ def note_href(note: MeetingNote, up: int) -> str:
 
 
 def note_link(note: MeetingNote, up: int) -> str:
-    label = f"{_day_and_minute(note.started_at)} — {note.title}"
+    label = escape_md_label(f"{_day_and_minute(note.started_at)} — {note.title}")
     return f"[{label}]({note_href(note, up)})"
 
 
@@ -413,7 +418,7 @@ def meeting_files(notes: list[MeetingNote], today: date) -> dict[PurePosixPath, 
             people = len(note.attendees)
             projects = len(note.projects)
             page.append(
-                f"- [{note.title}]({quote(note.file_name)}) — "
+                f"- [{escape_md_label(note.title)}]({quote(note.file_name)}) — "
                 f"{_day_and_minute(note.started_at)} UTC · "
                 f"{people} {'participant' if people == 1 else 'participants'} · "
                 f"{projects} {'project' if projects == 1 else 'projects'}\n")
