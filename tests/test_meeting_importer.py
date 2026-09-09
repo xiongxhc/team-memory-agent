@@ -1096,6 +1096,65 @@ def test_handled_windows_store_failure_can_retry_without_a_final_audio_conflict(
     assert [path for path in _files(tree.audio) if path.name != "audio.enc"] == []
 
 
+def test_custody_recovery_exception_before_ownership_preserves_replacement(tmp_path):
+    if os.name == "nt":
+        pytest.skip("the regression exercises real POSIX custody descriptors")
+    from teammem import meeting_importer
+
+    final = tmp_path / "audio.enc"
+    final.touch()
+    custody = tmp_path / ".audio.enc.custody.replaced"
+    custody.write_bytes(b"REPLACEMENT MUST SURVIVE")
+    source = tmp_path / "source.enc"
+    source.write_bytes(b"source ciphertext")
+    final_fd = os.open(final, os.O_RDONLY)
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        final.unlink()
+        with pytest.raises(FileNotFoundError):
+            meeting_importer._recover_custody_audio(
+                source, tmp_path, final, final_fd, directory_fd)
+        assert custody.read_bytes() == b"REPLACEMENT MUST SURVIVE"
+    finally:
+        os.close(final_fd)
+        os.close(directory_fd)
+
+
+def test_custody_recovery_partial_refill_failure_zeros_only_owned_inode(
+    tmp_path, monkeypatch
+):
+    if os.name == "nt":
+        pytest.skip("the regression exercises real POSIX custody descriptors")
+    from teammem import meeting_importer
+
+    final = tmp_path / "audio.enc"
+    final.touch()
+    custody = tmp_path / ".audio.enc.custody.owned"
+    os.link(final, custody)
+    replacement = tmp_path / "replacement.enc"
+    replacement.write_bytes(b"REPLACEMENT MUST SURVIVE")
+    source = tmp_path / "source.enc"
+    source.write_bytes(b"source ciphertext")
+    final_fd = os.open(final, os.O_RDONLY)
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+
+    def fail_partial_write(descriptor, data):
+        os.write(descriptor, data[:3])
+        os.replace(replacement, custody)
+        raise OSError("injected partial refill failure")
+
+    monkeypatch.setattr(meeting_importer, "_write_all", fail_partial_write)
+    try:
+        with pytest.raises(OSError, match="injected partial refill failure"):
+            meeting_importer._recover_custody_audio(
+                source, tmp_path, final, final_fd, directory_fd)
+        assert final.read_bytes() == b""
+        assert custody.read_bytes() == b"REPLACEMENT MUST SURVIVE"
+    finally:
+        os.close(final_fd)
+        os.close(directory_fd)
+
+
 def test_handled_posix_store_failure_can_retry_without_a_final_audio_conflict(
     tmp_path, monkeypatch
 ):

@@ -410,6 +410,7 @@ def _recover_custody_audio(
                 custody.name, os.O_RDWR | _FILE_FLAGS, dir_fd=revision_fd)
         except FileNotFoundError:
             continue
+        refill_started = False
         try:
             custody_metadata = os.fstat(custody_fd)
             current = os.stat(
@@ -421,6 +422,7 @@ def _recover_custody_audio(
                 or not _same_inode(current, final_metadata)
             ):
                 continue
+            refill_started = True
             _copy_source_into_descriptor(source, custody_fd)
             os.fsync(revision_fd)
             recovered = custody_fd
@@ -428,7 +430,8 @@ def _recover_custody_audio(
             return recovered
         except BaseException:
             try:
-                _discard_owned_descriptor(custody_fd)
+                if refill_started:
+                    _discard_owned_descriptor(custody_fd)
             finally:
                 os.close(custody_fd)
                 custody_fd = None

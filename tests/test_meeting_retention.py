@@ -338,6 +338,50 @@ def test_revived_audio_from_a_replayed_bundle_is_removed_again(tmp_path):
     stored = get_meeting(conn, payload["occurrence_id"])["audio"]
     assert stored["deleted_at"] == EXPIRY           # a replay never moves the decision
     assert stored["sha256"] == payload["audio"]["sha256"]
+    assert all(path.stat().st_size == 0 for path in _files(_store(tmp_path)))
+    assert result.failed == ()
+    retried = _expire(conn, tmp_path, LATER)
+    assert retried.swept == () and retried.failed == ()
+
+
+@pytest.mark.parametrize("interruption", ["missing_final", "replaced_custody", "zero_failure"])
+def test_replay_custody_failure_remains_visible_on_missing_final_retries(
+    tmp_path, monkeypatch, interruption
+):
+    if os.name == "nt":
+        pytest.skip("the regression exercises real POSIX custody descriptors")
+    conn = _db(tmp_path)
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    _expire(conn, tmp_path, EXPIRY)
+    _import(conn, tmp_path, payload)
+    target = _audio(tmp_path, payload)
+    ciphertext = target.read_bytes()
+    [custody] = [path for path in _custody_files(_store(tmp_path)) if path.stat().st_size]
+    if interruption == "missing_final":
+        target.unlink()
+    elif interruption == "replaced_custody":
+        replacement = tmp_path / "replacement.enc"
+        replacement.write_bytes(b"REPLACEMENT MUST SURVIVE")
+        os.replace(replacement, custody)
+    else:
+        def fail_zero(_descriptors):
+            raise OSError("injected custody zero failure")
+        monkeypatch.setattr(meeting_retention, "_zero_opened_custody", fail_zero)
+
+    result = _expire(conn, tmp_path, LATER)
+    monkeypatch.undo()
+    retried = _expire(conn, tmp_path, LATER)
+
+    for outcome in (result, retried):
+        assert outcome.swept == ()
+        assert outcome.exit_code == 1
+        assert [(failure.occurrence_id, failure.revision, failure.stage)
+                for failure in outcome.failed] == [(payload["occurrence_id"], 3, "sweep")]
+    assert not target.exists()
+    assert custody.read_bytes() == (
+        b"REPLACEMENT MUST SURVIVE" if interruption == "replaced_custody" else ciphertext)
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
 
 
 @pytest.mark.parametrize(("link_level", "failure_revision"), [

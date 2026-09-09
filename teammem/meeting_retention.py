@@ -507,16 +507,37 @@ def _sweep_revision(
         return None
     path = revision_dir / AUDIO_FILENAME
     revision = int(revision_dir.name)
-    if path.is_symlink() or not path.is_file():
-        return None
     meeting = get_meeting(conn, occurrence_id, revision=revision)
     audio = meeting["audio"] if meeting else None
     if audio is None or audio["deleted_at"] is None:
         return None
+    expected_directory = audio_revision_dir(store, occurrence_id, revision)
+    if (
+        _physical_path(revision_dir) != expected_directory
+        or not _path_within(expected_directory, store)
+    ):
+        raise OSError("revived audio directory is not contained in its configured revision")
+    if path.is_symlink() or not path.is_file():
+        # Without a final we cannot prove a custody inode's ownership. Keep
+        # remaining bytes visible on every retry, even though the row is marked.
+        _assert_governed_audio_bytes_gone(revision_dir)
+        return None
     if dry_run:
         return occurrence_id, revision
-    os.unlink(path)
-    _prune_empty(revision_dir, store)
+    custody_descriptors = _open_posix_custody_descriptors(revision_dir)
+    try:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        _discard_windows_staging_residues(revision_dir)
+        _zero_opened_custody(custody_descriptors)
+        _zero_posix_staging_residues(revision_dir)
+        _assert_governed_audio_bytes_gone(revision_dir)
+        _prune_empty(revision_dir, store)
+    finally:
+        for descriptor in custody_descriptors:
+            os.close(descriptor)
     return occurrence_id, revision
 
 
