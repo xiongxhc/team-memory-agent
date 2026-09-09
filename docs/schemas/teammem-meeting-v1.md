@@ -258,7 +258,17 @@ negotiated.
 
 - `filename` must be exactly `audio.enc`.
 - `format` names the plaintext container inside the encryption; `encryption`
-  names the scheme. TeamMem never holds the key and never decrypts.
+  names the scheme. The supported `teammem-meeting/v1` metadata values are
+  exactly `age-x25519` and `aes-256-gcm`; every other value, including
+  no-encryption aliases such as `none`, `identity`, `raw`, `no-encryption`,
+  `plaintext`, and `unencrypted`, is rejected.
+- `age-x25519` retains compatibility with the Meeting Agent delivery fixtures.
+  `aes-256-gcm` is TeamMem's supported metadata spelling for the Conversation
+  Runtime AES-256-GCM recording primitive. This does not claim that producer
+  integration or an upstream metadata token has been frozen or verified.
+- The allowlist validates only the producer's metadata declaration. TeamMem
+  never holds a recording key, never decrypts, and does not treat an allowed
+  value as cryptographic proof that `audio.enc` is ciphertext.
 - `duration_seconds` is > 0 and ≤ 86400; `bytes` is > 0 and ≤ 8 GiB.
 - `sha256` is `sha256:<64 lowercase hex>` over the encrypted bytes and must
   match `audio.enc` on disk and the manifest.

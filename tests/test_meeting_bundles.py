@@ -375,6 +375,40 @@ def test_audio_size_mismatch_is_rejected(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "encryption",
+    ["none", "identity", "raw", "no-encryption", "plaintext", "unencrypted"],
+)
+def test_no_encryption_aliases_are_rejected_for_nonmagic_raw_audio(tmp_path, encryption):
+    payload = _fixture(MINIMAL)
+    raw_pcm = b"\x01\x00\x02\x00" * 128
+    _set_audio(payload, raw_pcm)
+    payload["audio"]["encryption"] = encryption
+
+    message = _reject(tmp_path, payload, audio=raw_pcm)
+
+    assert "audio encryption" in message
+
+
+def test_unknown_encryption_scheme_is_rejected(tmp_path):
+    payload = _fixture(MINIMAL)
+    payload["audio"]["encryption"] = "future-cipher"
+
+    message = _reject(tmp_path, payload)
+
+    assert "audio encryption" in message
+
+
+@pytest.mark.parametrize("encryption", ["age-x25519", "aes-256-gcm"])
+def test_supported_encryption_schemes_are_accepted(tmp_path, encryption):
+    payload = _fixture(MINIMAL)
+    payload["audio"]["encryption"] = encryption
+
+    bundle = _load(tmp_path, payload)
+
+    assert bundle.payload["audio"]["encryption"] == encryption
+
+
+@pytest.mark.parametrize(
     "head",
     [
         b"RIFF\x00\x00\x00\x00WAVE",

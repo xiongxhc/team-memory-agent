@@ -30,6 +30,7 @@ BUNDLE_FILENAMES = (MEETING_FILENAME, AUDIO_FILENAME, MANIFEST_FILENAME, READY_F
 ORGANIZER_SOURCES = ("reservation", "calendar_event")
 ORGANIZER_UNRESOLVED_REASON = "instant_meeting"
 RUNTIME_PROFILES = ("offline", "online")
+AUDIO_ENCRYPTION_SCHEMES = ("age-x25519", "aes-256-gcm")
 SEGMENT_STAGES = ("live_stream", "final_batch")
 SPEAKER_KINDS = ("person", "anonymous", "ambiguous")
 
@@ -470,7 +471,11 @@ def _validate_audio(data: dict) -> None:
     if audio["filename"] != AUDIO_FILENAME:
         raise _error(f"audio filename must be {AUDIO_FILENAME}")
     _pattern(audio, "format", _TOKEN, MAX_NAME, "audio ")
-    _pattern(audio, "encryption", _TOKEN, MAX_NAME, "audio ")
+    encryption = _pattern(audio, "encryption", _TOKEN, MAX_NAME, "audio ")
+    if encryption not in AUDIO_ENCRYPTION_SCHEMES:
+        raise _error(
+            f"audio encryption must be one of {', '.join(AUDIO_ENCRYPTION_SCHEMES)}"
+        )
     duration = audio["duration_seconds"]
     if isinstance(duration, bool) or not isinstance(duration, (int, float)):
         raise _error("audio duration_seconds must be a number")
