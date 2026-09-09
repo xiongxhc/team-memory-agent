@@ -76,6 +76,27 @@ def _payload(*, day: str | None = None) -> dict:
     return json.loads(text)
 
 
+SHORT_TURNS = ("Red fox seven.", "Blue kite eleven.", "Gold moon thirteen.")
+
+
+def _short_transcript_payload(*texts: str) -> dict:
+    """A real-schema fixture with no synthesis tied to removed segments."""
+    payload = _payload()
+    source = payload["transcript"]
+    payload["transcript"] = []
+    for index, text in enumerate(texts or SHORT_TURNS):
+        segment = copy.deepcopy(source[index])
+        segment["text"] = text
+        payload["transcript"].append(segment)
+    payload["summary"] = "A concise status exchange."
+    payload["projects"] = []
+    payload["decisions"] = []
+    payload["action_items"] = []
+    payload["discussion_points"] = []
+    payload["person_summaries"] = []
+    return payload
+
+
 def _retitle(payload: dict, title: str) -> dict:
     payload = copy.deepcopy(payload)
     payload["title"] = title
@@ -886,6 +907,89 @@ def test_transcript_text_in_the_vault_is_reported_without_quoting_it(tmp_path):
     assert found[0]["path"] == "Person/Hana Suzuki/README.md"
     assert sentence not in json.dumps(found)
     assert "staging soak" not in json.dumps(found)
+
+
+@pytest.mark.parametrize("copied", [
+    "\n".join(SHORT_TURNS),
+    "".join(SHORT_TURNS),
+    "Red\tfox seven. Blue\u2003kite eleven.\nGold moon\tthirteen.",
+])
+def test_a_complete_all_short_transcript_is_forbidden_across_spacing_variants(
+    tmp_path, copied
+):
+    payload = _short_transcript_payload()
+    conn = _validated_seeded(tmp_path, payload)
+    vault = _render(tmp_path, conn)
+    page = vault / "Docs" / "preserved.md"
+    page.parent.mkdir()
+    page.write_text(f"# Preserved notes\n\n{copied}\n", encoding="utf-8")
+
+    found = _findings(conn, vault)
+
+    assert [item["invariant"] for item in found] == [LEAKAGE]
+    assert found[0]["path"] == "Docs/preserved.md"
+    diagnostics = json.dumps(found)
+    assert all(turn not in diagnostics for turn in SHORT_TURNS)
+    assert "Redfoxseven.Bluekiteeleven.Goldmoonthirteen." not in diagnostics
+
+
+def test_short_turn_fragments_do_not_match_without_the_complete_ordered_transcript(
+    tmp_path,
+):
+    payload = _short_transcript_payload()
+    conn = _validated_seeded(tmp_path, payload)
+    vault = _render(tmp_path, conn)
+    page = vault / "Docs" / "sound-notes.md"
+    page.parent.mkdir()
+    page.write_text(
+        "# Sound notes\n\n"
+        "Red fox seven. This isolated phrase is ordinary.\n"
+        "Gold moon thirteen. Blue kite eleven. Red fox seven.\n"
+        "Red fox seven.Blue kite eleventh.Gold moon thirteen.\n"
+        "red fox seven.blue kite eleven.gold moon thirteen.\n"
+        "Red fox seven Blue kite eleven Gold moon thirteen\n",
+        encoding="utf-8",
+    )
+
+    assert _findings(conn, vault) == []
+
+
+@pytest.mark.parametrize(("page_text", "leaks"), [
+    ("Yesterday", False),
+    ("## Status\nYes\n", True),
+    ("Yesterday\nYes", True),
+])
+def test_a_tiny_complete_transcript_requires_lexical_boundaries(
+    tmp_path, page_text, leaks
+):
+    payload = _short_transcript_payload("Yes")
+    conn = _validated_seeded(tmp_path, payload)
+    vault = _render(tmp_path, conn)
+    page = vault / "Docs" / "tiny.md"
+    page.parent.mkdir()
+    page.write_text(page_text, encoding="utf-8")
+
+    found = _findings(conn, vault)
+
+    assert bool(found) is leaks
+    assert {item["invariant"] for item in found} <= {LEAKAGE}
+    assert "Yes" not in json.dumps(found)
+
+
+def test_a_complete_all_short_transcript_from_a_superseded_revision_is_forbidden(
+    tmp_path,
+):
+    old = _short_transcript_payload()
+    conn = _validated_seeded(tmp_path, old)
+    current = _payload()
+    current["revision"] = old["revision"] + 1
+    _import(conn, current)
+    vault = _render(tmp_path, conn)
+    page = vault / "Docs" / "old.md"
+    page.parent.mkdir()
+    page.write_text("".join(SHORT_TURNS), encoding="utf-8")
+
+    assert _broken(conn, vault) == {LEAKAGE}
 
 
 def test_an_audio_path_in_the_vault_is_reported_without_quoting_it(tmp_path):

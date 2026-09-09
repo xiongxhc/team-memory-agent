@@ -768,9 +768,11 @@ MEETING_INVARIANTS = (
     "meeting.project.backlinks",
     "meeting.week-index.membership",
 )
-# Shorter transcript lines ("Yes.") legitimately recur in a summary; matching
-# them would make every vault look like a leak.
+# Individual short transcript lines ("Yes.") legitimately recur in a summary,
+# so only a complete transcript may make them a probe on their own.
 _MIN_LEAKED_TEXT = 24
+_Probe = tuple[str, str]
+_ProbeIndex = tuple[dict[str, list[_Probe]], list[_Probe]]
 
 
 def _md_links(text: str) -> list[str]:
@@ -884,42 +886,9 @@ def _meeting_facts(meeting: dict, ids: IdentityMaps) -> dict:
     }
 
 
-def _forbidden_values(conn: sqlite3.Connection, occurrence_ids
-                      ) -> tuple[int, dict[str, list[tuple[str, str]]],
-                                 list[tuple[str, str]]]:
-    """A probe index of (kind, value) for everything that must never reach the vault.
-
-    Every stored revision, not only the current one: a superseded revision's
-    transcript is exactly as confidential as the one being rendered.
-
-    Returns `(probe_len, indexed, unindexed)`. A file can hold a value only if
-    it holds that value's first `probe_len` characters, so reading a file's
-    distinct windows of that length once names every value worth a full
-    substring test, and the sweep costs files plus values rather than files
-    times values. `unindexed` carries the few values too short to have a probe;
-    those are tested directly. Nothing rests on `probe_len` but speed: every
-    candidate is still confirmed with the same substring test as before.
-    """
-    # ~4 words of prose: long enough that vault text does not collide with the
-    # start of a transcript line, short enough to index all but a stray value.
-    probe_len = 32
-    values: dict[tuple[str, str], None] = {}      # deduplicated, insertion order
-    for occurrence_id in occurrence_ids:
-        for entry in list_meeting_revisions(conn, occurrence_id):
-            meeting = get_meeting(conn, occurrence_id, revision=entry["revision"])
-            if meeting is None:
-                continue
-            for segment in meeting["transcript"]:
-                if len(segment["text"]) >= _MIN_LEAKED_TEXT:
-                    values[("transcript text", segment["text"])] = None
-            audio = meeting["audio"]
-            if audio:
-                values[("audio store path", audio["stored_path"])] = None
-                values[("audio digest", audio["sha256"])] = None
-                if len(audio["filename"]) >= 5:
-                    values[("audio file name", audio["filename"])] = None
-    indexed: dict[str, list[tuple[str, str]]] = {}
-    unindexed: list[tuple[str, str]] = []
+def _probe_index(values: dict[_Probe, None], probe_len: int) -> _ProbeIndex:
+    indexed: dict[str, list[_Probe]] = {}
+    unindexed: list[_Probe] = []
     for pair in values:
         value = pair[1]
         if not value:                             # would match every file
@@ -928,7 +897,105 @@ def _forbidden_values(conn: sqlite3.Connection, occurrence_ids
             indexed.setdefault(value[:probe_len], []).append(pair)
         else:
             unindexed.append(pair)
-    return probe_len, indexed, unindexed
+    return indexed, unindexed
+
+
+def _compact_whitespace(text: str) -> str:
+    """Remove Unicode whitespace and preserve every other code point."""
+    return "".join(character for character in text if not character.isspace())
+
+
+def _forbidden_values(conn: sqlite3.Connection, occurrence_ids
+                      ) -> tuple[int, _ProbeIndex, _ProbeIndex]:
+    """A probe index of (kind, value) for everything that must never reach the vault.
+
+    Every stored revision, not only the current one: a superseded revision's
+    transcript is exactly as confidential as the one being rendered.
+
+    Raw values retain the existing exact long-segment and audio checks. A
+    separate compact domain has one complete transcript per revision with only
+    Unicode whitespace removed. Keeping the domains separate lets each file be
+    indexed once in the spelling appropriate to that probe.
+    """
+    # ~4 words of prose: long enough that vault text does not collide with the
+    # start of a transcript line, short enough to index all but a stray value.
+    probe_len = 32
+    raw_values: dict[_Probe, None] = {}           # deduplicated, insertion order
+    compact_values: dict[_Probe, None] = {}
+    for occurrence_id in occurrence_ids:
+        for entry in list_meeting_revisions(conn, occurrence_id):
+            meeting = get_meeting(conn, occurrence_id, revision=entry["revision"])
+            if meeting is None:
+                continue
+            for segment in meeting["transcript"]:
+                if len(segment["text"]) >= _MIN_LEAKED_TEXT:
+                    raw_values[("transcript text", segment["text"])] = None
+            complete = _compact_whitespace(
+                "".join(segment["text"] for segment in meeting["transcript"])
+            )
+            compact_values[("transcript text", complete)] = None
+            audio = meeting["audio"]
+            if audio:
+                raw_values[("audio store path", audio["stored_path"])] = None
+                raw_values[("audio digest", audio["sha256"])] = None
+                if len(audio["filename"]) >= 5:
+                    raw_values[("audio file name", audio["filename"])] = None
+    return (probe_len, _probe_index(raw_values, probe_len),
+            _probe_index(compact_values, probe_len))
+
+
+def _probe_candidates(text: str, probe_len: int, index: _ProbeIndex) -> set[_Probe]:
+    indexed, unindexed = index
+    candidates = set(unindexed)
+    # In chunks, so a large file in the vault costs bounded memory instead of
+    # one window per character all at once. Each chunk keeps the tail a probe
+    # needs to be found across the seam.
+    for start in range(0, max(len(text) - probe_len + 1, 1), 1 << 16):
+        chunk = text[start:start + (1 << 16) + probe_len - 1]
+        windows = {chunk[i:i + probe_len]
+                   for i in range(len(chunk) - probe_len + 1)}
+        for probe in windows & indexed.keys():
+            candidates.update(indexed[probe])
+    return candidates
+
+
+def _compact_with_breaks(text: str) -> tuple[str, set[int]]:
+    """Compact `text` and retain offsets at which whitespace was removed."""
+    compact = []
+    breaks = set()
+    for character in text:
+        if character.isspace():
+            breaks.add(len(compact))
+        else:
+            compact.append(character)
+    return "".join(compact), breaks
+
+
+def _word_character(character: str) -> bool:
+    return character == "_" or character.isalnum()
+
+
+def _contains_compact_probe(text: str, breaks: set[int], value: str) -> bool:
+    """Whether compact `text` contains a complete-transcript probe.
+
+    Tiny transcripts need lexical boundaries so `Yes` is not found in
+    `Yesterday`. A whitespace break is a boundary even though compaction
+    removed it. Search continues after an invalid occurrence because a later
+    standalone occurrence may still be a leak.
+    """
+    if len(value) >= _MIN_LEAKED_TEXT:
+        return value in text
+    start = text.find(value)
+    while start >= 0:
+        end = start + len(value)
+        left_ok = (not _word_character(value[0]) or start == 0
+                   or not _word_character(text[start - 1]) or start in breaks)
+        right_ok = (not _word_character(value[-1]) or end == len(text)
+                    or not _word_character(text[end]) or end in breaks)
+        if left_ok and right_ok:
+            return True
+        start = text.find(value, start + 1)
+    return False
 
 
 def _vault_pages(vault_dir: Path, top: str) -> list[tuple[str, str, str]]:
@@ -1178,24 +1245,25 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
                        blamed)
 
     # ---- nothing forbidden anywhere under the vault -------------------------
-    probe_len, indexed, unindexed = _forbidden_values(conn, sorted(expected))
-    if indexed or unindexed:
+    probe_len, raw_index, compact_index = _forbidden_values(conn, sorted(expected))
+    if any(raw_index) or any(compact_index):
         for path in sorted(vault_dir.rglob("*")):
             rel_parts = path.relative_to(vault_dir).parts
             if not path.is_file() or ".git" in rel_parts:
                 continue
             text = path.read_text(encoding="utf-8", errors="ignore")
-            candidates = set(unindexed)
-            # In chunks, so a large file in the vault costs bounded memory
-            # instead of one window per character all at once. Each chunk keeps
-            # the tail a probe needs to be found across the seam.
-            for start in range(0, max(len(text) - probe_len + 1, 1), 1 << 16):
-                chunk = text[start:start + (1 << 16) + probe_len - 1]
-                windows = {chunk[i:i + probe_len]
-                           for i in range(len(chunk) - probe_len + 1)}
-                for probe in windows & indexed.keys():
-                    candidates.update(indexed[probe])
-            for kind in sorted({k for k, value in candidates if value in text}):
+            leaked = {
+                kind for kind, value in _probe_candidates(text, probe_len, raw_index)
+                if value in text
+            }
+            if any(compact_index):
+                compact, breaks = _compact_with_breaks(text)
+                leaked.update(
+                    kind for kind, value in _probe_candidates(
+                        compact, probe_len, compact_index
+                    ) if _contains_compact_probe(compact, breaks, value)
+                )
+            for kind in sorted(leaked):
                 report("meeting.leakage.forbidden-content", "/".join(rel_parts),
                        f"{kind} from the ledger appears in this file")
 

@@ -740,7 +740,8 @@ from teammem.vaultgit import commit_all
 from tests.test_meeting_bundles import write_meeting_bundle
 from tests.test_meeting_publish import _git, _remote_ref, _vault
 from tests.test_meeting_render import CONFIG_DIR as MEETING_CONFIG_DIR
-from tests.test_meeting_render import NOTE, WEEK, _payload
+from tests.test_meeting_render import (NOTE, SHORT_TURNS, WEEK, _payload,
+                                       _short_transcript_payload)
 
 MEETING_NOW = "2026-09-02T16:00:00Z"
 MEETING_WEB_BASE = "https://git.example.com/team/team-vault"
@@ -1243,6 +1244,23 @@ def test_an_unattributable_finding_blocks_every_occurrence(bench):
     assert bench.run() == 1
 
     assert not any(bench.cfg.meeting_receipts.iterdir())
+    assert _remote_ref(bench.bare, bench.branch) == before
+
+
+def test_an_all_short_transcript_copied_into_the_summary_is_not_published(
+    bench, capsys
+):
+    payload = _short_transcript_payload()
+    payload["summary"] = "Status:\n" + "\n".join(SHORT_TURNS)
+    bench.drop(payload)
+    before = _remote_ref(bench.bare, bench.branch)
+
+    assert bench.run() == 1
+
+    captured = capsys.readouterr()
+    assert "meeting.leakage.forbidden-content" in captured.err
+    assert all(turn not in captured.err for turn in SHORT_TURNS)
+    assert not bench.receipt(payload["occurrence_id"]).exists()
     assert _remote_ref(bench.bare, bench.branch) == before
 
 
