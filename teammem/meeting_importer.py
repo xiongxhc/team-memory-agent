@@ -48,6 +48,7 @@ import secrets
 import shutil
 import sqlite3
 import stat
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,8 +68,12 @@ from .meeting_store import (
     MeetingRevisionSuperseded,
     MeetingStoreError,
     StagedAudio,
+    SourceCleanup,
+    clear_source_cleanup,
     import_meeting_revision,
     list_meeting_revisions,
+    list_meetings,
+    pending_source_cleanup,
 )
 
 
@@ -113,6 +118,7 @@ class MeetingImportResult:
     quarantined: int = 0
     activated: int = 0
     details: tuple[tuple[str, str, str], ...] = ()
+    cleanup_pending: tuple[tuple[str, int], ...] = ()
 
 
 def audio_revision_dir(audio_store: Path, occurrence_id: str, revision: int) -> Path:
@@ -749,6 +755,180 @@ def _discard_staged(
 # --- archive and quarantine -------------------------------------------------
 
 
+@contextmanager
+def _open_source(root: Path, relative: Path, *, expected: str | None = None,
+                 writable: bool = False):
+    """Hold nofollow directories and the exact source inode through destruction.
+
+    POSIX walks from the filesystem root with directory descriptors so renaming
+    an ancestor cannot redirect an open. Windows destroys through its native
+    file handle; reparse/physical-path checks precede that handle acquisition.
+    """
+    if not root.is_absolute() or len(relative.parts) != 2 or any(
+        part in (".", "..") for part in relative.parts
+    ):
+        raise OSError("invalid source cleanup location")
+    identities = json.loads(expected) if expected is not None else None
+    observed = []
+    descriptors = []
+
+    def remember(info):
+        value = [info.st_dev, info.st_ino]
+        if identities is not None and value != identities[len(observed)]:
+            raise OSError("source cleanup ownership changed")
+        observed.append(value)
+
+    try:
+        if os.name == "nt":
+            if root.resolve() != root:
+                raise OSError("source root changed")
+            directory = root
+            for name in (None, *relative.parts):
+                if name is not None:
+                    directory = directory / name
+                info = directory.lstat()
+                if not stat.S_ISDIR(info.st_mode) or getattr(info, "st_reparse_tag", 0):
+                    raise OSError("source directory is not owned")
+                remember(info)
+            audio = directory / AUDIO_FILENAME
+            info = audio.lstat()
+            if not stat.S_ISREG(info.st_mode) or getattr(info, "st_reparse_tag", 0):
+                raise OSError("source audio is not a regular file")
+            descriptor = (_open_windows_existing(audio) if writable
+                          else os.open(audio, os.O_RDONLY | _FILE_FLAGS))
+            descriptors.append(descriptor)
+        else:
+            descriptor = os.open(root.anchor, _DIRECTORY_FLAGS)
+            descriptors.append(descriptor)
+            for name in root.parts[1:]:
+                descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                descriptors.append(descriptor)
+            remember(os.fstat(descriptor))
+            for name in relative.parts:
+                descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+                descriptors.append(descriptor)
+                remember(os.fstat(descriptor))
+            descriptor = os.open(
+                AUDIO_FILENAME, (os.O_RDWR if writable else os.O_RDONLY) | _FILE_FLAGS
+                | os.O_NONBLOCK,  # a replacement FIFO must fail the regular-file check, not wait
+                dir_fd=descriptor,
+            )
+            descriptors.append(descriptor)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("source audio is not a regular file")
+        remember(info)
+        yield descriptor, json.dumps(observed, separators=(",", ":"))
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _capture_source(bundle: MeetingBundle, inbox: Path) -> SourceCleanup:
+    root = inbox.resolve()
+    relative = bundle.path.resolve().relative_to(root)
+    if relative.parts != (occurrence_path_segment(bundle.occurrence_id), str(bundle.revision)):
+        raise _Rejected("path_escape")
+    with _open_source(root, relative) as (descriptor, identity):
+        digest, size = _digest_descriptor(descriptor)
+        if (digest, size) != (bundle.payload["audio"]["sha256"], bundle.payload["audio"]["bytes"]):
+            raise _Rejected("audio_hash_mismatch")
+    return SourceCleanup(str(root), relative.as_posix(), identity)
+
+
+def _source_has_bytes(row: dict, *, destroy: bool = False, dry_run: bool = False) -> bool:
+    root, relative = Path(row["source_root"]), Path(row["relative_path"])
+    if relative.parts != (occurrence_path_segment(row["occurrence_id"]), str(row["revision"])):
+        raise OSError("invalid source cleanup location")
+    try:
+        with _open_source(root, relative, expected=row["identity"],
+                          writable=destroy and not dry_run) as (descriptor, _):
+            if os.fstat(descriptor).st_size == 0:
+                return False
+            if _digest_descriptor(descriptor) != (row["sha256"], row["bytes"]):
+                raise OSError("source audio ownership changed")
+            if destroy:
+                if not dry_run:
+                    # No conditional inode unlink exists on POSIX. Destroy the
+                    # held inode and retain its zero-byte name; never unlink a
+                    # replacement which raced into that pathname.
+                    _discard_owned_descriptor(descriptor)
+                return False
+            return True
+    except FileNotFoundError:
+        return False
+
+
+def cleanup_source_copy(conn, row: dict, *, archive: Path | None = None,
+                        dry_run: bool = False) -> bool:
+    """Discharge one source obligation, returning only a redacted success flag.
+
+    A freshly revalidated intact bundle may complete normal metadata archiving.
+    Partial sources and expiry destroy only proved owned ciphertext. Any failed
+    probe, replacement, archive, destruction or DB clear keeps durable debt.
+    """
+    try:
+        present = _source_has_bytes(row)
+        if present and archive is not None:
+            try:
+                bundle = load_meeting_bundle(
+                    Path(row["source_root"]) / row["relative_path"], Path(row["source_root"]))
+            except MeetingBundleError:
+                bundle = None
+            if bundle is not None:
+                if bundle.artifact_hash != row["artifact_hash"]:
+                    return False
+                _source_has_bytes(row)  # loader I/O must not transfer directory ownership
+                if not dry_run:
+                    _archive_bundle(bundle, archive)
+                present = False if dry_run else _source_has_bytes(row)
+                if present:
+                    return False
+        if present:
+            _source_has_bytes(row, destroy=True, dry_run=dry_run)
+        if not dry_run:
+            clear_source_cleanup(conn, row)
+        return True
+    except (OSError, sqlite3.Error, ValueError, RuntimeError):
+        return False
+
+
+def sync_source_cleanup_alerts(conn, *, alert_path, now: str, dry_run: bool = False) -> list:
+    """Maintain cleanup-only alerts without touching incomplete-transcript alerts.
+
+    Only public identity, revision and exact retention deadline are emitted.
+    Filesystem and database exceptions never enter an alert or service result.
+    """
+    pending = {}
+    for row in pending_source_cleanup(conn):
+        pending.setdefault(row["occurrence_id"], {})[row["revision"]] = row["audio_expires_at"]
+    failed = []
+    for meeting in list_meetings(conn):
+        occurrence_id = meeting["occurrence_id"]
+        base = alert_path(occurrence_id)
+        path = base.with_name(base.stem + ".source-cleanup.json")
+        revisions = pending.get(occurrence_id)
+        if dry_run:
+            continue
+        try:
+            if revisions:
+                payload = {
+                    "schema": "teammem-meeting-source-cleanup-alert/v1",
+                    "status": "source_cleanup_pending",
+                    "occurrence_id": occurrence_id,
+                    "revisions": sorted(revisions),
+                    "audio_expires_at": [revisions[revision] for revision in sorted(revisions)],
+                    "warned_at": now,
+                    "action": "retry source cleanup; retention is not extended",
+                }
+                _write_atomic(path, (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+            else:
+                path.unlink(missing_ok=True)
+        except OSError:
+            failed.append((occurrence_id, meeting["current_revision"]))
+    return failed
+
+
 def _archive_bundle(bundle: MeetingBundle, archive: Path) -> None:
     """Keep the source JSON by occurrence/revision, then consume the inbox copy.
 
@@ -925,8 +1105,6 @@ def import_meeting_inbox(
     counts = dict.fromkeys(OUTCOMES, 0)
     details: list[tuple[str, str, str]] = []
     inbox = Path(inbox)
-    if not inbox.is_dir():
-        return MeetingImportResult()
 
     projection = _Projection(conn) if dry_run else None
 
@@ -937,7 +1115,22 @@ def import_meeting_inbox(
         # transcript, nothing but percent-encoded path components.
         log.info("meeting bundle %s: %s (%s)", label, outcome, code)
 
-    for candidate in _candidates(inbox):
+    # Retry before READY discovery, including former inbox roots and partial
+    # directories. Never quarantine a source already accepted into our ledger:
+    # moving it would silently move its ciphertext outside recorded custody.
+    obligations = pending_source_cleanup(conn)
+    governed = {Path(row["source_root"]) / row["relative_path"] for row in obligations}
+    if not dry_run:
+        for row in obligations:
+            resolved = cleanup_source_copy(conn, row, archive=archive)
+            record(row["occurrence_id"], "unchanged", "ok" if resolved else "archive_failed",
+                   row["relative_path"])
+    physical_inbox = inbox.resolve()
+    for candidate in _candidates(inbox) if inbox.is_dir() else ():
+        physical_candidate = physical_inbox / candidate.path.relative_to(inbox)
+        if any(physical_candidate == source or physical_candidate in source.parents
+               for source in governed):
+            continue
         if candidate.symlink:
             if not dry_run:
                 _quarantine_symlink(candidate, quarantine)
@@ -966,6 +1159,7 @@ def import_meeting_inbox(
 
         before = _current_revision(conn, bundle.occurrence_id)
         try:
+            source = _capture_source(bundle, inbox)
             adopted = _stage_audio(bundle, audio_store, vault_dir)
         except _Rejected as exc:
             _quarantine_bundle(candidate, quarantine, exc.code, bundle=bundle)
@@ -973,6 +1167,17 @@ def import_meeting_inbox(
             continue
 
         try:
+            source_row = {
+                **vars(source), "occurrence_id": bundle.occurrence_id,
+                "revision": bundle.revision, "sha256": bundle.payload["audio"]["sha256"],
+                "bytes": bundle.payload["audio"]["bytes"],
+            }
+
+            def before_commit():
+                adopted.before_commit()
+                if not _source_has_bytes(source_row):
+                    raise OSError("source cleanup ownership disappeared before commit")
+
             stored = import_meeting_revision(
                 conn,
                 payload=bundle.payload,
@@ -981,7 +1186,8 @@ def import_meeting_inbox(
                 artifact_hash=bundle.artifact_hash,
                 audio=adopted.staged,
                 imported_at=now,
-                before_commit=adopted.before_commit,
+                before_commit=before_commit,
+                source_cleanup=source,
             )
         except _Rejected as exc:
             _discard_staged(
@@ -1010,14 +1216,17 @@ def import_meeting_inbox(
         else:
             outcome = "activated"
         try:
+            _source_has_bytes(source_row)
             _archive_bundle(bundle, archive)
-        except OSError:
+            if _source_has_bytes(source_row):
+                raise OSError("source archive cleanup incomplete")
+            clear_source_cleanup(conn, source_row)
+        except (OSError, sqlite3.Error):
             # The revision is committed. Failing to file the source copy does
             # not undo that, so report the outcome the store actually produced
             # with a code saying the archive is incomplete, and carry on with
-            # the rest of the scan. Both halves of archiving are idempotent —
-            # the atomic writes overwrite, and a re-delivered bundle replays
-            # through the store's `unchanged` path — so a rescan self-heals.
+            # the rest of the scan. The already-committed source obligation
+            # survives restart and partial removal independently of READY.
             record(bundle.occurrence_id, outcome, "archive_failed", candidate.label)
             continue
         record(bundle.occurrence_id, outcome, "ok", candidate.label)
@@ -1028,4 +1237,7 @@ def import_meeting_inbox(
         quarantined=counts["quarantined"],
         activated=counts["activated"],
         details=tuple(details),
+        cleanup_pending=tuple(sorted({
+            (row["occurrence_id"], row["revision"]) for row in pending_source_cleanup(conn)
+        })),
     )

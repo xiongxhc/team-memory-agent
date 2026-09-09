@@ -53,6 +53,7 @@ MEETING_TABLES = (
     "meeting_recording_gaps",
     "meeting_processing_warnings",
     "meeting_audio",
+    "meeting_source_cleanup",
 )
 
 EVIDENCE_KINDS = ("project", "decision", "action_item", "discussion_point")
@@ -296,6 +297,17 @@ CREATE TABLE IF NOT EXISTS meeting_audio (
 
 CREATE INDEX IF NOT EXISTS idx_meeting_audio_expiry
   ON meeting_audio(audio_expires_at) WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS meeting_source_cleanup (
+  occurrence_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  source_root TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  identity TEXT NOT NULL,
+  PRIMARY KEY (occurrence_id, revision, source_root, relative_path),
+  FOREIGN KEY (occurrence_id, revision)
+    REFERENCES meeting_audio(occurrence_id, revision) ON DELETE CASCADE
+);
 """
 
 
@@ -323,6 +335,20 @@ class StagedAudio:
     stored_path: str
     sha256: str
     bytes: int
+
+
+@dataclass(frozen=True)
+class SourceCleanup:
+    """Loader-verified physical location and root/directory/file inode identities.
+
+    Digest, size, artifact hash and exact expiry remain on the referenced revision.
+    This obligation is inserted before that revision's commit, never as recovery
+    after a failed archive, which would lose ownership on a process crash.
+    """
+
+    source_root: str
+    relative_path: str
+    identity: str
 
 
 @dataclass(frozen=True)
@@ -434,6 +460,7 @@ def import_meeting_revision(
     audio: StagedAudio,
     imported_at: str,
     before_commit: Callable[[], None],
+    source_cleanup: SourceCleanup | None = None,
 ) -> RevisionImportResult:
     """Store one validated meeting revision and make it current if it is newer.
 
@@ -452,7 +479,8 @@ def import_meeting_revision(
     the sole owner of the SQL transaction. Callers without adopted filesystem
     state must still make that decision explicit with a no-op callback.
 
-    Replaying the same `(occurrence_id, revision, artifact_hash)` is a no-op.
+    Replaying the same `(occurrence_id, revision, artifact_hash)` preserves every
+    artifact row, but may atomically register another validated source copy.
     The same revision with a different hash raises `MeetingRevisionConflict`; a
     revision below the current one raises `MeetingRevisionSuperseded`.
     """
@@ -483,7 +511,12 @@ def import_meeting_revision(
                         "different artifact hash; a revision is immutable once imported"
                     )
                 current, stored_expiry = _current_state(conn, occurrence_id, revision)
-                conn.rollback()
+                if source_cleanup is not None:
+                    _insert_source_cleanup(conn, (occurrence_id, revision), source_cleanup)
+                    before_commit()
+                    conn.commit()
+                else:
+                    conn.rollback()
                 return RevisionImportResult(
                     occurrence_id=occurrence_id,
                     revision=revision,
@@ -528,6 +561,8 @@ def import_meeting_revision(
             _insert_provenance(conn, key, payload)
             _insert_gaps_and_warnings(conn, key, payload)
             _insert_audio(conn, key, payload, audio, expires_at)
+            if source_cleanup is not None:
+                _insert_source_cleanup(conn, key, source_cleanup)
             _activate_revision(conn, key, payload)
             before_commit()
         except Exception:
@@ -543,6 +578,43 @@ def import_meeting_revision(
         current_revision=revision,
         audio_expires_at=expires_at,
     )
+
+
+def _insert_source_cleanup(conn, key: tuple[str, int], source: SourceCleanup) -> None:
+    location = (*key, source.source_root, source.relative_path)
+    conn.execute(
+        "INSERT OR IGNORE INTO meeting_source_cleanup "
+        "(occurrence_id, revision, source_root, relative_path, identity) VALUES (?, ?, ?, ?, ?)",
+        (*location, source.identity),
+    )
+    identity = conn.execute(
+        "SELECT identity FROM meeting_source_cleanup WHERE occurrence_id = ? AND revision = ? "
+        "AND source_root = ? AND relative_path = ?", location,
+    ).fetchone()[0]
+    if identity != source.identity:
+        raise MeetingStoreError("source cleanup ownership changed")
+
+
+def pending_source_cleanup(conn: sqlite3.Connection) -> list[dict]:
+    cursor = conn.execute(
+        "SELECT s.*, a.sha256, a.bytes, a.audio_expires_at, f.artifact_hash "
+        "FROM meeting_source_cleanup s JOIN meeting_audio a USING (occurrence_id, revision) "
+        "JOIN meeting_artifacts f USING (occurrence_id, revision) "
+        "ORDER BY s.occurrence_id, s.revision, s.source_root, s.relative_path"
+    )
+    names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row)) for row in cursor]
+
+
+def clear_source_cleanup(conn: sqlite3.Connection, row: dict) -> None:
+    """Clear only the exact obligation proved discharged; failure leaves retry debt."""
+    with conn:
+        conn.execute(
+            "DELETE FROM meeting_source_cleanup WHERE occurrence_id = ? AND revision = ? "
+            "AND source_root = ? AND relative_path = ? AND identity = ?",
+            tuple(row[name] for name in (
+                "occurrence_id", "revision", "source_root", "relative_path", "identity")),
+        )
 
 
 def _current_state(conn: sqlite3.Connection, occurrence_id: str, revision: int) -> tuple[int, str]:

@@ -24,7 +24,8 @@ from .docs_sync import sync_docs
 from .events import Event
 from .identity import IdentityMaps, _read
 from .meeting_bundles import occurrence_path_segment
-from .meeting_importer import MeetingImportResult, import_meeting_inbox
+from .meeting_importer import (MeetingImportResult, import_meeting_inbox,
+                               sync_source_cleanup_alerts)
 from .meeting_publish import PublishRefused, publish_meeting
 from .meeting_retention import RetentionResult, expire_meeting_audio
 from .meeting_store import list_meetings
@@ -770,7 +771,7 @@ class MeetingRunResult:
     @property
     def exit_code(self) -> int:
         """A quarantined bundle is a failure too: the producer must see it."""
-        return int(bool(self.refused or self.imported.quarantined))
+        return int(bool(self.refused or self.imported.quarantined or self.imported.cleanup_pending))
 
 
 def meeting_receipt_path(cfg: Config, occurrence_id: str) -> Path:
@@ -933,7 +934,10 @@ def execute_process_meetings(
         return MeetingRunResult(imported=imported, pending=tuple(unpublished))
 
     receipts: list[dict] = []
-    refused: list[MeetingFailure] = []
+    refused = [MeetingFailure(occurrence_id, "source_cleanup_alert",
+                              "source cleanup alert update failed; retry required")
+               for occurrence_id, _ in sync_source_cleanup_alerts(
+                   conn, alert_path=partial(meeting_alert_path, cfg), now=now)]
     for occurrence_id in unpublished:
         head = _vault_head(cfg.vault_dir)
         snapshot = _managed_snapshot(cfg.vault_dir)
@@ -1005,6 +1009,9 @@ def run_process_meetings(
     for name, outcome, reason in imported.details:
         if outcome == "quarantined":
             print(f"{prefix}quarantined {name}: {reason}", file=sys.stderr)
+    for occurrence_id, revision in imported.cleanup_pending:
+        print(f"{prefix}source_cleanup_pending {occurrence_id} revision {revision}: "
+              "retry required; retention is not extended", file=sys.stderr)
     for occurrence_id in result.pending:
         print(f"{prefix}would publish {occurrence_id}")
     for receipt in result.receipts:
@@ -1061,13 +1068,17 @@ def run_expire_meeting_audio(
         return 2
 
     prefix = "dry-run: " if dry_run else ""
-    if conn is not None:
-        connection = conn
-    elif dry_run and not cfg.db_path.exists():
-        connection = open_db(Path(":memory:"))   # classify without creating a ledger
-    else:
-        connection = open_db(cfg.db_path)
-    result = execute_expire_meeting_audio(cfg, now=now, conn=connection, dry_run=dry_run)
+    try:
+        connection = (open_db_snapshot(cfg.db_path, conn=conn) if dry_run
+                      else conn if conn is not None else open_db(cfg.db_path))
+    except ValueError as failure:
+        print(f"error: {redact_secrets(failure, cfg)}", file=sys.stderr)
+        return 2
+    try:
+        result = execute_expire_meeting_audio(cfg, now=now, conn=connection, dry_run=dry_run)
+    finally:
+        if dry_run or conn is None:
+            connection.close()
 
     print(
         f"{prefix}meeting audio: deleted={len(result.deleted)} "
@@ -1100,4 +1111,7 @@ def run_expire_meeting_audio(
             f"{failure.stage}: {redact_secrets(failure.detail, cfg)}",
             file=sys.stderr,
         )
+    for occurrence_id, revision in result.source_cleanup_pending:
+        print(f"{prefix}source_cleanup_pending {occurrence_id} revision {revision}: "
+              "retry required; retention is not extended", file=sys.stderr)
     return result.exit_code

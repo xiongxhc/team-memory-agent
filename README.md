@@ -405,16 +405,28 @@ One run imports every ready bundle from the meeting inbox, renders the vault,
 verifies it against the ledger, pushes, confirms the configured remote holds the
 commit, and only then writes that occurrence's receipt. It asks for no approval
 at any step. A receipt therefore means the note is published: rendered locally
-and committed locally are not receipts, and a failed run writes none.
+and committed locally are not receipts, and a failed publication writes no receipt
+for that occurrence.
 
 Occurrences are processed independently. A malformed bundle is quarantined with
 its reason and the next one still publishes; a refused publication leaves that
 occurrence without a receipt and retryable on the next run, without holding up
 any other meeting. The command exits `0` when everything published, `1` when a
-bundle was quarantined or a publication was refused, and `2` when the
-configuration itself is wrong. `--dry-run` reports what a real run would import
+bundle was quarantined, a publication was refused, or accepted-source cleanup
+remains pending, and `2` when the configuration itself is wrong. `--dry-run`
+reports what a real run would import
 and publish and writes nothing at all: no ledger row, no audio file, no vault
 file, no commit, no push, no receipt.
+
+An accepted source whose metadata archive or directory removal fails remains a
+durable cleanup obligation in the same transaction as its revision. Replays can
+register additional physical source copies. Every real run retries these
+obligations, including a partial bundle without `READY` and sources beneath a
+previously configured inbox root. Publication continues while cleanup failures
+return `1` with `source_cleanup_pending` and a separate
+`*.source-cleanup.json` alert in `TEAMMEM_MEETING_ALERTS`. These alerts contain
+occurrence/revision/deadline information, never transcript text, titles, source
+paths, digests, or raw exceptions. Resolving cleanup removes only its cleanup alert.
 
 `TEAMMEM_VAULT_REMOTE` and `TEAMMEM_VAULT_REF` (default `origin` and
 `refs/heads/main`) declare where receipts point. The run refuses before touching
@@ -452,6 +464,23 @@ timestamps as fixed-width UTC microseconds (for example,
 `2026-09-16T14:52:00.000000Z`). A deletion timestamp records when deletion
 actually happened; migration preserves that evidence instead of rewriting it to
 the deadline.
+
+Expiry destroys the primary ciphertext even if source cleanup or metadata
+archiving fails. It records deletion only after every recorded duplicate is also
+gone; a failure remains visible and retryable without extending retention.
+Deferred cleanup checks the captured physical root, directory and audio identities
+and the recording's hash/size. Replaced files and symlinks are preserved and
+reported. On POSIX, partial-source cleanup destroys bytes through the verified
+file descriptor and may retain a zero-byte `audio.enc` placeholder; it never
+unlinks a concurrent replacement by pathname. Normal freshly validated archival
+still removes the complete source bundle.
+
+The additive migration creates cleanup tracking without scanning source files.
+Legacy accepted bundles are enrolled when a real inbox run validates them again;
+old source copies under former roots that were never recorded cannot be located
+automatically. Operators must account for those historical locations separately.
+Both meeting commands run dry-run migrations only in an ephemeral ledger snapshot
+and leave source bytes, durable schema and alerts unchanged.
 
 When a meeting's current transcript is still incomplete and its recording is
 within `TEAMMEM_MEETING_WARN_DAYS` (default 3, `0` to warn about nothing) of

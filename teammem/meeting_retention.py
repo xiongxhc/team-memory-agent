@@ -47,6 +47,8 @@ from .meeting_importer import (
     _same_inode,
     _write_atomic,
     audio_revision_dir,
+    cleanup_source_copy,
+    sync_source_cleanup_alerts,
 )
 from .meeting_store import (
     MEETING_AUDIO_WARN_DAYS,
@@ -54,6 +56,7 @@ from .meeting_store import (
     get_meeting,
     list_meetings,
     mark_audio_deleted,
+    pending_source_cleanup,
 )
 
 log = logging.getLogger(__name__)
@@ -83,12 +86,13 @@ class RetentionResult:
     cleared: tuple[str, ...] = ()                  # alerts whose warning has lapsed
     failed: tuple[RetentionFailure, ...] = ()
     dry_run: bool = False
+    source_cleanup_pending: tuple[tuple[str, int], ...] = ()
 
     @property
     def exit_code(self) -> int:
         """An alert is a non-zero outcome: somebody has to act before the
         deadline, and nothing else in this pipeline will tell them."""
-        return int(bool(self.failed or self.alerted or self.mismatched))
+        return int(bool(self.failed or self.alerted or self.mismatched or self.source_cleanup_pending))
 
 
 def _instant(value: str, field: str) -> datetime:
@@ -137,7 +141,8 @@ def expire_meeting_audio(
     failed: list[RetentionFailure] = []
     stamp = _stamp(_instant(now, "now"))
 
-    for row in audio_due_for_expiry(conn, now):
+    due = audio_due_for_expiry(conn, now)
+    for row in due:
         if store is None:
             failed.append(RetentionFailure(
                 row["occurrence_id"], row["revision"], "containment", str(root_error)))
@@ -154,8 +159,22 @@ def expire_meeting_audio(
                 row["occurrence_id"], row["revision"], "path", str(error)))
     swept = [] if store is None else _sweep_revived(
         conn, store, dry_run=dry_run, failed=failed)
+    # A redelivery after an earlier expiry must not bypass source governance
+    # just because deleted_at is already set. Preserve that historical audit
+    # timestamp while independently destroying its new captured source copy.
+    due_keys = {(row["occurrence_id"], row["revision"]) for row in due}
+    for source in pending_source_cleanup(conn):
+        key = (source["occurrence_id"], source["revision"])
+        if key not in due_keys and source["audio_expires_at"] <= stamp:
+            if not cleanup_source_copy(conn, source, dry_run=dry_run):
+                failed.append(RetentionFailure(*key, "source_cleanup", "source cleanup pending; retry required"))
     alerted, cleared = _warn(conn, now=now, warn_days=warn_days,
                              alert_path=alert_path, dry_run=dry_run, failed=failed)
+    for occurrence_id, revision in sync_source_cleanup_alerts(
+        conn, alert_path=alert_path, now=stamp, dry_run=dry_run
+    ):
+        failed.append(RetentionFailure(occurrence_id, revision, "source_cleanup_alert",
+                                       "source cleanup alert update failed; retry required"))
     return RetentionResult(
         deleted=tuple(deleted),
         swept=tuple(swept),
@@ -164,6 +183,9 @@ def expire_meeting_audio(
         cleared=tuple(cleared),
         failed=tuple(failed),
         dry_run=dry_run,
+        source_cleanup_pending=tuple(sorted({
+            (row["occurrence_id"], row["revision"]) for row in pending_source_cleanup(conn)
+        })),
     )
 
 
@@ -239,8 +261,13 @@ def _expire_one(
             if digest != row["sha256"] or size != row["bytes"]:
                 mismatched.append(key)
 
+    sources = [source for source in pending_source_cleanup(conn)
+               if (source["occurrence_id"], source["revision"]) == key]
     if dry_run:
-        deleted.append(key)
+        if all(cleanup_source_copy(conn, source, dry_run=True) for source in sources):
+            deleted.append(key)
+        else:
+            failed.append(RetentionFailure(*key, "source_cleanup", "source cleanup pending; retry required"))
         return
 
     custody_descriptors = ()
@@ -272,6 +299,13 @@ def _expire_one(
         finally:
             for descriptor in custody_descriptors:
                 os.close(descriptor)
+    # Primary destruction is never held hostage by metadata archiving or source
+    # permissions. Every captured duplicate must also be discharged before the
+    # ledger can claim deletion, including sources beneath former inbox roots.
+    resolved = [cleanup_source_copy(conn, source) for source in sources]
+    if not all(resolved):
+        failed.append(RetentionFailure(*key, "source_cleanup", "source cleanup pending; retry required"))
+        return
     try:
         mark_audio_deleted(conn, row["occurrence_id"], row["revision"], stamp)
     except sqlite3.Error as error:
