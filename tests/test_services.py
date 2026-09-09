@@ -973,6 +973,52 @@ def test_dry_run_writes_no_database_vault_audio_receipt_or_commit(bench):
     assert snapshot() == before
 
 
+def test_dry_run_legacy_wal_preserves_ledger_and_every_meeting_directory(bench, capsys):
+    from tests.test_store import legacy_wal_ledger, ledger_bytes, ledger_logical
+
+    bench.cfg.db_path = bench.tmp_path / "legacy.db"
+    bench.drop(_payload())
+    def files():
+        return {p.relative_to(bench.tmp_path): (p.read_bytes(), p.stat().st_mode)
+                for p in bench.tmp_path.rglob("*") if p.is_file()}
+
+    with legacy_wal_ledger(bench.cfg.db_path) as caller:
+        logical = ledger_logical(caller)
+        before = files()
+        for _ in range(2):
+            assert bench.run(dry_run=True) == 0
+            assert "accepted=1" in capsys.readouterr().out
+            assert files() == before
+            assert ledger_logical(caller) == logical
+
+        # Caller ownership survives both successful snapshotting and refusal.
+        assert run_process_meetings(bench.cfg, bench.ids, now=MEETING_NOW,
+                                    dry_run=True, conn=caller) == 0
+        assert files() == before
+        caller.execute("BEGIN")
+        bytes_before = ledger_bytes(bench.cfg.db_path)
+        assert run_process_meetings(bench.cfg, bench.ids, now=MEETING_NOW,
+                                    dry_run=True, conn=caller) == 2
+        assert "transaction" in capsys.readouterr().err
+        assert caller.in_transaction
+        assert ledger_bytes(bench.cfg.db_path) == bytes_before
+        caller.rollback()
+
+
+def test_dry_run_closes_owned_snapshot_when_processing_fails(bench, monkeypatch):
+    captured = []
+
+    def fail_processing(*args, conn, **kwargs):
+        captured.append(conn)
+        raise RuntimeError("processing failed")
+
+    monkeypatch.setattr(services_module, "execute_process_meetings", fail_processing)
+    with pytest.raises(RuntimeError, match="processing failed"):
+        bench.run(dry_run=True)
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        captured[0].execute("SELECT 1")
+
+
 def test_a_vault_publishing_to_another_ref_refuses_before_rendering(bench):
     bench.drop(_payload())
     bench.cfg.vault_ref = "refs/heads/somewhere-else"

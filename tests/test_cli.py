@@ -1353,6 +1353,26 @@ def test_main_process_meetings_dry_run_writes_nothing(
     assert not (tmp_path / "meeting-audio").exists()
 
 
+def test_main_process_meetings_dry_run_preserves_legacy_wal_ledger(
+    tmp_path, monkeypatch, capsys
+):
+    from tests.test_store import legacy_wal_ledger, ledger_bytes, ledger_logical
+
+    _vault_dir, _bare, _branch, inbox = _meeting_hub(tmp_path, monkeypatch)
+    _drop_meeting(inbox)
+    path = tmp_path / "ledger.db"
+    with legacy_wal_ledger(path) as writer:
+        logical = ledger_logical(writer)
+        before = ledger_bytes(path)
+        for _ in range(2):
+            assert main(["process-meetings", "--now", MEETING_NOW, "--dry-run"]) == 0
+            assert "accepted=1" in capsys.readouterr().out
+            assert ledger_bytes(path) == before
+            assert ledger_logical(writer) == logical
+    assert not (tmp_path / "meeting-receipts").exists()
+    assert not (tmp_path / "meeting-audio").exists()
+
+
 def test_main_process_meetings_without_configuration_exits_2(
     tmp_path, monkeypatch, capsys
 ):

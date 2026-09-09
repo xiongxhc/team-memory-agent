@@ -37,7 +37,7 @@ from .reclaim import reclaim, reclaim_channel_projects
 from .render import MANAGED, render_vault_verified, verify_vault
 from .render import _managed_files as managed_vault_files
 from .slices import active_person_days
-from .store import get_summary, insert_events, open_db, reconcile_gitlab_events
+from .store import get_summary, insert_events, open_db, open_db_snapshot, reconcile_gitlab_events
 from .summarize import (
     DAILY_SYSTEM,
     LLM,
@@ -983,14 +983,18 @@ def run_process_meetings(
         return 2
 
     prefix = "dry-run: " if dry_run else ""
-    if conn is not None:
-        connection = conn
-    elif dry_run and not cfg.db_path.exists():
-        connection = open_db(Path(":memory:"))   # classify without creating a ledger
-    else:
-        connection = open_db(cfg.db_path)
-    result = execute_process_meetings(
-        cfg, ids, now=now, conn=connection, dry_run=dry_run)
+    try:
+        connection = (open_db_snapshot(cfg.db_path, conn=conn) if dry_run
+                      else conn if conn is not None else open_db(cfg.db_path))
+    except ValueError as failure:
+        print(f"error: {redact_secrets(failure, cfg)}", file=sys.stderr)
+        return 2
+    try:
+        result = execute_process_meetings(
+            cfg, ids, now=now, conn=connection, dry_run=dry_run)
+    finally:
+        if dry_run or conn is None:
+            connection.close()
 
     imported = result.imported
     print(

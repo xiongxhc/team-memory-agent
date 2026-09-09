@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,196 @@ PROVENANCE = {
     "source_input_hash", "effective_flags_json",
 }
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
+
+
+@contextmanager
+def legacy_wal_ledger(path):
+    """An unmigrated ledger with committed data found only in its live WAL."""
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE summaries (
+            id INTEGER PRIMARY KEY, kind TEXT, key TEXT, input_hash TEXT,
+            text TEXT, model TEXT, created_ts TEXT, UNIQUE(kind, key));
+        CREATE TABLE marker (value TEXT);
+        INSERT INTO marker VALUES ('checkpointed');
+        PRAGMA user_version = 7;
+        PRAGMA journal_mode = WAL;
+        PRAGMA wal_autocheckpoint = 0;
+    """)
+    conn.execute("INSERT INTO marker VALUES ('committed WAL only')")
+    conn.commit()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def ledger_bytes(path):
+    return {suffix: p.read_bytes() if p.exists() else None
+            for suffix in ("", "-wal", "-shm", "-journal")
+            for p in [Path(str(path) + suffix)]}
+
+
+def ledger_logical(conn):
+    return (list(conn.iterdump()), {
+        name: conn.execute(f"PRAGMA {name}").fetchall()
+        for name in ("schema_version", "user_version", "page_count", "freelist_count")
+    })
+
+
+def test_dry_run_snapshot_migrates_legacy_wal_without_touching_source(tmp_path):
+    from teammem import store
+
+    path = tmp_path / "ledger.db"
+    with legacy_wal_ledger(path) as writer:
+        logical_before = ledger_logical(writer)
+        before = ledger_bytes(path)
+        for _ in range(2):
+            conn = store.open_db_snapshot(path)
+            try:
+                assert conn.execute("SELECT value FROM marker").fetchall() == [
+                    ("checkpointed",), ("committed WAL only",)]
+                assert PROVENANCE <= {r[1] for r in conn.execute("PRAGMA table_info(summaries)")}
+                assert conn.execute("SELECT COUNT(*) FROM meetings").fetchone() == (0,)
+            finally:
+                conn.close()
+            assert ledger_bytes(path) == before
+            assert ledger_logical(writer) == logical_before
+
+
+def test_dry_run_snapshot_resolves_database_alias_before_finding_wal(tmp_path):
+    from teammem import store
+
+    path = tmp_path / "ledger.db"
+    alias = tmp_path / "alias.db"
+    alias.symlink_to(path)
+    with legacy_wal_ledger(path):
+        before = ledger_bytes(path)
+        conn = store.open_db_snapshot(alias)
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM marker").fetchone() == (2,)
+        finally:
+            conn.close()
+        assert ledger_bytes(path) == before
+        assert ledger_bytes(alias)["-wal"] is None
+
+
+def test_dry_run_snapshot_repairs_expiry_only_in_ephemeral_view(tmp_path):
+    from teammem import store
+    from tests.test_meeting_store import _legacy_fractional_expiry_db
+
+    path = _legacy_fractional_expiry_db(tmp_path)
+    before = ledger_bytes(path)
+    conn = store.open_db_snapshot(path)
+    try:
+        assert conn.execute(
+            "SELECT audio_expires_at FROM meeting_audio ORDER BY revision"
+        ).fetchall() == [("2026-09-16T14:52:00.125000Z",), ("2026-09-16T14:52:00.875000Z",)]
+    finally:
+        conn.close()
+    assert ledger_bytes(path) == before
+
+
+def test_dry_run_snapshot_refuses_active_rollback_journal_without_recovery(tmp_path):
+    from teammem import store
+
+    path = tmp_path / "ledger.db"
+    writer = sqlite3.connect(path)
+    writer.execute("CREATE TABLE marker(value)")
+    writer.commit()
+    writer.execute("INSERT INTO marker VALUES (1)")
+    before = ledger_bytes(path)
+    try:
+        with pytest.raises(ValueError, match="journal"):
+            store.open_db_snapshot(path)
+        assert ledger_bytes(path) == before
+        assert writer.in_transaction
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_dry_run_snapshot_retries_changed_wal_and_refuses_continuous_writes(
+    tmp_path, monkeypatch, continuous,
+):
+    from teammem import store
+    import shutil
+
+    path = tmp_path / "ledger.db"
+    real_copy = shutil.copyfile
+    with legacy_wal_ledger(path) as writer:
+        copies = []
+
+        def racing_copy(source, target):
+            result = real_copy(source, target)
+            if str(source).endswith("-wal"):
+                copies.append(source)
+                if continuous or len(copies) == 1:
+                    writer.execute("INSERT INTO marker VALUES ('raced')")
+                    writer.commit()
+            return result
+
+        monkeypatch.setattr(shutil, "copyfile", racing_copy)
+        if continuous:
+            with pytest.raises(ValueError, match="stable.*snapshot"):
+                store.open_db_snapshot(path)
+        else:
+            conn = store.open_db_snapshot(path)
+            try:
+                assert conn.execute("SELECT COUNT(*) FROM marker").fetchone() == (3,)
+            finally:
+                conn.close()
+        assert 1 < len(copies) <= 3
+
+
+def test_dry_run_snapshot_preserves_in_memory_caller_transaction(tmp_path):
+    from teammem import store
+
+    caller = sqlite3.connect(":memory:")
+    caller.execute("CREATE TABLE marker(value)")
+    caller.execute("INSERT INTO marker VALUES ('uncommitted')")
+    before = ledger_logical(caller)
+    conn = store.open_db_snapshot(tmp_path / "absent.db", conn=caller)
+    assert conn.execute("SELECT value FROM marker").fetchall() == [("uncommitted",)]
+    conn.close()
+    assert caller.in_transaction
+    assert ledger_logical(caller) == before
+    assert not (tmp_path / "absent.db").exists()
+    caller.rollback()
+    caller.close()
+
+
+def test_dry_run_snapshot_refuses_disk_caller_transaction_without_changing_it(tmp_path):
+    from teammem import store
+
+    path = tmp_path / "ledger.db"
+    with legacy_wal_ledger(path) as caller:
+        caller.execute("BEGIN")
+        before = ledger_bytes(path)
+        with pytest.raises(ValueError, match="transaction"):
+            store.open_db_snapshot(path, conn=caller)
+        assert ledger_bytes(path) == before
+        assert caller.in_transaction
+        caller.rollback()
+
+
+def test_dry_run_snapshot_does_not_acquire_wal_state_on_idle_disk_caller(tmp_path):
+    from teammem import store
+
+    path = tmp_path / "ledger.db"
+    with legacy_wal_ledger(path):
+        caller = sqlite3.connect(path)
+        before = ledger_bytes(path)
+        try:
+            conn = store.open_db_snapshot(tmp_path / "wrong.db", conn=caller)
+            assert conn.execute("SELECT COUNT(*) FROM marker").fetchone() == (2,)
+            conn.close()
+            assert ledger_bytes(path) == before
+            assert not caller.in_transaction
+            assert caller.execute("SELECT 1").fetchone() == (1,)
+        finally:
+            caller.close()
 
 
 def _ev(**kw):

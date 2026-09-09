@@ -2,10 +2,12 @@
 UNIQUE(person, source, hash) key makes every ingest path idempotent."""
 
 import json
+import shutil
 import sqlite3
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from .events import Event
 from .identity import IdentityMaps
@@ -71,6 +73,15 @@ class SummaryRecord:
 
 def open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
+    try:
+        _initialize_db(conn)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def _initialize_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -84,7 +95,92 @@ def open_db(path: Path) -> sqlite3.Connection:
     else:
         conn.commit()
     migrate_meetings(conn)
-    return conn
+
+
+def _snapshot_file_state(paths: tuple[Path, ...]) -> tuple:
+    state = []
+    for path in paths:
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            state.append(None)
+        else:
+            state.append((info.st_dev, info.st_ino, info.st_size,
+                          info.st_mtime_ns, info.st_ctime_ns))
+    return tuple(state)
+
+
+def _migrated_memory_copy(path: Path) -> sqlite3.Connection:
+    """Recover and migrate only a private image, then detach it from disk."""
+    copy = sqlite3.connect(path)
+    memory = sqlite3.connect(":memory:")
+    try:
+        if copy.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise ValueError("dry-run ledger snapshot failed integrity check")
+        copy.backup(memory)
+        _initialize_db(memory)
+        return memory
+    except Exception:
+        memory.close()
+        raise
+    finally:
+        copy.close()
+
+
+def open_db_snapshot(
+    path: Path, *, conn: sqlite3.Connection | None = None,
+) -> sqlite3.Connection:
+    """Return an owned, migrated memory view without SQLite-opening the source.
+
+    File copies include committed WAL frames and rebuild SHM only in a private
+    directory. Whole-set metadata checks bound retries when writers/checkpoints
+    change the source during copying; rollback journals are conservatively
+    refused. Symlinks resolve before locating sidecars.
+
+    A disk caller's active transaction is refused: serializing it can modify
+    SHM and backing it up can self-deadlock. Idle disk callers use committed
+    durable state. In-memory callers retain their uncommitted view, ownership,
+    and transaction. Nothing commits, rolls back, migrates, or closes a caller.
+    """
+    try:
+        if conn is not None:
+            database = next(row[2] for row in conn.execute("PRAGMA database_list")
+                            if row[1] == "main")
+            if not database:
+                if conn.execute("PRAGMA page_count").fetchone()[0] == 0:
+                    return open_db(Path(":memory:"))
+                with TemporaryDirectory(prefix="teammem-dry-run-") as directory:
+                    image = Path(directory) / "ledger.db"
+                    image.write_bytes(conn.serialize())
+                    return _migrated_memory_copy(image)
+            if conn.in_transaction:
+                raise ValueError("dry-run cannot snapshot a caller's active disk transaction")
+            path = Path(database)
+
+        path = path.resolve()
+        if not path.exists():
+            return open_db(Path(":memory:"))
+        wal = Path(str(path) + "-wal")
+        journal = Path(str(path) + "-journal")
+        sources = (path, wal, journal)
+        for _ in range(3):
+            with TemporaryDirectory(prefix="teammem-dry-run-") as directory:
+                before = _snapshot_file_state(sources)
+                if before[2] is not None:
+                    raise ValueError("dry-run refuses a ledger with a rollback journal")
+                image = Path(directory) / "ledger.db"
+                try:
+                    shutil.copyfile(path, image)
+                    if before[1] is not None:
+                        shutil.copyfile(wal, Path(str(image) + "-wal"))
+                except FileNotFoundError:
+                    continue
+                if before != _snapshot_file_state(sources):
+                    continue
+                return _migrated_memory_copy(image)
+        raise ValueError("dry-run could not obtain a stable ledger snapshot; retry when idle")
+    except (OSError, sqlite3.Error) as failure:
+        raise ValueError(f"dry-run cannot snapshot ledger: {failure}") from failure
 
 
 def get_summary(conn: sqlite3.Connection, kind: str, key: str) -> SummaryRecord | None:
