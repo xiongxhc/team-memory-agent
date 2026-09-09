@@ -22,24 +22,29 @@ them: the record that a recording existed and was destroyed on time is itself
 part of the promise.
 """
 
+import errno
 import json
 import logging
 import os
 import sqlite3
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+from .config import _path_within, _physical_path
 from .meeting_bundles import AUDIO_FILENAME, occurrence_path_segment, short_occurrence_id
 # Private on purpose, imported on purpose: the audio store's layout, its digest
 # spelling and where a prune must stop are each defined once, by the importer
 # that wrote the files. Re-deriving any of them here is how two answers to one
 # question drift apart.
 from .meeting_importer import (
+    _CUSTODY_PREFIX,
     _digest_file,
     _discard_windows_staging_residues,
     _prune_empty,
+    _same_inode,
     _write_atomic,
     audio_revision_dir,
 )
@@ -117,13 +122,26 @@ def expire_meeting_audio(
     prevent a deletion this run owes. `dry_run` reports exactly what a real run
     would do and writes nothing at all: no unlink, no row, no alert.
     """
-    store = Path(audio_store)
+    root_error = None
+    try:
+        # This is the same nearest-existing-ancestor normalization used by
+        # configuration validation and the importer before it creates a store
+        # child.  Retention must not compare a physical stored path with a
+        # lexical configured spelling of that same root.
+        store = _physical_path(audio_store)
+    except (OSError, RuntimeError) as error:
+        store = None
+        root_error = error
     deleted: list[tuple[str, int]] = []
     mismatched: list[tuple[str, int]] = []
     failed: list[RetentionFailure] = []
     stamp = _stamp(_instant(now, "now"))
 
     for row in audio_due_for_expiry(conn, now):
+        if store is None:
+            failed.append(RetentionFailure(
+                row["occurrence_id"], row["revision"], "containment", str(root_error)))
+            continue
         try:
             _expire_one(conn, store, row, stamp=stamp, dry_run=dry_run,
                         deleted=deleted, mismatched=mismatched, failed=failed)
@@ -134,7 +152,8 @@ def expire_meeting_audio(
             # due that day. One bad path costs exactly one meeting.
             failed.append(RetentionFailure(
                 row["occurrence_id"], row["revision"], "path", str(error)))
-    swept = _sweep_revived(conn, store, dry_run=dry_run, failed=failed)
+    swept = [] if store is None else _sweep_revived(
+        conn, store, dry_run=dry_run, failed=failed)
     alerted, cleared = _warn(conn, now=now, warn_days=warn_days,
                              alert_path=alert_path, dry_run=dry_run, failed=failed)
     return RetentionResult(
@@ -174,15 +193,28 @@ def _expire_one(
     # strand every recording on disk the day `TEAMMEM_MEETING_AUDIO_STORE`
     # changes, with only a daily failure line to say so.
     path = Path(row["stored_path"])
-    inside = path == audio_revision_dir(store, *key) / AUDIO_FILENAME
+    expected_directory = audio_revision_dir(store, *key)
 
-    # A symlinked directory in the path is the one thing worth refusing: unlink
-    # would delete a file in whatever the link points at, which is exactly the
-    # store the sweep already declines to walk into. Loud and retryable, because
-    # a link where the importer put a directory is tampering, not configuration.
+    # A symlink is a local tampering signal, not a configured-root alias. The
+    # link itself is safe to remove; its target is never followed.
     if path.parent.is_symlink() or path.parent.parent.is_symlink():
         failed.append(RetentionFailure(
             *key, "symlink", "the stored audio directory is a symlink"))
+        return
+    try:
+        actual_directory = _physical_path(path.parent)
+    except (OSError, RuntimeError) as error:
+        failed.append(RetentionFailure(*key, "containment", str(error)))
+        return
+    inside = (
+        actual_directory == expected_directory
+        and _path_within(expected_directory, store)
+        and path.name == AUDIO_FILENAME
+    )
+    if path.name != AUDIO_FILENAME:
+        failed.append(RetentionFailure(
+            *key, "containment",
+            "stored audio is not named audio.enc"))
         return
 
     # Reported, never a veto: retention deletes what sits at this occurrence's
@@ -211,30 +243,179 @@ def _expire_one(
         deleted.append(key)
         return
 
+    custody_descriptors = ()
+    if inside:
+        try:
+            custody_descriptors = _open_posix_custody_descriptors(expected_directory)
+        except OSError as error:
+            failed.append(RetentionFailure(*key, "containment", str(error)))
+            return
     try:
         os.unlink(path)
     except FileNotFoundError:
         pass                                    # already gone; still mark it
     except OSError as error:
+        for descriptor in custody_descriptors:
+            os.close(descriptor)
         failed.append(RetentionFailure(*key, "unlink", str(error)))
         return
     if inside:
         try:
-            _discard_windows_staging_residues(path.parent)
+            _discard_windows_staging_residues(expected_directory)
+            _zero_opened_custody(custody_descriptors)
+            _zero_posix_staging_residues(expected_directory)
+            _assert_governed_audio_bytes_gone(expected_directory)
+            _prune_empty(expected_directory, store)
         except OSError as error:
-            failed.append(RetentionFailure(*key, "unlink", str(error)))
+            failed.append(RetentionFailure(*key, "containment", str(error)))
             return
-        # Pruning walks up until it reaches the store root. A path from an older
-        # store has no such stop, so its empty directories are left to the
-        # operator who moved them rather than climbed by this job.
-        _prune_empty(path.parent, store)
-
+        finally:
+            for descriptor in custody_descriptors:
+                os.close(descriptor)
     try:
         mark_audio_deleted(conn, row["occurrence_id"], row["revision"], stamp)
     except sqlite3.Error as error:
         failed.append(RetentionFailure(*key, "mark", str(error)))
         return
     deleted.append(key)
+
+
+def _assert_governed_audio_bytes_gone(directory: Path) -> None:
+    """Refuse a retention mark while a final or crash-staging file has bytes."""
+    prefix = f".{AUDIO_FILENAME}."
+    try:
+        entries = tuple(directory.iterdir())
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        if entry.name != AUDIO_FILENAME and not entry.name.startswith(prefix):
+            continue
+        metadata = entry.stat(follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size:
+            raise OSError(
+                "governed audio entry remains after retention cleanup", entry)
+
+
+def _open_posix_custody_descriptors(directory: Path) -> tuple[int, ...]:
+    """Hold custody inodes that are still exactly the current final audio."""
+    if os.name == "nt":
+        return ()
+    try:
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError:
+        return ()
+    descriptors = []
+    try:
+        try:
+            final_fd = os.open(
+                AUDIO_FILENAME,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            return ()
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                return ()
+            raise
+        try:
+            final_metadata = os.fstat(final_fd)
+            current = os.stat(
+                AUDIO_FILENAME, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(final_metadata.st_mode)
+                or not _same_inode(current, final_metadata)
+            ):
+                return ()
+            for entry in sorted(directory.iterdir()):
+                if not entry.name.startswith(_CUSTODY_PREFIX):
+                    continue
+                try:
+                    descriptor = os.open(
+                        entry.name,
+                        os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
+                except FileNotFoundError:
+                    continue
+                try:
+                    metadata = os.fstat(descriptor)
+                    named = os.stat(
+                        entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                    if (
+                        stat.S_ISREG(metadata.st_mode)
+                        and metadata.st_nlink == 2
+                        and _same_inode(metadata, final_metadata)
+                        and _same_inode(named, metadata)
+                    ):
+                        descriptors.append(descriptor)
+                        descriptor = None
+                except FileNotFoundError:
+                    pass
+                finally:
+                    if descriptor is not None:
+                        os.close(descriptor)
+        finally:
+            os.close(final_fd)
+        return tuple(descriptors)
+    except BaseException:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
+    finally:
+        os.close(directory_fd)
+
+
+def _zero_opened_custody(descriptors: tuple[int, ...]) -> None:
+    """Destroy only custody inodes already proven by held descriptors."""
+    for descriptor in descriptors:
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+
+
+def _zero_posix_staging_residues(directory: Path) -> None:
+    """Destroy bytes through staging descriptors; leave every mutable name alone."""
+    if os.name == "nt":
+        return
+    try:
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError:
+        return
+    try:
+        for entry in tuple(directory.iterdir()):
+            if (
+                not entry.name.startswith(f".{AUDIO_FILENAME}.")
+                or entry.name.startswith(_CUSTODY_PREFIX)
+            ):
+                continue
+            try:
+                descriptor = os.open(
+                    entry.name,
+                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                continue
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise OSError(
+                        "governed audio staging entry is not a private file", entry)
+                os.ftruncate(descriptor, 0)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        os.fsync(directory_fd)
+    except FileNotFoundError:
+        return
+    finally:
+        os.close(directory_fd)
 
 
 def _sweep_revived(

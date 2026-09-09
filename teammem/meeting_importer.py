@@ -10,8 +10,9 @@ state, and it does so in one fixed order per bundle:
    a staging file, fsynced, verified, and atomically renamed. Windows creates
    the final path exclusively so the exact created descriptor can remain open
    through verification and commit. In both cases the database sees only a
-   complete verified file; failure can leave only unreferenced zero-byte
-   residue from the inode this invocation created.
+   complete verified file; a handled POSIX store failure can leave only
+   unreferenced zero-byte final and private-custody names for the inode this
+   invocation created.
 3. **Write the database.** `teammem.meeting_store.import_meeting_revision` owns
    every meeting SQL statement and runs its own `BEGIN IMMEDIATE`. This module
    writes none.
@@ -30,8 +31,9 @@ Environmental faults are not the producer's fault. A failed copy (a full disk)
 or an unexpected crash in the store destroys bytes through the held created
 descriptor, leaves the bundle in the inbox, and re-raises so the run stops
 instead of quarantining a bundle that was never wrong. Windows marks the exact
-held inode for deletion through its native handle; POSIX may retain a zero-byte
-name because cleanup never trusts a mutable pathname.
+held inode for deletion through its native handle; POSIX may retain zero-byte
+final and private-custody names because cleanup never trusts a mutable
+pathname.
 
 TeamMem never holds the recording key and never decrypts audio; it only ever
 copies and hashes opaque bytes.
@@ -346,6 +348,97 @@ def _discard_owned_descriptor(descriptor: int) -> None:
         _delete_windows_owned_descriptor(descriptor)
 
 
+_CUSTODY_PREFIX = f".{AUDIO_FILENAME}.custody."
+
+
+def _same_inode(left, right) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _create_custody_link(
+    staging: Path, custody: Path, descriptor: int, revision_fd: int
+) -> None:
+    """Give the exact exclusive-created POSIX inode a second private name."""
+    owned = os.fstat(descriptor)
+    current = os.stat(staging.name, dir_fd=revision_fd, follow_symlinks=False)
+    if not stat.S_ISREG(current.st_mode) or not _same_inode(current, owned):
+        raise _Rejected("path_escape")
+    os.link(
+        staging.name,
+        custody.name,
+        src_dir_fd=revision_fd,
+        dst_dir_fd=revision_fd,
+        follow_symlinks=False,
+    )
+    linked = os.stat(custody.name, dir_fd=revision_fd, follow_symlinks=False)
+    if not stat.S_ISREG(linked.st_mode) or not _same_inode(linked, owned):
+        raise _Rejected("path_escape")
+
+
+def _copy_source_into_descriptor(source: Path, descriptor: int) -> None:
+    """Refill an owned zero-byte inode without resolving its final pathname."""
+    source_fd = os.open(source, os.O_RDONLY | _NOFOLLOW)
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.ftruncate(descriptor, 0)
+        with os.fdopen(source_fd, "rb", closefd=False) as handle:
+            while chunk := handle.read(_COPY_CHUNK):
+                _write_all(descriptor, chunk)
+        os.fsync(descriptor)
+    finally:
+        os.close(source_fd)
+
+
+def _recover_custody_audio(
+    source: Path,
+    directory: Path,
+    final: Path,
+    final_fd: int,
+    revision_fd: int | None,
+) -> int | None:
+    """Refill only a zero-byte final that still shares its owned custody inode."""
+    if os.name == "nt" or revision_fd is None:
+        return None
+    final_metadata = os.fstat(final_fd)
+    if not stat.S_ISREG(final_metadata.st_mode) or final_metadata.st_size != 0:
+        return None
+    for custody in sorted(directory.iterdir()):
+        if not custody.name.startswith(_CUSTODY_PREFIX):
+            continue
+        try:
+            custody_fd = os.open(
+                custody.name, os.O_RDWR | _FILE_FLAGS, dir_fd=revision_fd)
+        except FileNotFoundError:
+            continue
+        try:
+            custody_metadata = os.fstat(custody_fd)
+            current = os.stat(
+                final.name, dir_fd=revision_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(custody_metadata.st_mode)
+                or custody_metadata.st_nlink != 2
+                or not _same_inode(custody_metadata, final_metadata)
+                or not _same_inode(current, final_metadata)
+            ):
+                continue
+            _copy_source_into_descriptor(source, custody_fd)
+            os.fsync(revision_fd)
+            recovered = custody_fd
+            custody_fd = None
+            return recovered
+        except BaseException:
+            try:
+                _discard_owned_descriptor(custody_fd)
+            finally:
+                os.close(custody_fd)
+                custody_fd = None
+            raise
+        finally:
+            if custody_fd is not None:
+                os.close(custody_fd)
+    return None
+
+
 def _discard_windows_staging_residues(directory: Path) -> None:
     """Destroy only regular, single-link staging inodes through opened handles."""
     if os.name != "nt":
@@ -566,7 +659,17 @@ def _stage_audio(
             digest, size = _digest_descriptor(final_fd)
             physical = _verified_audio_path(final_fd, final, store, vault)
             if digest != declared_sha or size != declared_bytes:
-                raise _Rejected("audio_conflict")
+                recovered = _recover_custody_audio(
+                    bundle.audio_path, directory, final, final_fd, revision_fd)
+                if recovered is None:
+                    raise _Rejected("audio_conflict")
+                os.close(final_fd)
+                final_fd = recovered
+                owns_fd = created = True
+                digest, size = _digest_descriptor(final_fd)
+                if digest != declared_sha or size != declared_bytes:
+                    raise _Rejected("audio_conflict")
+                physical = _verified_audio_path(final_fd, final, store, vault)
         else:
             final_fd = _copy_file(
                 bundle.audio_path, staging, directory_fd=revision_fd)
@@ -578,6 +681,13 @@ def _stage_audio(
             digest, size = _digest_descriptor(final_fd)
             if digest != declared_sha or size != declared_bytes:
                 raise _Rejected("audio_hash_mismatch")
+            if revision_fd is not None:
+                _create_custody_link(
+                    staging,
+                    directory / f"{_CUSTODY_PREFIX}{secrets.token_hex(8)}",
+                    final_fd,
+                    revision_fd,
+                )
             if revision_fd is None:
                 os.replace(staging, final)
             else:

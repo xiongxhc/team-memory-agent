@@ -92,6 +92,11 @@ def _files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
 
 
+def _audio_payload_files(root: Path) -> list[Path]:
+    """Audio names that carry a distinct payload rather than a custody link."""
+    return [path for path in _files(root) if not path.name.startswith(".audio.enc.custody.")]
+
+
 def _entries(root: Path) -> list[Path]:
     if not root.exists():
         return []
@@ -141,7 +146,7 @@ def test_valid_bundle_is_imported_archived_and_consumed(tmp_path):
     assert _entries(tree.quarantine) == []
 
 
-def test_staged_audio_is_byte_identical_and_leaves_no_temporary_behind(tmp_path):
+def test_staged_audio_is_byte_identical_and_keeps_only_its_custody_link(tmp_path):
     conn = _db(tmp_path)
     tree = _Tree(tmp_path)
     payload = _payload()
@@ -153,7 +158,12 @@ def test_staged_audio_is_byte_identical_and_leaves_no_temporary_behind(tmp_path)
     final = _audio_file(tree, payload)
     assert final.read_bytes() == source
     assert hashlib.sha256(source).hexdigest() == payload["audio"]["sha256"].split(":", 1)[1]
-    assert _files(tree.audio) == [final]                            # no staging leftovers
+    assert _audio_payload_files(tree.audio) == [final]
+    [custody] = [
+        path for path in _files(tree.audio)
+        if path.name.startswith(".audio.enc.custody.")
+    ]
+    assert custody.samefile(final)
 
 
 def test_two_occurrences_in_one_scan_are_both_imported(tmp_path):
@@ -252,7 +262,7 @@ def test_duplicate_rescan_is_unchanged_and_writes_no_second_revision(tmp_path):
     assert (replay.accepted, replay.unchanged, replay.quarantined) == (0, 1, 0)
     assert replay.details == ((payload["occurrence_id"], "unchanged", "ok"),)
     assert len(list_meeting_revisions(conn, payload["occurrence_id"])) == 1
-    assert _files(tree.audio) == [_audio_file(tree, payload)]
+    assert _audio_payload_files(tree.audio) == [_audio_file(tree, payload)]
     assert not (tree.inbox / occurrence_path_segment(payload["occurrence_id"])).exists()
 
 
@@ -1086,6 +1096,63 @@ def test_handled_windows_store_failure_can_retry_without_a_final_audio_conflict(
     assert [path for path in _files(tree.audio) if path.name != "audio.enc"] == []
 
 
+def test_handled_posix_store_failure_can_retry_without_a_final_audio_conflict(
+    tmp_path, monkeypatch
+):
+    """Losing exact-name recovery for our zeroed POSIX inode breaks this retry."""
+    if os.name == "nt":
+        pytest.skip("the regression exercises the real POSIX rename path")
+    conn = _db(tmp_path)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    source = write_meeting_bundle(tree.inbox, payload) / "audio.enc"
+    source_bytes = source.read_bytes()
+
+    from teammem import meeting_importer
+
+    real_import = meeting_importer.import_meeting_revision
+
+    def fail_store(*args, **kwargs):
+        raise RuntimeError("injected handled store failure")
+
+    monkeypatch.setattr(meeting_importer, "import_meeting_revision", fail_store)
+
+    with pytest.raises(RuntimeError, match="injected handled store failure"):
+        _run(conn, tree)
+    final = _audio_file(tree, payload)
+    assert final.is_file() and final.stat().st_size == 0
+    [custody] = [
+        path for path in _files(tree.audio)
+        if path.name.startswith(".audio.enc.custody.")
+    ]
+    assert custody.stat().st_size == 0 and custody.samefile(final)
+    assert list_meetings(conn) == []
+    assert (source.parent / "READY").is_file()
+
+    monkeypatch.setattr(meeting_importer, "import_meeting_revision", real_import)
+    result = _run(conn, tree)
+
+    assert _outcomes(result) == [("accepted", "ok")]
+    assert final.read_bytes() == source_bytes
+    assert get_meeting(conn, payload["occurrence_id"])["revision"] == payload["revision"]
+    assert not tree.quarantine.exists()
+    [custody] = [
+        path for path in _files(tree.audio)
+        if path.name.startswith(".audio.enc.custody.")
+    ]
+    assert custody.samefile(final) and custody.read_bytes() == source_bytes
+
+    expired = expire_meeting_audio(
+        conn,
+        tree.audio,
+        now="2026-09-17T00:00:00Z",
+        alert_path=lambda _occurrence_id: tmp_path / "unused-alert.json",
+    )
+
+    assert expired.deleted == ((payload["occurrence_id"], payload["revision"]),)
+    assert not final.exists() and custody.read_bytes() == b""
+
+
 class _WindowsCrashDuringCopyOS(_WindowsCustodyAttackOS):
     def __init__(self):
         super().__init__(Path("unused-escape"))
@@ -1167,6 +1234,48 @@ def test_abrupt_windows_copy_exit_exposes_only_staging_and_a_retry_succeeds(
     assert expired.failed == ()
     assert not final.exists()
     assert not staging[0].exists()
+
+
+def test_alias_store_expiry_removes_final_and_windows_staging_before_marking(
+    tmp_path, monkeypatch
+):
+    """A lexical-root comparison strands governed crash ciphertext."""
+    conn = _db(tmp_path)
+    physical_parent = tmp_path / "physical-parent"
+    physical_parent.mkdir()
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(physical_parent, target_is_directory=True)
+    tree = _Tree(tmp_path)
+    tree.audio = alias_parent / "audio-store"
+    payload = _payload()
+    write_meeting_bundle(tree.inbox, payload)
+
+    assert _outcomes(_run(conn, tree)) == [("accepted", "ok")]
+    stored = Path(get_meeting(conn, payload["occurrence_id"])["audio"]["stored_path"])
+    lexical = _audio_file(tree, payload)
+    assert stored != lexical and stored.samefile(lexical)
+    staging = stored.with_name(".audio.enc.crash-residue")
+    staging.write_bytes(b"orphaned ciphertext")
+
+    from teammem import meeting_importer
+
+    windows = _WindowsCustodyAttackOS(tmp_path / "must-not-escape.enc")
+    _force_windows(monkeypatch, meeting_importer, windows)
+
+    expired = expire_meeting_audio(
+        conn,
+        tree.audio,
+        now="2026-09-17T00:00:00Z",
+        alert_path=lambda _occurrence_id: tmp_path / "unused-alert.json",
+    )
+
+    assert expired.deleted == ((payload["occurrence_id"], payload["revision"]),)
+    assert expired.failed == ()
+    assert not stored.exists()
+    assert not staging.exists()
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == (
+        "2026-09-17T00:00:00Z"
+    )
 
 
 class _StagingCleanupRaceOS:
@@ -1256,7 +1365,7 @@ def test_disk_full_during_the_audio_copy_leaves_only_a_zero_byte_staging_residue
     assert _run(conn, tree).accepted == 1                           # a retry then succeeds
 
 
-def test_crash_before_db_commit_leaves_only_a_zero_byte_final_residue(
+def test_crash_before_db_commit_leaves_zero_byte_final_and_custody_residue(
     tmp_path, monkeypatch
 ):
     conn = _db(tmp_path)
@@ -1281,7 +1390,11 @@ def test_crash_before_db_commit_leaves_only_a_zero_byte_final_residue(
     assert observed["staged"] is True
     assert list_meetings(conn) == []
     assert observed["path"].stat().st_size == 0                     # no ciphertext remains
-    assert _files(tree.audio) == [observed["path"]]                 # explicit safe residue
+    [custody] = [
+        path for path in _files(tree.audio)
+        if path.name.startswith(".audio.enc.custody.")
+    ]
+    assert custody.stat().st_size == 0 and custody.samefile(observed["path"])
     assert (directory / "READY").is_file() and not tree.archive.exists()
 
 
@@ -1301,7 +1414,7 @@ def test_a_store_rejection_removes_only_the_audio_it_did_not_already_own(tmp_pat
 
     assert _outcomes(result) == [("quarantined", "revision_conflict")]
     assert kept.read_bytes() == kept_bytes                         # the stored audio is intact
-    assert _files(tree.audio) == [kept]
+    assert _audio_payload_files(tree.audio) == [kept]
     assert get_meeting(conn, first["occurrence_id"])["audio"]["stored_path"] == str(kept)
 
 
@@ -1319,7 +1432,7 @@ def test_a_quarantine_never_touches_audio_belonging_to_another_occurrence(tmp_pa
     _run(conn, tree)
 
     assert kept.is_file()
-    assert _files(tree.audio) == [kept]
+    assert _audio_payload_files(tree.audio) == [kept]
     assert not audio_revision_dir(tree.audio, bad["occurrence_id"], bad["revision"]).exists()
 
 

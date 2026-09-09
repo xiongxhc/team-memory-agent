@@ -132,6 +132,10 @@ def _files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file())
 
 
+def _custody_files(root: Path) -> list[Path]:
+    return [path for path in _files(root) if path.name.startswith(".audio.enc.custody.")]
+
+
 # --- the boundary -----------------------------------------------------------
 
 
@@ -161,7 +165,8 @@ def test_exactly_at_expiry_the_audio_is_deleted_and_the_row_marked(tmp_path):
     assert result.deleted == ((occurrence_id, payload["revision"]),)
     assert not _audio(tmp_path, payload).exists()
     assert get_meeting(conn, occurrence_id)["audio"]["deleted_at"] == EXPIRY
-    assert _files(_store(tmp_path)) == []          # the empty directories are pruned
+    [custody] = _custody_files(_store(tmp_path))
+    assert custody.read_bytes() == b""             # only the expired inode's name remains
     assert result.exit_code == 0
 
 
@@ -179,7 +184,7 @@ def test_a_second_run_after_expiry_deletes_nothing_and_keeps_the_first_timestamp
     assert result.exit_code == 0
 
 
-def test_an_already_missing_file_is_still_marked_deleted(tmp_path):
+def test_a_missing_final_with_custody_bytes_blocks_the_deleted_mark(tmp_path):
     conn = _db(tmp_path)
     payload = _payload()
     _import(conn, tmp_path, payload)
@@ -187,9 +192,11 @@ def test_an_already_missing_file_is_still_marked_deleted(tmp_path):
 
     result = _expire(conn, tmp_path, EXPIRY)
 
-    assert result.deleted == ((payload["occurrence_id"], payload["revision"]),)
-    assert result.failed == ()
-    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+    assert result.deleted == ()
+    assert [(failure.occurrence_id, failure.stage) for failure in result.failed] == [
+        (payload["occurrence_id"], "containment")
+    ]
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] is None
 
 
 def test_audio_that_no_longer_matches_its_digest_is_deleted_and_reported(tmp_path):
@@ -351,6 +358,7 @@ def test_a_revived_audio_symlink_is_visible_without_blocking_another_due_deletio
     )
 
     occurrence = _store(tmp_path) / occurrence_path_segment(revived["occurrence_id"])
+    shutil.rmtree(occurrence)  # the zeroed custody entry has no bytes after expiry
     if link_level == "occurrence":
         outside = tmp_path / "revived-occurrence"
         external_audio = outside / "3" / "audio.enc"
@@ -846,7 +854,7 @@ def test_a_symlink_in_place_of_the_audio_is_reported_and_not_followed(tmp_path):
     assert result.mismatched == ((payload["occurrence_id"], payload["revision"]),)
     assert not target.exists() and not target.is_symlink()
     assert outside.exists()                      # the link went, its target stayed
-    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] == EXPIRY
+    assert get_meeting(conn, payload["occurrence_id"])["audio"]["deleted_at"] is None
     assert result.exit_code == 1
 
 
