@@ -11,6 +11,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from functools import partial
@@ -37,6 +38,7 @@ from .reclaim import reclaim, reclaim_channel_projects
 # `render._meeting_facts` across the same boundary for the same reason.
 from .render import MANAGED, render_vault_verified, verify_vault
 from .render import _managed_files as managed_vault_files
+from .run_lock import RunLockedError, acquire_publication_lock
 from .slices import active_person_days
 from .store import get_summary, insert_events, open_db, open_db_snapshot, reconcile_gitlab_events
 from .summarize import (
@@ -266,11 +268,16 @@ def run_docs_sync(cfg: Config) -> int:
     if not cfg.obsidian_projects:
         print("set TEAMMEM_OBSIDIAN_PROJECTS", file=sys.stderr)
         return 2
-    out = sync_docs(
-        _read(cfg.config_dir, "projects"),
-        cfg.obsidian_projects,
-        cfg.vault_dir,
-    )
+    try:
+        with acquire_publication_lock(cfg.vault_dir):
+            out = sync_docs(
+                _read(cfg.config_dir, "projects"),
+                cfg.obsidian_projects,
+                cfg.vault_dir,
+            )
+    except RunLockedError as error:
+        print(f"docs-sync: {error}", file=sys.stderr)
+        return 1
     print(
         f"docs-sync: {out['copied']} files updated"
         f" across {out['projects']} projects -> {cfg.vault_dir / 'Docs'}"
@@ -288,6 +295,28 @@ def run_render(
     dry_run: bool = False,
     verify: bool = False,
     conn: sqlite3.Connection | None = None,
+) -> int:
+    try:
+        with (nullcontext() if dry_run or verify
+              else acquire_publication_lock(cfg.vault_dir)):
+            return _run_render(
+                cfg, ids, today=today, weeks=weeks, push_requested=push_requested,
+                dry_run=dry_run, verify=verify, conn=conn)
+    except RunLockedError as error:
+        print(f"render: {error}", file=sys.stderr)
+        return 1
+
+
+def _run_render(
+    cfg: Config,
+    ids: IdentityMaps,
+    *,
+    today: date,
+    weeks: int,
+    push_requested: bool,
+    dry_run: bool,
+    verify: bool,
+    conn: sqlite3.Connection | None,
 ) -> int:
     if verify and (push_requested or dry_run):
         print("render --verify cannot combine with --push or --dry-run",
@@ -925,38 +954,42 @@ def execute_process_meetings(
         cfg.meeting_audio_store, vault_dir=cfg.vault_dir, now=now,
         dry_run=dry_run,
     )
-    unpublished = [
-        meeting["occurrence_id"] for meeting in list_meetings(conn)
-        if not _receipt_is_current(
-            meeting_receipt_path(cfg, meeting["occurrence_id"]), meeting)
-    ]
-    if dry_run:
-        return MeetingRunResult(imported=imported, pending=tuple(unpublished))
-
     receipts: list[dict] = []
-    refused = [MeetingFailure(occurrence_id, "source_cleanup_alert",
+    refused = [] if dry_run else [MeetingFailure(occurrence_id, "source_cleanup_alert",
                               "source cleanup alert update failed; retry required")
                for occurrence_id, _ in sync_source_cleanup_alerts(
                    conn, alert_path=partial(meeting_alert_path, cfg), now=now)]
-    for occurrence_id in unpublished:
-        head = _vault_head(cfg.vault_dir)
-        snapshot = _managed_snapshot(cfg.vault_dir)
-        try:
-            receipts.append(publish_meeting(
-                conn, ids, cfg.vault_dir, today,
-                occurrence_id=occurrence_id,
-                receipt_path=meeting_receipt_path(cfg, occurrence_id),
-                web_base=cfg.vault_web_base, weeks=weeks,
-                channel_names=channel_names,
-            ))
-        except PublishRefused as refusal:
-            # An unmoved HEAD is the proof that nothing this attempt rendered was
-            # committed, whatever stage it stopped at, so the working tree — and
-            # only the working tree — has to be put back.
-            if _vault_head(cfg.vault_dir) == head:
-                _restore_managed(cfg.vault_dir, snapshot)
-            refused.append(MeetingFailure(
-                occurrence_id, refusal.stage, redact_secrets(refusal, cfg)))
+    try:
+        with (nullcontext() if dry_run else acquire_publication_lock(cfg.vault_dir)):
+            # Refresh after acquiring: another publisher may have issued receipts
+            # while this process imported or waited for the shared vault.
+            unpublished = [
+                meeting["occurrence_id"] for meeting in list_meetings(conn)
+                if not _receipt_is_current(
+                    meeting_receipt_path(cfg, meeting["occurrence_id"]), meeting)
+            ]
+            if dry_run:
+                return MeetingRunResult(imported=imported, pending=tuple(unpublished))
+            for occurrence_id in unpublished:
+                head = _vault_head(cfg.vault_dir)
+                snapshot = _managed_snapshot(cfg.vault_dir)
+                try:
+                    receipts.append(publish_meeting(
+                        conn, ids, cfg.vault_dir, today,
+                        occurrence_id=occurrence_id,
+                        receipt_path=meeting_receipt_path(cfg, occurrence_id),
+                        web_base=cfg.vault_web_base, weeks=weeks,
+                        channel_names=channel_names,
+                    ))
+                except PublishRefused as refusal:
+                    # The snapshot and this restore share the publication lock:
+                    # refusal cannot roll back another publisher's valid render.
+                    if _vault_head(cfg.vault_dir) == head:
+                        _restore_managed(cfg.vault_dir, snapshot)
+                    refused.append(MeetingFailure(
+                        occurrence_id, refusal.stage, redact_secrets(refusal, cfg)))
+    except RunLockedError as error:
+        refused.append(MeetingFailure("", "lock", str(error)))
     return MeetingRunResult(
         imported=imported, receipts=tuple(receipts), refused=tuple(refused))
 
@@ -978,10 +1011,14 @@ def run_process_meetings(
                 "TEAMMEM_MEETING_INBOX is not set; this hub processes no meetings"
             )
         prepare_meeting_dirs(cfg, create=not dry_run)
-        if not dry_run:
-            ensure_repo(cfg.vault_dir)
-        if (cfg.vault_dir / ".git").is_dir():
-            _check_publication_target(cfg)
+        with (nullcontext() if dry_run else acquire_publication_lock(cfg.vault_dir)):
+            if not dry_run:
+                ensure_repo(cfg.vault_dir)
+            if (cfg.vault_dir / ".git").is_dir():
+                _check_publication_target(cfg)
+    except RunLockedError as failure:
+        print(f"error: {failure}", file=sys.stderr)
+        return 1
     except ValueError as failure:
         print(f"error: {redact_secrets(failure, cfg)}", file=sys.stderr)
         return 2

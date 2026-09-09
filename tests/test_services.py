@@ -954,6 +954,49 @@ def test_a_refused_verify_leaves_nothing_a_later_run_could_commit(bench, monkeyp
     assert bench.receipt(refused["occurrence_id"]).exists()
 
 
+def test_meeting_service_locks_pending_snapshot_and_refusal_restore(bench, monkeypatch):
+    from teammem import services
+    from tests.test_publication_lock import _assert_locked
+
+    bench.drop(_payload())
+    real_snapshot = services._managed_snapshot
+    real_restore = services._restore_managed
+    real_pending = services._receipt_is_current
+    real_ensure = services.ensure_repo
+    seen = []
+
+    def pending(*args):
+        _assert_locked(bench.vault)
+        seen.append("pending")
+        return real_pending(*args)
+
+    def ensure(*args):
+        _assert_locked(bench.vault)
+        return real_ensure(*args)
+
+    def snapshot(*args):
+        _assert_locked(bench.vault)
+        seen.append("snapshot")
+        return real_snapshot(*args)
+
+    def restore(*args):
+        _assert_locked(bench.vault)
+        seen.append("restore")
+        return real_restore(*args)
+
+    def refused(*args, **kwargs):
+        _assert_locked(bench.vault)
+        raise services.PublishRefused("verify", "controlled refusal")
+
+    monkeypatch.setattr(services, "_receipt_is_current", pending)
+    monkeypatch.setattr(services, "ensure_repo", ensure)
+    monkeypatch.setattr(services, "_managed_snapshot", snapshot)
+    monkeypatch.setattr(services, "_restore_managed", restore)
+    monkeypatch.setattr(services, "publish_meeting", refused)
+    assert bench.run() == 1
+    assert seen == ["pending", "snapshot", "restore"]
+
+
 def test_dry_run_writes_no_database_vault_audio_receipt_or_commit(bench):
     bench.drop(_payload())
     open_db(bench.cfg.db_path).close()             # an existing ledger to compare

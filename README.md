@@ -323,6 +323,18 @@ capture mode return non-zero after preserving successfully captured evidence.
 The full and capture modes share one ledger lock: capture fails fast if another
 run owns it, while a full run waits for at most 30 minutes.
 
+Vault writers share a separate publication lock beside the canonical vault path
+(`vault.lock` for a vault named `vault`), including writers using different
+ledgers. The vault's parent directory must be writable; a missing parent is
+created on first use. Daily holds its ledger lock first, then holds the vault
+lock across docs-sync, verified render, commit and push. Standalone docs-sync,
+render and meeting publication use the same vault lock; meeting publication
+retains it through remote verification and receipt writing, including refusal
+restoration. Contention waits up to 30 minutes and returns a retryable nonzero
+result if the lock remains unavailable. Dry-run and render verification do not
+create publication locks. The adjacent lock file is never vault content and may
+remain after a run; do not remove it while writers are running.
+
 Journal synthesis defaults to two concurrent LLM calls. Set
 `TEAMMEM_LLM_CONCURRENCY` to an integer from `1` through `8` (`1` restores serial
 calls). The runtime optimization preserves the complete ordered text of every

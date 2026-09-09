@@ -25,6 +25,7 @@ from .meeting_store import get_meeting
 # one the semantic checks hold the vault against. The receipt names the path the
 # ledger says the note belongs at, not a path a renderer handed back.
 from .render import _meeting_facts, render_vault_verified
+from .run_lock import RunLockedError, acquire_publication_lock
 from .vaultgit import (PushNotVerified, commit_all, commit_contains,
                        head_commit, push_verified, remote_reaches)
 
@@ -34,7 +35,7 @@ WEB_BASE_ENV = "TEAMMEM_VAULT_WEB_BASE"
 
 class PublishRefused(RuntimeError):
     """Publication stopped, so no receipt exists. `stage` says where it stopped:
-    `config`, `ledger`, `render`, `verify`, `commit`, `push` or `receipt`."""
+    `lock`, `config`, `ledger`, `render`, `verify`, `commit`, `push` or `receipt`."""
 
     def __init__(self, stage: str, reason: str, invariants: tuple[str, ...] = ()):
         super().__init__(f"{stage}: {reason}")
@@ -131,6 +132,21 @@ def publish_meeting(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path
                     today: date, *, occurrence_id: str, receipt_path: Path,
                     web_base: str | None, weeks: int = 4,
                     channel_names: dict | None = None) -> dict:
+    """Hold the shared vault transaction until the verified receipt is durable."""
+    try:
+        with acquire_publication_lock(vault_dir):
+            return _publish_meeting(
+                conn, ids, vault_dir, today, occurrence_id=occurrence_id,
+                receipt_path=receipt_path, web_base=web_base, weeks=weeks,
+                channel_names=channel_names)
+    except RunLockedError as error:
+        raise PublishRefused("lock", str(error)) from error
+
+
+def _publish_meeting(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
+                     today: date, *, occurrence_id: str, receipt_path: Path,
+                     web_base: str | None, weeks: int,
+                     channel_names: dict | None) -> dict:
     """Render, verify, commit, push, prove, then write the receipt. Returns it.
 
     Raises `PublishRefused` at the first step that cannot be proven. The receipt

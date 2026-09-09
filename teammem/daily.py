@@ -19,7 +19,7 @@ from .connectors.registry import get_connector
 from .identity import IdentityMaps
 from .importer import import_inbox
 from .reclaim import reclaim, reclaim_channel_projects
-from .run_lock import acquire_run_lock
+from .run_lock import RunLockedError, acquire_publication_lock, acquire_run_lock
 from .services import (
     collect_connector,
     execute_journal,
@@ -335,6 +335,24 @@ def _run_full_stages(
         )
 
     run.timed("report", report_action)
+    try:
+        # run_daily already holds the ledger run lock. Keep Docs, render and the
+        # separate push stage in one vault transaction, including stage callbacks.
+        with acquire_publication_lock(cfg.vault_dir):
+            _run_publication_stages(run, cfg, ids, conn, local_day)
+    except RunLockedError as error:
+        run.skip(("docs-sync",), "publication lock unavailable")
+        run.timed("render", lambda: StepResult("render", "failed", str(error)))
+        run.skip(("push",), "render failed")
+
+
+def _run_publication_stages(
+    run: _Run,
+    cfg: Config,
+    ids: IdentityMaps,
+    conn: sqlite3.Connection,
+    local_day: date,
+) -> None:
     if cfg.obsidian_projects is None:
         run.skip(("docs-sync",), "TEAMMEM_OBSIDIAN_PROJECTS not set")
     else:
