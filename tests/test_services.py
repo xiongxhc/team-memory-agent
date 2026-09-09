@@ -1133,13 +1133,15 @@ def test_a_commit_that_landed_is_never_rolled_back_by_a_later_refusal(bench):
     assert (bench.vault / "Meetings").is_dir()     # the published note is still there
 
 
-def test_one_occurrence_that_fails_verification_does_not_block_another(
+def test_a_sound_occurrence_publishes_without_its_invalid_neighbour(
     bench, monkeypatch
 ):
-    """The invariant checks read the whole vault, so a refusal has to be scoped
-    to the occurrence that earned it. Here one note is genuinely rendered without
-    its project backlinks — the real checker reads the real vault and reports it
-    — and the other occurrence still reaches a receipt in the same run."""
+    """The published commit is the verified projection, not the earlier render.
+
+    One note is genuinely rendered without its project backlinks. The real
+    checker withholds that occurrence, while the sound neighbour reaches a
+    receipt whose exact local and remote trees do not carry the invalid note.
+    """
     broken = _payload(day=OTHER_DAY)             # earlier: attempted first
     sound = _payload()
     bench.drop(broken)
@@ -1156,12 +1158,23 @@ def test_one_occurrence_that_fails_verification_does_not_block_another(
     assert not bench.receipt(broken["occurrence_id"]).exists()
     receipt = json.loads(bench.receipt(sound["occurrence_id"]).read_text())
     assert receipt["occurrence_id"] == sound["occurrence_id"]
-    assert _remote_ref(bench.bare, bench.branch) == receipt["vault_commit"]
-
     conn = open_db(bench.cfg.db_path)
-    findings = render_module.verify_meeting_semantics(conn, bench.ids, bench.vault)
-    assert {f["occurrence_id"] for f in findings} == {broken["occurrence_id"]}
-    assert {f["invariant"] for f in findings} == {"meeting.project.backlinks"}
+    broken_path = str(render_module._meeting_facts(
+        get_meeting(conn, broken["occurrence_id"]), bench.ids)["rel"])
+    sound_path = receipt["markdown_path"]
+    commit = receipt["vault_commit"]
+
+    assert _git(bench.vault, "rev-parse", "HEAD") == commit
+    assert _remote_ref(bench.bare, bench.branch) == commit
+    assert (bench.vault / sound_path).is_file()
+    assert not (bench.vault / broken_path).exists()
+    for repository in (bench.vault, bench.bare):
+        assert subprocess.run(
+            ["git", "-C", str(repository), "cat-file", "-e",
+             f"{commit}:{sound_path}"], capture_output=True).returncode == 0
+        assert subprocess.run(
+            ["git", "-C", str(repository), "cat-file", "-e",
+             f"{commit}:{broken_path}"], capture_output=True).returncode != 0
 
     monkeypatch.undo()                           # the renderer bug is fixed
     assert bench.run() == 0

@@ -1196,7 +1196,8 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
 
 
 def _blame_findings(conn: sqlite3.Connection, ids: IdentityMaps,
-                    findings: list[dict], withheld: dict[str, str]) -> dict[str, str]:
+                    findings: list[dict], withheld: dict[str, str]
+                    ) -> dict[str, list[dict]]:
     """The occurrences that could be withheld to clear these findings.
 
     `verify_meeting_semantics` attributes a finding only when one current
@@ -1206,7 +1207,7 @@ def _blame_findings(conn: sqlite3.Connection, ids: IdentityMaps,
     occurrence its short id spells, and a person or project page belongs to the
     occurrences whose backlinks reach it.
     """
-    blamed: dict[str, str] = {}
+    blamed: dict[str, list[dict]] = {}
     shorts: dict[str, str] | None = None
     pages: dict[str, tuple[str, ...]] | None = None
     for finding in findings:
@@ -1225,7 +1226,7 @@ def _blame_findings(conn: sqlite3.Connection, ids: IdentityMaps,
             owners = list(pages.get(path, ()))
         for occurrence_id in owners:
             if occurrence_id not in withheld:
-                blamed[occurrence_id] = f"{finding['invariant']} on {path}"
+                blamed.setdefault(occurrence_id, []).append(finding)
     return blamed
 
 
@@ -1243,12 +1244,14 @@ def render_vault_verified(conn: sqlite3.Connection, ids: IdentityMaps,
     stays retryable: nothing is deleted from the ledger, and the next render
     files it as soon as a corrected revision lands.
 
-    Returns `render_vault`'s dict, plus `withheld` (occurrence -> what it failed)
+    Returns `render_vault`'s dict, plus `withheld` (occurrence -> what it failed),
+    `withheld_findings` (the structured semantic findings behind those entries),
     and `findings`: the findings no occurrence could be withheld for. Those name
     vault content the meetings projection does not own and no render can remove,
     so a caller that pushes must not.
     """
     withheld: dict[str, str] = {}
+    withheld_findings: dict[str, list[dict]] = {}
     while True:
         out = render_vault(conn, ids, vault_dir, today, weeks=weeks,
                            channel_names=channel_names, withhold=withheld)
@@ -1256,8 +1259,16 @@ def render_vault_verified(conn: sqlite3.Connection, ids: IdentityMaps,
         findings = verify_meeting_semantics(conn, ids, vault_dir)
         blamed = _blame_findings(conn, ids, findings, withheld)
         if blamed:
-            withheld.update(blamed)
+            withheld_findings.update(blamed)
+            withheld.update({
+                occurrence_id: "; ".join(
+                    f"{finding['invariant']} on {finding['path']}"
+                    for finding in occurrence_findings
+                )
+                for occurrence_id, occurrence_findings in blamed.items()
+            })
             continue
+        out["withheld_findings"] = withheld_findings
         out["findings"] = [f for f in findings
                            if f["occurrence_id"] not in withheld]
         return out
