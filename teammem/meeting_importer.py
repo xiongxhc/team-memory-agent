@@ -16,10 +16,12 @@ state, and it does so in one fixed order per bundle:
 3. **Write the database.** `teammem.meeting_store.import_meeting_revision` owns
    every meeting SQL statement and runs its own `BEGIN IMMEDIATE`. This module
    writes none.
-4. **Consume the source.** An accepted bundle's `meeting.json` and
-   `manifest.json` move to the archive and the inbox directory is removed. The
-   encrypted audio is *not* archived: it already lives in the audio store, and
-   a second copy would double the retention surface the expiry job must erase.
+4. **Consume the ciphertext.** Validated `meeting.json` and `manifest.json`
+   metadata are serialized into the archive. A held source descriptor destroys
+   the exact adopted source inode, never a replacement by pathname. Source
+   metadata and POSIX zero-byte audio placeholders remain; completed identity
+   records prevent reprocessing those leftovers without hiding new deliveries.
+   Encrypted audio is *not* archived: it already lives in the audio store.
 
 Routing is exhaustive. Every `READY` bundle ends as one of `accepted`,
 `unchanged`, `activated` or `quarantined`, each with a short machine-readable
@@ -56,6 +58,7 @@ from .config import _path_within, _physical_path
 from .meeting_bundles import (
     AUDIO_FILENAME,
     MANIFEST_FILENAME,
+    MANIFEST_SCHEMA,
     MEETING_FILENAME,
     READY_FILENAME,
     MeetingBundle,
@@ -878,12 +881,9 @@ def cleanup_source_copy(conn, row: dict, *, archive: Path | None = None,
             if bundle is not None:
                 if bundle.artifact_hash != row["artifact_hash"]:
                     return False
-                _source_has_bytes(row)  # loader I/O must not transfer directory ownership
                 if not dry_run:
-                    _archive_bundle(bundle, archive)
-                present = False if dry_run else _source_has_bytes(row)
-                if present:
-                    return False
+                    _archive_owned_source(bundle, archive, row)
+                present = False  # proved through the held inode, never a missing-path probe
         if present:
             _source_has_bytes(row, destroy=True, dry_run=dry_run)
         if not dry_run:
@@ -929,14 +929,32 @@ def sync_source_cleanup_alerts(conn, *, alert_path, now: str, dry_run: bool = Fa
     return failed
 
 
+def _archive_owned_source(bundle: MeetingBundle, archive: Path, row: dict) -> None:
+    """Hold exact ciphertext ownership through archive I/O and destruction.
+
+    No source pathname is removed. A concurrent directory rename can neither
+    strand the captured ciphertext nor cause removal of a replacement tree.
+    The held descriptor is the proof used to discharge the durable obligation.
+    """
+    with _open_source(Path(row["source_root"]), Path(row["relative_path"]),
+                      expected=row["identity"], writable=True) as (descriptor, _):
+        if _digest_descriptor(descriptor) != (row["sha256"], row["bytes"]):
+            raise OSError("source audio ownership changed")
+        _archive_bundle(bundle, archive)
+        _discard_owned_descriptor(descriptor)
+        if os.fstat(descriptor).st_size != 0:
+            raise OSError("owned source ciphertext remains")
+
+
 def _archive_bundle(bundle: MeetingBundle, archive: Path) -> None:
-    """Keep the source JSON by occurrence/revision, then consume the inbox copy.
+    """Archive validated metadata without mutating the source namespace.
 
     `manifest.json` carries the occurrence id, the revision and the artifact
     hash, so an archived bundle is identifiable by all three without a
     side-car. `audio.enc` is deliberately not archived — the encrypted bytes
     live in the audio store, and a duplicate would double what expiry must
-    delete.
+    delete. Serialize validated in-memory metadata so a replacement during I/O
+    cannot inject its files into the archive. The caller owns ciphertext cleanup.
     """
     destination = (
         Path(archive)
@@ -944,10 +962,15 @@ def _archive_bundle(bundle: MeetingBundle, archive: Path) -> None:
         / str(bundle.revision)
     )
     destination.mkdir(parents=True, exist_ok=True)
-    for name in (MEETING_FILENAME, MANIFEST_FILENAME):
-        _write_atomic(destination / name, (bundle.path / name).read_bytes())
-    shutil.rmtree(bundle.path)
-    _prune_empty(bundle.path.parent, bundle.path.parent.parent)
+    manifest = {
+        "schema": MANIFEST_SCHEMA, "occurrence_id": bundle.occurrence_id,
+        "revision": bundle.revision, "artifact_hash": bundle.artifact_hash,
+        "audio_sha256": bundle.payload["audio"]["sha256"],
+        "audio_bytes": bundle.payload["audio"]["bytes"],
+    }
+    for name, data in ((MEETING_FILENAME, bundle.payload), (MANIFEST_FILENAME, manifest)):
+        _write_atomic(destination / name,
+                      (json.dumps(data, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"))
 
 
 def _free_name(parent: Path, name: str) -> Path:
@@ -1120,6 +1143,13 @@ def import_meeting_inbox(
     # moving it would silently move its ciphertext outside recorded custody.
     obligations = pending_source_cleanup(conn)
     governed = {Path(row["source_root"]) / row["relative_path"] for row in obligations}
+    for row in pending_source_cleanup(conn, include_completed=True):
+        if row["completed"]:
+            try:
+                if not _source_has_bytes(row):
+                    governed.add(Path(row["source_root"]) / row["relative_path"])
+            except (OSError, ValueError, RuntimeError):
+                pass  # a completed identity is not authority over a new delivery
     if not dry_run:
         for row in obligations:
             resolved = cleanup_source_copy(conn, row, archive=archive)
@@ -1216,10 +1246,7 @@ def import_meeting_inbox(
         else:
             outcome = "activated"
         try:
-            _source_has_bytes(source_row)
-            _archive_bundle(bundle, archive)
-            if _source_has_bytes(source_row):
-                raise OSError("source archive cleanup incomplete")
+            _archive_owned_source(bundle, archive, source_row)
             clear_source_cleanup(conn, source_row)
         except (OSError, sqlite3.Error):
             # The revision is committed. Failing to file the source copy does

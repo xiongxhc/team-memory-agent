@@ -418,7 +418,7 @@ reports what a real run would import
 and publish and writes nothing at all: no ledger row, no audio file, no vault
 file, no commit, no push, no receipt.
 
-An accepted source whose metadata archive or directory removal fails remains a
+An accepted source whose metadata archival or ciphertext destruction fails remains a
 durable cleanup obligation in the same transaction as its revision. Replays can
 register additional physical source copies. Every real run retries these
 obligations, including a partial bundle without `READY` and sources beneath a
@@ -472,8 +472,13 @@ Deferred cleanup checks the captured physical root, directory and audio identiti
 and the recording's hash/size. Replaced files and symlinks are preserved and
 reported. On POSIX, partial-source cleanup destroys bytes through the verified
 file descriptor and may retain a zero-byte `audio.enc` placeholder; it never
-unlinks a concurrent replacement by pathname. Normal freshly validated archival
-still removes the complete source bundle.
+unlinks a concurrent replacement by pathname. Archive completion means validated
+metadata was archived and the exact owned ciphertext was destroyed through a
+descriptor held across archival I/O. Source directories and metadata remain;
+Windows removes the owned audio through its exact file handle, while POSIX
+retains an empty audio placeholder. Completed source identity records suppress
+reprocessing only while that recorded source is still ciphertext-free. A newly
+delivered valid bundle at the same path or a higher revision is enrolled normally.
 
 The additive migration creates cleanup tracking without scanning source files.
 Legacy accepted bundles are enrolled when a real inbox run validates them again;

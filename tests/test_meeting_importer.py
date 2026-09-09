@@ -112,6 +112,22 @@ def _audio_file(tree: _Tree, payload: dict, revision: int | None = None) -> Path
     return audio_revision_dir(tree.audio, payload["occurrence_id"], revision) / "audio.enc"
 
 
+def _assert_source_completed(conn, tree, payload):
+    segment = occurrence_path_segment(payload["occurrence_id"])
+    source = tree.inbox / segment / str(payload["revision"])
+    assert source.is_dir()  # retain namespace rather than unlink a concurrent replacement
+    audio = source / "audio.enc"
+    assert not audio.exists() or audio.stat().st_size == 0
+    archived = tree.archive / segment / str(payload["revision"])
+    assert json.loads((archived / "meeting.json").read_text()) == payload
+    assert (archived / "manifest.json").is_file()
+    assert conn.execute(
+        "SELECT completed FROM meeting_source_cleanup WHERE occurrence_id = ? AND revision = ?",
+        (payload["occurrence_id"], payload["revision"]),
+    ).fetchall() == [(1,)]
+    assert _run(conn, tree) == MeetingImportResult()  # completed READY source is not re-quarantined
+
+
 # --- the happy path ---------------------------------------------------------
 
 
@@ -142,7 +158,7 @@ def test_valid_bundle_is_imported_archived_and_consumed(tmp_path):
     assert manifest["occurrence_id"] == payload["occurrence_id"]
     assert not (archived / "audio.enc").exists()                    # audio lives only in the store
 
-    assert not directory.exists()                                   # the inbox bundle was consumed
+    _assert_source_completed(conn, tree, payload)
     assert _entries(tree.quarantine) == []
 
 
@@ -263,7 +279,7 @@ def test_duplicate_rescan_is_unchanged_and_writes_no_second_revision(tmp_path):
     assert replay.details == ((payload["occurrence_id"], "unchanged", "ok"),)
     assert len(list_meeting_revisions(conn, payload["occurrence_id"])) == 1
     assert _audio_payload_files(tree.audio) == [_audio_file(tree, payload)]
-    assert not (tree.inbox / occurrence_path_segment(payload["occurrence_id"])).exists()
+    _assert_source_completed(conn, tree, payload)
 
 
 def test_higher_revision_activates_and_keeps_the_prior_revision_as_provenance(tmp_path):
@@ -1615,7 +1631,7 @@ def test_a_failed_archive_still_reports_the_committed_import_and_the_scan_contin
     assert [r["revision"] for r in list_meeting_revisions(conn, first["occurrence_id"])] == [
         first["revision"]
     ]
-    assert not (tree.inbox / occurrence_path_segment(first["occurrence_id"])).exists()
+    _assert_source_completed(conn, tree, first)
 
 
 def test_audio_swapped_for_a_symlink_after_validation_is_not_copied_through(tmp_path, monkeypatch):

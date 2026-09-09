@@ -304,6 +304,7 @@ CREATE TABLE IF NOT EXISTS meeting_source_cleanup (
   source_root TEXT NOT NULL,
   relative_path TEXT NOT NULL,
   identity TEXT NOT NULL,
+  completed INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (occurrence_id, revision, source_root, relative_path),
   FOREIGN KEY (occurrence_id, revision)
     REFERENCES meeting_audio(occurrence_id, revision) ON DELETE CASCADE
@@ -406,6 +407,10 @@ def migrate_meetings(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if "completed" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(meeting_source_cleanup)")
+        }:
+            conn.execute("ALTER TABLE meeting_source_cleanup ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
         rows = conn.execute(
             "SELECT a.occurrence_id, a.revision, a.audio_expires_at, r.ended_at "
             "FROM meeting_audio a JOIN meeting_revisions r "
@@ -587,30 +592,40 @@ def _insert_source_cleanup(conn, key: tuple[str, int], source: SourceCleanup) ->
         "(occurrence_id, revision, source_root, relative_path, identity) VALUES (?, ?, ?, ?, ?)",
         (*location, source.identity),
     )
-    identity = conn.execute(
-        "SELECT identity FROM meeting_source_cleanup WHERE occurrence_id = ? AND revision = ? "
+    identity, completed = conn.execute(
+        "SELECT identity, completed FROM meeting_source_cleanup WHERE occurrence_id = ? AND revision = ? "
         "AND source_root = ? AND relative_path = ?", location,
-    ).fetchone()[0]
-    if identity != source.identity:
+    ).fetchone()
+    if identity != source.identity and not completed:
         raise MeetingStoreError("source cleanup ownership changed")
+    if completed:
+        # Completed ownership must never hide a fresh validated delivery, even
+        # one which reused the same source path/inode after ciphertext removal.
+        conn.execute(
+            "UPDATE meeting_source_cleanup SET identity = ?, completed = 0 "
+            "WHERE occurrence_id = ? AND revision = ? AND source_root = ? AND relative_path = ?",
+            (source.identity, *location),
+        )
 
 
-def pending_source_cleanup(conn: sqlite3.Connection) -> list[dict]:
+def pending_source_cleanup(conn: sqlite3.Connection, *, include_completed: bool = False) -> list[dict]:
     cursor = conn.execute(
         "SELECT s.*, a.sha256, a.bytes, a.audio_expires_at, f.artifact_hash "
         "FROM meeting_source_cleanup s JOIN meeting_audio a USING (occurrence_id, revision) "
         "JOIN meeting_artifacts f USING (occurrence_id, revision) "
-        "ORDER BY s.occurrence_id, s.revision, s.source_root, s.relative_path"
+        "WHERE s.completed = 0 OR ? "
+        "ORDER BY s.occurrence_id, s.revision, s.source_root, s.relative_path",
+        (include_completed,),
     )
     names = [column[0] for column in cursor.description]
     return [dict(zip(names, row)) for row in cursor]
 
 
 def clear_source_cleanup(conn: sqlite3.Connection, row: dict) -> None:
-    """Clear only the exact obligation proved discharged; failure leaves retry debt."""
+    """Complete exact owned ciphertext debt, retaining a source identity tombstone."""
     with conn:
         conn.execute(
-            "DELETE FROM meeting_source_cleanup WHERE occurrence_id = ? AND revision = ? "
+            "UPDATE meeting_source_cleanup SET completed = 1 WHERE occurrence_id = ? AND revision = ? "
             "AND source_root = ? AND relative_path = ? AND identity = ?",
             tuple(row[name] for name in (
                 "occurrence_id", "revision", "source_root", "relative_path", "identity")),

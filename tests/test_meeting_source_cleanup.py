@@ -28,7 +28,7 @@ def _fail_archive(monkeypatch):
 def _debt(conn):
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
     assert "meeting_source_cleanup" in tables, "accepted source cleanup must be durable"
-    return conn.execute("SELECT * FROM meeting_source_cleanup").fetchall()
+    return conn.execute("SELECT * FROM meeting_source_cleanup WHERE completed = 0").fetchall()
 
 
 def _expire(conn, tree, now="2026-09-16T14:52:00.000000Z", **kwargs):
@@ -456,3 +456,106 @@ def test_fifo_source_replacement_reports_pending_without_blocking(tmp_path, monk
             process.terminate()
         process.join(timeout=2)
     assert (source / "original-owned.enc").stat().st_size == payload["audio"]["bytes"]
+
+
+@pytest.mark.parametrize("when", ["initial_archive", "retry_archive"])
+def test_archive_metadata_write_race_preserves_replacement_and_destroys_owned_inode(
+    tmp_path, monkeypatch, when,
+):
+    conn = open_db(tmp_path / "ledger.db")
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    source = write_meeting_bundle(tree.inbox, payload)
+    if when == "retry_archive":
+        _fail_archive(monkeypatch)
+        _run(conn, tree)
+        monkeypatch.undo()
+    original = meeting_importer._write_atomic
+    escaped = tmp_path / "renamed-owned-source"
+    raced = False
+
+    def replace_during_metadata(path, blob):
+        nonlocal raced
+        if path.is_relative_to(tree.archive) and not raced:
+            raced = True
+            source.rename(escaped)
+            write_meeting_bundle(tree.inbox, payload)
+            (source / "replacement-marker").write_text("unowned replacement")
+        return original(path, blob)
+
+    monkeypatch.setattr(meeting_importer, "_write_atomic", replace_during_metadata)
+    result = _run(conn, tree)
+
+    assert raced
+    assert source.is_dir(), "metadata I/O must not permit deleting a replacement directory"
+    assert (source / "replacement-marker").read_text() == "unowned replacement"
+    assert (source / "audio.enc").stat().st_size == 2048
+    assert (escaped / "audio.enc").stat().st_size == 0
+    assert result.cleanup_pending == ()
+    assert _debt(conn) == []
+
+
+def test_completed_source_placeholder_is_skipped_on_repeated_normal_runs(tmp_path):
+    conn = open_db(tmp_path / "ledger.db")
+    tree = _Tree(tmp_path)
+    source = write_meeting_bundle(tree.inbox, _payload())
+    assert _run(conn, tree).accepted == 1
+    assert source.is_dir(), "POSIX archive completion retains owned empty placeholders"
+    assert (source / "audio.enc").stat().st_size == 0
+    for _ in range(3):
+        result = _run(conn, tree)
+        assert result.quarantined == 0
+        assert result.cleanup_pending == ()
+        assert not tree.quarantine.exists()
+
+
+@pytest.mark.parametrize("delivery", ["same_inode", "replacement_directory", "new_revision"])
+def test_completed_tombstone_does_not_hide_fresh_delivery(tmp_path, monkeypatch, delivery):
+    conn = open_db(tmp_path / "ledger.db")
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    source = write_meeting_bundle(tree.inbox, payload)
+    assert _run(conn, tree).accepted == 1
+    assert source.exists(), "archive must not remove source namespace by pathname"
+    if delivery == "replacement_directory":
+        source.rename(tmp_path / "completed-old-source")
+    elif delivery == "new_revision":
+        payload = _payload(revision=4)
+    source = write_meeting_bundle(tree.inbox, payload)
+    _fail_archive(monkeypatch)
+
+    result = _run(conn, tree)
+
+    assert result.quarantined == 0
+    assert result.unchanged == (delivery != "new_revision")
+    assert result.activated == (delivery == "new_revision")
+    assert result.cleanup_pending == ((payload["occurrence_id"], payload["revision"]),)
+    assert (source / "audio.enc").stat().st_size == 2048
+    assert len(_debt(conn)) == 1
+
+
+def test_existing_cleanup_table_migrates_idempotently_without_source_io(tmp_path, monkeypatch):
+    db = tmp_path / "ledger.db"
+    conn = open_db(db)
+    tree = _Tree(tmp_path)
+    payload = _payload()
+    source = write_meeting_bundle(tree.inbox, payload)
+    _fail_archive(monkeypatch)
+    _run(conn, tree)
+    captured = conn.execute(
+        "SELECT occurrence_id, revision, source_root, relative_path, identity FROM meeting_source_cleanup"
+    ).fetchall()
+    conn.execute("ALTER TABLE meeting_source_cleanup DROP COLUMN completed")
+    conn.commit()
+    conn.close()
+    before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in source.iterdir()}
+
+    for _ in range(2):
+        conn = open_db(db)  # migration precedes every subsequent store/API query
+        assert conn.execute(
+            "SELECT occurrence_id, revision, source_root, relative_path, identity FROM meeting_source_cleanup"
+        ).fetchall() == captured
+        assert conn.execute("SELECT completed FROM meeting_source_cleanup").fetchall() == [(0,)]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        conn.close()
+    assert {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in source.iterdir()} == before

@@ -851,7 +851,14 @@ def test_process_meetings_imports_renders_and_publishes_without_approval(bench):
     assert "fix: JWT refresh race" in aged and STALE_WEEK_LINK in aged
     assert not (bench.vault / "Work Journal" / "Week 2026-07-13-17.md").exists()
     assert list(bench.cfg.meeting_audio_store.rglob("audio.enc"))
-    assert not list(bench.cfg.meeting_inbox.rglob("meeting.json"))   # consumed
+    sources = list(bench.cfg.meeting_inbox.rglob("audio.enc"))
+    assert all(source.stat().st_size == 0 for source in sources)
+    assert list(bench.cfg.meeting_archive.rglob("meeting.json"))
+    assert open_db(bench.cfg.db_path).execute(
+        "SELECT completed FROM meeting_source_cleanup"
+    ).fetchall() == [(1,)]
+    assert bench.run() == 0  # retained READY metadata does not become a rejected bundle
+    assert not list(bench.cfg.meeting_quarantine.rglob("meeting.json"))
 
 
 def test_a_second_run_republishes_nothing_and_reissues_no_commit(

@@ -76,14 +76,19 @@ def test_a_meeting_goes_from_bundle_to_receipt_to_destroyed_audio(bench):  # noq
     assert len(meeting["transcript"]) == len(payload["transcript"])
 
     # the encrypted bytes are in the audio store, at the path the ledger names,
-    # and the inbox has been drained
+    # and the captured inbox ciphertext is gone without removing its namespace
     audio = meeting["audio"]
     stored = Path(audio["stored_path"])
     assert stored.is_file()
     assert stored.is_relative_to(bench.cfg.meeting_audio_store)
     assert stored.stat().st_size == audio["bytes"]
     assert audio["deleted_at"] is None
-    assert not list(bench.cfg.meeting_inbox.rglob("meeting.json"))
+    source_audio = bundle / "audio.enc"
+    assert not source_audio.exists() or source_audio.stat().st_size == 0
+    assert conn.execute(
+        "SELECT completed FROM meeting_source_cleanup WHERE occurrence_id = ?",
+        (occurrence_id,),
+    ).fetchall() == [(1,)]
     assert list(bench.cfg.meeting_archive.rglob("meeting.json"))
 
     # the canonical note is on disk under the meeting's week, with the front
@@ -136,6 +141,12 @@ def test_a_meeting_goes_from_bundle_to_receipt_to_destroyed_audio(bench):  # noq
     assert not url.startswith(("file:", "/"))              # not a filesystem path
     assert str(bench.vault) not in url and str(bench.tmp_path) not in url
     assert url.startswith("https://")
+
+    # Completed source metadata must not become a quarantined replay or a second
+    # publication merely because the original READY directory still exists.
+    assert run_process_meetings(bench.cfg, bench.ids, now=NOW) == 0
+    assert not list(bench.cfg.meeting_quarantine.rglob("meeting.json"))
+    assert _remote_ref(bench.bare, bench.branch) == published
 
     # ---- stage 4: a second before the boundary, the recording is still there
     expires_at = _instant(audio["expires_at"])
