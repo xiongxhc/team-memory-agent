@@ -134,8 +134,9 @@ def open_db_snapshot(
 
     File copies include committed WAL frames and rebuild SHM only in a private
     directory. Whole-set metadata checks bound retries when writers/checkpoints
-    change the source during copying; rollback journals are conservatively
-    refused. Symlinks resolve before locating sidecars.
+    change the source during copying. Cold journals with an empty/zeroed header are
+    safe to omit; active/recovery journals are refused. Symlinks resolve before
+    locating sidecars.
 
     A disk caller's active transaction is refused: serializing it can modify
     SHM and backing it up can self-deadlock. Idle disk callers use committed
@@ -166,10 +167,17 @@ def open_db_snapshot(
         for _ in range(3):
             with TemporaryDirectory(prefix="teammem-dry-run-") as directory:
                 before = _snapshot_file_state(sources)
-                if before[2] is not None:
-                    raise ValueError("dry-run refuses a ledger with a rollback journal")
                 image = Path(directory) / "ledger.db"
                 try:
+                    if before[2] is not None:
+                        with journal.open("rb") as source_journal:
+                            header = source_journal.read(28)
+                        # TRUNCATE empties the journal; PERSIST clears its header.
+                        # Both mark a completed transaction. An
+                        # active unsynced journal can have zero magic bytes but
+                        # a nonzero remainder, so checking only magic is unsafe.
+                        if header not in (b"", bytes(28)):
+                            raise ValueError("dry-run refuses an active or recovery rollback journal")
                     shutil.copyfile(path, image)
                     if before[1] is not None:
                         shutil.copyfile(wal, Path(str(image) + "-wal"))

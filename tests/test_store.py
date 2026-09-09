@@ -39,6 +39,24 @@ def legacy_wal_ledger(path):
         conn.close()
 
 
+def legacy_persist_ledger(path, journal_mode="PERSIST"):
+    """Commit a legacy ledger and close its last connection, retaining a cold journal."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(f"PRAGMA journal_mode = {journal_mode}")
+        conn.executescript("""
+            CREATE TABLE summaries (
+                id INTEGER PRIMARY KEY, kind TEXT, key TEXT, input_hash TEXT,
+                text TEXT, model TEXT, created_ts TEXT, UNIQUE(kind, key));
+            CREATE TABLE marker (value TEXT);
+            INSERT INTO marker VALUES ('committed persist');
+            PRAGMA user_version = 7;
+        """)
+        return ledger_logical(conn)
+    finally:
+        conn.close()
+
+
 def ledger_bytes(path):
     return {suffix: p.read_bytes() if p.exists() else None
             for suffix in ("", "-wal", "-shm", "-journal")
@@ -119,6 +137,61 @@ def test_dry_run_snapshot_refuses_active_rollback_journal_without_recovery(tmp_p
             store.open_db_snapshot(path)
         assert ledger_bytes(path) == before
         assert writer.in_transaction
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+@pytest.mark.parametrize("journal_mode, header", [("PERSIST", bytes(28)), ("TRUNCATE", b"")])
+def test_dry_run_snapshot_migrates_idle_persist_ledger_without_touching_source(
+    tmp_path, journal_mode, header,
+):
+    from teammem import store
+
+    path = tmp_path / "ledger.db"
+    logical = legacy_persist_ledger(path, journal_mode)
+    before = ledger_bytes(path)
+    assert before["-journal"][:28] == header
+    for _ in range(2):
+        conn = store.open_db_snapshot(path)
+        try:
+            assert conn.execute("SELECT value FROM marker").fetchall() == [
+                ("committed persist",)]
+            assert PROVENANCE <= {r[1] for r in conn.execute("PRAGMA table_info(summaries)")}
+            assert conn.execute("SELECT COUNT(*) FROM meetings").fetchone() == (0,)
+        finally:
+            conn.close()
+        assert ledger_bytes(path) == before
+        source = sqlite3.connect(path.as_uri() + "?immutable=1", uri=True)
+        try:
+            assert ledger_logical(source) == logical
+        finally:
+            source.close()
+        assert ledger_bytes(path) == before
+
+
+def test_dry_run_snapshot_refuses_cold_journal_that_becomes_active_during_copy(tmp_path, monkeypatch):
+    from teammem import store
+    import shutil
+
+    path = tmp_path / "ledger.db"
+    legacy_persist_ledger(path)
+    writer = sqlite3.connect(path)
+    real_copy = shutil.copyfile
+    changed = []
+
+    def start_transaction(source, target):
+        result = real_copy(source, target)
+        writer.execute("INSERT INTO marker VALUES ('not committed')")
+        changed.append(ledger_bytes(path))
+        return result
+
+    monkeypatch.setattr(shutil, "copyfile", start_transaction)
+    try:
+        with pytest.raises(ValueError, match="journal"):
+            store.open_db_snapshot(path)
+        assert writer.in_transaction
+        assert ledger_bytes(path) == changed[0]
     finally:
         writer.rollback()
         writer.close()
