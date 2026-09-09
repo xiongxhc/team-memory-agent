@@ -112,7 +112,7 @@ def expire_meeting_audio(
     audio_store: Path,
     *,
     now: str,
-    alert_path: Callable[[str], Path],
+    alert_path: Callable[[str], Path] | None,
     warn_days: int = MEETING_AUDIO_WARN_DAYS,
     dry_run: bool = False,
 ) -> RetentionResult:
@@ -168,13 +168,17 @@ def expire_meeting_audio(
         if key not in due_keys and source["audio_expires_at"] <= stamp:
             if not cleanup_source_copy(conn, source, dry_run=dry_run):
                 failed.append(RetentionFailure(*key, "source_cleanup", "source cleanup pending; retry required"))
-    alerted, cleared = _warn(conn, now=now, warn_days=warn_days,
-                             alert_path=alert_path, dry_run=dry_run, failed=failed)
-    for occurrence_id, revision in sync_source_cleanup_alerts(
-        conn, alert_path=alert_path, now=stamp, dry_run=dry_run
-    ):
-        failed.append(RetentionFailure(occurrence_id, revision, "source_cleanup_alert",
-                                       "source cleanup alert update failed; retry required"))
+    alerted, cleared = [], []
+    if alert_path is None:
+        failed.append(RetentionFailure("", 0, "alert", "alert spool is unavailable"))
+    else:
+        alerted, cleared = _warn(conn, now=now, warn_days=warn_days,
+                                 alert_path=alert_path, dry_run=dry_run, failed=failed)
+        for occurrence_id, revision in sync_source_cleanup_alerts(
+            conn, alert_path=alert_path, now=stamp, dry_run=dry_run
+        ):
+            failed.append(RetentionFailure(occurrence_id, revision, "source_cleanup_alert",
+                                           "source cleanup alert update failed; retry required"))
     return RetentionResult(
         deleted=tuple(deleted),
         swept=tuple(swept),
@@ -270,11 +274,20 @@ def _expire_one(
             failed.append(RetentionFailure(*key, "source_cleanup", "source cleanup pending; retry required"))
         return
 
-    custody_descriptors = ()
-    if inside:
+    try:
+        custody_descriptors = (_open_posix_custody_descriptors(expected_directory)
+                               if inside else _open_authoritative_final(path))
+    except OSError as error:
+        failed.append(RetentionFailure(*key, "containment", str(error)))
+        return
+    if not inside:
         try:
-            custody_descriptors = _open_posix_custody_descriptors(expected_directory)
+            # No old sibling scan is authorized on retry. Destroy this held
+            # inode before a crash/unlink can remove its recorded final name.
+            _zero_opened_custody(custody_descriptors)
         except OSError as error:
+            for descriptor in custody_descriptors:
+                os.close(descriptor)
             failed.append(RetentionFailure(*key, "containment", str(error)))
             return
     try:
@@ -286,19 +299,22 @@ def _expire_one(
             os.close(descriptor)
         failed.append(RetentionFailure(*key, "unlink", str(error)))
         return
-    if inside:
-        try:
+    try:
+        # The recorded final remains authoritative after a configured-root move.
+        # Truncating its held inode destroys all hard-linked ciphertext without
+        # inspecting or deleting any sibling name outside the current root.
+        _zero_opened_custody(custody_descriptors)
+        if inside:
             _discard_windows_staging_residues(expected_directory)
-            _zero_opened_custody(custody_descriptors)
             _zero_posix_staging_residues(expected_directory)
             _assert_governed_audio_bytes_gone(expected_directory)
             _prune_empty(expected_directory, store)
-        except OSError as error:
-            failed.append(RetentionFailure(*key, "containment", str(error)))
-            return
-        finally:
-            for descriptor in custody_descriptors:
-                os.close(descriptor)
+    except OSError as error:
+        failed.append(RetentionFailure(*key, "containment", str(error)))
+        return
+    finally:
+        for descriptor in custody_descriptors:
+            os.close(descriptor)
     # Primary destruction is never held hostage by metadata archiving or source
     # permissions. Every captured duplicate must also be discharged before the
     # ledger can claim deletion, including sources beneath former inbox roots.
@@ -330,6 +346,29 @@ def _assert_governed_audio_bytes_gone(directory: Path) -> None:
                 "governed audio entry remains after retention cleanup", entry)
 
 
+def _open_authoritative_final(path: Path) -> tuple[int, ...]:
+    """Hold only the recorded regular inode, never follow or enumerate siblings."""
+    if os.name == "nt":
+        return ()
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            return ()
+        raise
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode)
+                or not _same_inode(metadata, path.stat(follow_symlinks=False))):
+            raise OSError("recorded audio is not a stable regular file")
+        return (descriptor,)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _open_posix_custody_descriptors(directory: Path) -> tuple[int, ...]:
     """Hold custody inodes that are still exactly the current final audio."""
     if os.name == "nt":
@@ -346,7 +385,7 @@ def _open_posix_custody_descriptors(directory: Path) -> tuple[int, ...]:
         try:
             final_fd = os.open(
                 AUDIO_FILENAME,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
                 dir_fd=directory_fd,
             )
         except FileNotFoundError:
@@ -363,14 +402,15 @@ def _open_posix_custody_descriptors(directory: Path) -> tuple[int, ...]:
                 not stat.S_ISREG(final_metadata.st_mode)
                 or not _same_inode(current, final_metadata)
             ):
-                return ()
+                raise OSError("recorded audio is not a stable regular file")
+            descriptors.append(os.dup(final_fd))
             for entry in sorted(directory.iterdir()):
                 if not entry.name.startswith(_CUSTODY_PREFIX):
                     continue
                 try:
                     descriptor = os.open(
                         entry.name,
-                        os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                        os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
                         dir_fd=directory_fd,
                     )
                 except FileNotFoundError:
@@ -431,7 +471,7 @@ def _zero_posix_staging_residues(directory: Path) -> None:
             try:
                 descriptor = os.open(
                     entry.name,
-                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
                     dir_fd=directory_fd,
                 )
             except FileNotFoundError:

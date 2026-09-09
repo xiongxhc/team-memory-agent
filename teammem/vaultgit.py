@@ -1,6 +1,8 @@
 """Thin git wrapper for the vault repo. Deterministic hands: add -A, commit,
-optional push. Never rewrites history; push only on explicit operator opt-in."""
+optional push. Accepted history is never rewritten; a rejected owned unpushed
+commit may be rolled back with compare-and-swap. Push is operator opt-in."""
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -18,15 +20,114 @@ def ensure_repo(path: Path) -> None:
         _git(path, "config", "user.email", "teammem@local")
 
 
-def commit_all(path: Path, msg: str) -> bool:
+class VerifiedTreeMismatch(RuntimeError):
+    """Git's candidate tree differs from the verified filesystem projection."""
+
+
+def _publication_guard(path: Path) -> Path:
+    return Path(_git(path, "rev-parse", "--absolute-git-dir").stdout.strip()) / "teammem-publication-pending"
+
+
+def _assert_publication_ready(path: Path) -> None:
+    if _publication_guard(path).exists():
+        raise VerifiedTreeMismatch(
+            "an interrupted or rejected vault commit needs explicit recovery; "
+            "inspect the private Git teammem-publication-pending guard before publishing")
+
+
+def _head_or_none(path: Path) -> str | None:
+    result = subprocess.run(["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
+                            capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def verify_tree_manifest(path: Path, tree: str, manifest: dict[str, bytes]) -> None:
+    entries = _git(path, "ls-tree", "-rz", tree).stdout.split("\0")
+    actual = {}
+    for entry in filter(None, entries):
+        metadata, name = entry.split("\t", 1)
+        mode, kind, oid = metadata.split()
+        if kind != "blob" or mode not in ("100644", "100755"):
+            raise VerifiedTreeMismatch(f"unverified Git entry: {name}")
+        actual[name] = oid
+    if actual.keys() != manifest.keys():
+        names = sorted(actual.keys() ^ manifest.keys())
+        raise VerifiedTreeMismatch("Git tree differs from verified paths: " + ", ".join(names))
+    for name, expected in manifest.items():
+        blob = subprocess.run(["git", "-C", str(path), "cat-file", "blob", actual[name]],
+                              capture_output=True, check=True).stdout
+        if blob != expected:
+            raise VerifiedTreeMismatch(f"Git tree differs from verified bytes: {name}")
+
+
+def _current_ref(path: Path) -> str:
+    result = subprocess.run(["git", "-C", str(path), "symbolic-ref", "-q", "HEAD"],
+                            capture_output=True, text=True)
+    if result.returncode not in (0, 1):
+        result.check_returncode()
+    return result.stdout.strip() if result.returncode == 0 else "HEAD"
+
+
+def _reject_owned_commit(path: Path, ref: str, parent: str | None, rejected: str) -> None:
+    """Remove only our rejected unpushed commit from the current branch.
+
+    Hooks remain enabled. Working files and index remain available for diagnosis.
+    A ref/parent change or failed compare-and-swap refuses rollback rather than
+    rewriting somebody else's work.
+    """
+    ancestry = _git(path, "rev-list", "--parents", "-n", "1", rejected).stdout.split()
+    if _current_ref(path) != ref or ancestry != [rejected] + ([parent] if parent else []):
+        raise VerifiedTreeMismatch("rejected Git commit ownership changed; rollback refused")
+    try:
+        if parent is None:
+            _git(path, "update-ref", "-d", ref, rejected)
+        else:
+            _git(path, "update-ref", ref, parent, rejected)
+    except subprocess.CalledProcessError as error:
+        raise VerifiedTreeMismatch("rejected Git commit ref changed; rollback refused") from error
+
+
+def commit_all(path: Path, msg: str, *, verified_manifest: dict[str, bytes] | None = None) -> bool:
+    _assert_publication_ready(path)
     _git(path, "add", "-A")
+    if verified_manifest is not None:
+        verify_tree_manifest(path, _git(path, "write-tree").stdout.strip(), verified_manifest)
     if not _git(path, "status", "--porcelain").stdout.strip():
+        if verified_manifest is not None:
+            verify_tree_manifest(path, "HEAD", verified_manifest)
         return False
-    _git(path, "commit", "-q", "-m", msg)
+    if verified_manifest is not None:
+        ref = _current_ref(path)
+        parent = _head_or_none(path)
+        guard = _publication_guard(path)
+        # Write before commit: a crash or failed rollback must not let the next
+        # unattended run push an unverified ancestor. Only proven success or
+        # proven rollback clears this guard; recovery is explicitly operator-owned.
+        with guard.open("x", encoding="utf-8") as handle:
+            handle.write(f"ref={ref}\nparent={parent or 'unborn'}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    try:
+        _git(path, "commit", "-q", "-m", msg)
+    except subprocess.CalledProcessError:
+        if (verified_manifest is not None and _current_ref(path) == ref
+                and _head_or_none(path) == parent):
+            guard.unlink()
+        raise
+    if verified_manifest is not None:
+        committed = head_commit(path)
+        try:
+            verify_tree_manifest(path, committed, verified_manifest)
+        except VerifiedTreeMismatch:
+            _reject_owned_commit(path, ref, parent, committed)
+            guard.unlink()
+            raise
+        guard.unlink()
     return True
 
 
 def push(path: Path) -> None:
+    _assert_publication_ready(path)
     _git(path, "push")
 
 
@@ -97,6 +198,7 @@ def push_verified(path: Path, commit: str) -> str:
     hand committing to the same vault between the two reads would otherwise slip
     an unchecked commit into whatever the caller goes on to claim.
     """
+    _assert_publication_ready(path)
     _git(path, "push")
     if not remote_reaches(path, commit):
         remote, ref, _ = _upstream(path)

@@ -1297,11 +1297,12 @@ def test_an_unattributable_finding_blocks_every_occurrence(bench):
     assert _remote_ref(bench.bare, bench.branch) == before
 
 
+@pytest.mark.parametrize("scaffold", ["{}", "- {}", "- **{}**", "**Speaker:** {}"])
 def test_an_all_short_transcript_copied_into_the_summary_is_not_published(
-    bench, capsys
+    bench, capsys, scaffold
 ):
     payload = _short_transcript_payload()
-    payload["summary"] = "Status:\n" + "\n".join(SHORT_TURNS)
+    payload["summary"] = "Status:\n" + "\n".join(scaffold.format(turn) for turn in SHORT_TURNS)
     bench.drop(payload)
     before = _remote_ref(bench.bare, bench.branch)
 

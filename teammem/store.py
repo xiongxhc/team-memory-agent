@@ -4,6 +4,7 @@ UNIQUE(person, source, hash) key makes every ingest path idempotent."""
 import json
 import shutil
 import sqlite3
+from contextlib import contextmanager
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +80,25 @@ def open_db(path: Path) -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+@contextmanager
+def ledger_read_view(conn: sqlite3.Connection):
+    """An owned coherent SQLite image, including a caller's uncommitted view.
+
+    Serialization pins SQLite's read view for the copy. No source transaction
+    is committed, rolled back or held across filesystem/network work. A WAL
+    image becomes an ordinary in-memory database with no external sidecars.
+    """
+    image = bytearray(conn.serialize())
+    image[18:20] = b"\x01\x01"
+    view = sqlite3.connect(":memory:")
+    try:
+        view.deserialize(bytes(image))
+        view.row_factory = conn.row_factory
+        yield view
+    finally:
+        view.close()
 
 
 def _initialize_db(conn: sqlite3.Connection) -> None:

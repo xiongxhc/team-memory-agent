@@ -714,7 +714,7 @@ def test_main_expire_meeting_audio_without_configuration_exits_2(
     monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
 
     assert main(["expire-meeting-audio", "--now", EXPIRY]) == 2
-    assert "TEAMMEM_MEETING_INBOX" in capsys.readouterr().err
+    assert "TEAMMEM_MEETING_AUDIO_STORE" in capsys.readouterr().err
 
 
 def test_main_expire_meeting_audio_rejects_a_now_without_a_utc_offset(

@@ -26,7 +26,8 @@ from .meeting_store import get_meeting
 # ledger says the note belongs at, not a path a renderer handed back.
 from .render import _meeting_facts, render_vault_verified
 from .run_lock import RunLockedError, acquire_publication_lock
-from .vaultgit import (PushNotVerified, commit_all, commit_contains,
+from .store import ledger_read_view
+from .vaultgit import (PushNotVerified, VerifiedTreeMismatch, commit_all, commit_contains,
                        head_commit, push_verified, remote_reaches)
 
 RECEIPT_SCHEMA = "teammem-meeting-receipt/v1"
@@ -134,9 +135,9 @@ def publish_meeting(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path
                     channel_names: dict | None = None) -> dict:
     """Hold the shared vault transaction until the verified receipt is durable."""
     try:
-        with acquire_publication_lock(vault_dir):
+        with acquire_publication_lock(vault_dir), ledger_read_view(conn) as view:
             return _publish_meeting(
-                conn, ids, vault_dir, today, occurrence_id=occurrence_id,
+                view, ids, vault_dir, today, occurrence_id=occurrence_id,
                 receipt_path=receipt_path, web_base=web_base, weeks=weeks,
                 channel_names=channel_names)
     except RunLockedError as error:
@@ -181,8 +182,11 @@ def _publish_meeting(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Pat
         # receipt then names the current HEAD. An empty commit would pollute the
         # vault's history to say nothing.
         committed = commit_all(
-            vault_dir, f"meeting: {occurrence_id} revision {meeting['revision']}")
+            vault_dir, f"meeting: {occurrence_id} revision {meeting['revision']}",
+            verified_manifest=out["verified_manifest"])
         commit = head_commit(vault_dir)
+    except VerifiedTreeMismatch as error:
+        raise PublishRefused("commit", str(error)) from error
     except subprocess.CalledProcessError as error:
         raise PublishRefused(
             "commit", f"the vault commit failed: {_git_detail(error)}") from error

@@ -156,7 +156,11 @@ def test_expiry_source_failure_still_destroys_primary_and_retries_mark(tmp_path,
     original_open = os.open
 
     def deny_source(path, flags, *args, **kwargs):
-        if os.fspath(path) == str(audio) or (os.fspath(path) == "audio.enc" and flags & os.O_RDWR):
+        directory_fd = kwargs.get("dir_fd")
+        source_directory = (directory_fd is not None
+                            and os.fstat(directory_fd).st_ino == source.stat().st_ino)
+        if os.fspath(path) == str(audio) or (os.fspath(path) == "audio.enc"
+                                           and source_directory and flags & os.O_RDWR):
             raise OSError(errno.EACCES, "private-source-path transcript secret")
         return original_open(path, flags, *args, **kwargs)
 

@@ -24,7 +24,7 @@ from .meeting_bundles import short_occurrence_id
 from .meeting_store import get_meeting, list_meeting_revisions, list_meetings
 from .queries import (by_key, events_between, flags, ref_url,
                       week_label, week_monday, week_range)
-from .store import get_summary
+from .store import get_summary, ledger_read_view
 
 MANAGED = ("Person", "Projects", "Work Journal", "Meetings", "README.md")
 MAX_WORK_LINES = 12   # work bullets per person per week (project and person week files)
@@ -905,8 +905,38 @@ def _compact_whitespace(text: str) -> str:
     return "".join(character for character in text if not character.isspace())
 
 
+def _only_turn_scaffolding(gap: str) -> bool:
+    """Only Markdown markers, list numbers or colon-terminated speaker labels.
+
+    Applied to gaps between already matched whole turns, never spoken text.
+    This also supports labels on their own lines without erasing a spoken turn
+    that itself happens to end in a colon.
+    """
+    for line in gap.splitlines():
+        line = re.sub(r"^[\s>*_`~#+-]*(?:\d+[.)]\s*)?", "", line)
+        line = line.lstrip(" \t>*_`~#+-")
+        line = line.rstrip(" \t>*_`~#+-")
+        line = re.sub(r"^[\w][\w .'-]{0,60}(?:\*\*|__)?[:：](?:\*\*|__)?\s*$", "", line)
+        if line:
+            return False
+    return True
+
+
+def _ordered_turns_present(text: str, turns: tuple[re.Pattern, ...]) -> bool:
+    for first in turns[0].finditer(text):
+        end = first.end()
+        for turn in turns[1:]:
+            following = turn.search(text, end)
+            if following is None or not _only_turn_scaffolding(text[end:following.start()]):
+                break
+            end = following.end()
+        else:
+            return True
+    return False
+
+
 def _forbidden_values(conn: sqlite3.Connection, occurrence_ids
-                      ) -> tuple[int, _ProbeIndex, _ProbeIndex]:
+                      ) -> tuple[int, _ProbeIndex, _ProbeIndex, list]:
     """A probe index of (kind, value) for everything that must never reach the vault.
 
     Every stored revision, not only the current one: a superseded revision's
@@ -915,13 +945,15 @@ def _forbidden_values(conn: sqlite3.Connection, occurrence_ids
     Raw values retain the existing exact long-segment and audio checks. A
     separate compact domain has one complete transcript per revision with only
     Unicode whitespace removed. Keeping the domains separate lets each file be
-    indexed once in the spelling appropriate to that probe.
+    indexed once in the spelling appropriate to that probe. All-short revisions
+    also retain ordered whole-turn patterns for Markdown/speaker gap checks.
     """
     # ~4 words of prose: long enough that vault text does not collide with the
     # start of a transcript line, short enough to index all but a stray value.
     probe_len = 32
     raw_values: dict[_Probe, None] = {}           # deduplicated, insertion order
     compact_values: dict[_Probe, None] = {}
+    ordered_turns = []
     for occurrence_id in occurrence_ids:
         for entry in list_meeting_revisions(conn, occurrence_id):
             meeting = get_meeting(conn, occurrence_id, revision=entry["revision"])
@@ -934,6 +966,18 @@ def _forbidden_values(conn: sqlite3.Connection, occurrence_ids
                 "".join(segment["text"] for segment in meeting["transcript"])
             )
             compact_values[("transcript text", complete)] = None
+            texts = [_compact_whitespace(segment["text"]) for segment in meeting["transcript"]]
+            if texts and all(0 < len(value) < _MIN_LEAKED_TEXT for value in texts):
+                # Underscores are identifier characters, except for Markdown
+                # emphasis opening/closing at an outer lexical boundary.
+                # Thus _Yes_ is spoken text, while prefix_Yes_suffix is not.
+                ordered_turns.append(tuple(re.compile(
+                    (r"(?:(?<!\w)|(?<=\W_)|(?<=\W__)|(?<=\W___)|(?<=^_)|(?<=^__)|(?<=^___))"
+                     if _word_character(value[0]) else "")
+                    + r"\s*".join(re.escape(character) for character in value)
+                    + (r"(?:(?!\w)|(?=_{1,3}(?:\W|$)))"
+                       if _word_character(value[-1]) else "")
+                ) for value in texts))
             audio = meeting["audio"]
             if audio:
                 raw_values[("audio store path", audio["stored_path"])] = None
@@ -941,7 +985,7 @@ def _forbidden_values(conn: sqlite3.Connection, occurrence_ids
                 if len(audio["filename"]) >= 5:
                     raw_values[("audio file name", audio["filename"])] = None
     return (probe_len, _probe_index(raw_values, probe_len),
-            _probe_index(compact_values, probe_len))
+            _probe_index(compact_values, probe_len), ordered_turns)
 
 
 def _probe_candidates(text: str, probe_len: int, index: _ProbeIndex) -> set[_Probe]:
@@ -978,13 +1022,12 @@ def _word_character(character: str) -> bool:
 def _contains_compact_probe(text: str, breaks: set[int], value: str) -> bool:
     """Whether compact `text` contains a complete-transcript probe.
 
-    Tiny transcripts need lexical boundaries so `Yes` is not found in
-    `Yesterday`. A whitespace break is a boundary even though compaction
+    Complete transcripts need lexical boundaries so `Yes` is not found in
+    `Yesterday`, including when short turns combine into a longer probe.
+    A whitespace break is a boundary even though compaction
     removed it. Search continues after an invalid occurrence because a later
     standalone occurrence may still be a leak.
     """
-    if len(value) >= _MIN_LEAKED_TEXT:
-        return value in text
     start = text.find(value)
     while start >= 0:
         end = start + len(value)
@@ -1245,7 +1288,7 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
                        blamed)
 
     # ---- nothing forbidden anywhere under the vault -------------------------
-    probe_len, raw_index, compact_index = _forbidden_values(conn, sorted(expected))
+    probe_len, raw_index, compact_index, ordered_turns = _forbidden_values(conn, sorted(expected))
     if any(raw_index) or any(compact_index):
         for path in sorted(vault_dir.rglob("*")):
             rel_parts = path.relative_to(vault_dir).parts
@@ -1263,6 +1306,8 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
                         compact, probe_len, compact_index
                     ) if _contains_compact_probe(compact, breaks, value)
                 )
+            if any(_ordered_turns_present(text, turns) for turns in ordered_turns):
+                leaked.add("transcript text")
             for kind in sorted(leaked):
                 report("meeting.leakage.forbidden-content", "/".join(rel_parts),
                        f"{kind} from the ledger appears in this file")
@@ -1317,6 +1362,14 @@ def _blame_findings(conn: sqlite3.Connection, ids: IdentityMaps,
 def render_vault_verified(conn: sqlite3.Connection, ids: IdentityMaps,
                           vault_dir: Path, today: date, weeks: int = 4,
                           channel_names: dict | None = None) -> dict:
+    """Render and verify one coherent ledger view, returning its byte manifest."""
+    with ledger_read_view(conn) as view:
+        return _render_vault_verified(view, ids, vault_dir, today, weeks, channel_names)
+
+
+def _render_vault_verified(conn: sqlite3.Connection, ids: IdentityMaps,
+                           vault_dir: Path, today: date, weeks: int,
+                           channel_names: dict | None) -> dict:
     """Render for a caller that is going to commit and push the result.
 
     `render_vault` on its own leaves meeting content in the vault that no check
@@ -1355,4 +1408,12 @@ def render_vault_verified(conn: sqlite3.Connection, ids: IdentityMaps,
         out["withheld_findings"] = withheld_findings
         out["findings"] = [f for f in findings
                            if f["occurrence_id"] not in withheld]
+        # The cooperative vault lock spans verification, this manifest and Git.
+        # Git must reproduce every verified file, including companion pages,
+        # with identical bytes after ignore rules, clean filters and hooks.
+        out["verified_manifest"] = {
+            path.relative_to(vault_dir).as_posix(): path.read_bytes()
+            for path in sorted(vault_dir.rglob("*"))
+            if ".git" not in path.relative_to(vault_dir).parts and path.is_file()
+        }
         return out

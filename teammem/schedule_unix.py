@@ -37,11 +37,11 @@ SYSTEMD_MEETING_UNITS = (
 )
 SYSTEMD_MEETING_TIMERS = (SYSTEMD_MEETINGS_TIMER, SYSTEMD_RETENTION_TIMER)
 MEETING_LABELS = (MEETINGS_LABEL, RETENTION_LABEL)
-# Every quarter hour: a note published within a quarter hour of the meeting is
-# still the same conversation to the people who were in it.
-MEETING_INTERVAL_MINUTES = 15
-# Audio expiry is a once-a-day boundary. An hour after the daily run keeps the
-# two off each other's vault lock without inventing an unrelated clock time.
+# Leave processing and publication room within the initial ten-minute target.
+# This polling interval alone is not an end-to-end latency guarantee.
+MEETING_INTERVAL_MINUTES = 1
+# Legacy cadence retained pending an explicit deadline-delivery decision.
+# This daily invocation does NOT satisfy each recording's exact expiry instant.
 RETENTION_HOUR_OFFSET = 1
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_NOFOLLOW | os.O_CLOEXEC

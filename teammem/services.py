@@ -17,7 +17,8 @@ from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 
-from .config import MEETING_PATH_SETTINGS, Config, validate_meeting_settings
+from .config import (MEETING_PATH_SETTINGS, Config, _physical_path, _path_within,
+                     validate_meeting_settings)
 from .connectors.base import CollectionResult, Connector
 from .connectors.config import ConnectorSettings
 from .connectors.registry import get_connector
@@ -60,7 +61,7 @@ from .telemetry import (
     distribution,
     noop_reporter,
 )
-from .vaultgit import (PushNotVerified, commit_all, ensure_repo,
+from .vaultgit import (PushNotVerified, VerifiedTreeMismatch, commit_all, ensure_repo,
                        head_commit, push)
 from .vaultgit import _upstream as vault_upstream
 
@@ -375,10 +376,15 @@ def _run_render(
               "meeting could be withheld for; nothing committed or pushed",
               file=sys.stderr)
         return 1
-    committed = commit_all(
-        cfg.vault_dir,
-        f"render: {today.isoformat()} {out['week_label']} ({out['files']} files)",
-    )
+    try:
+        committed = commit_all(
+            cfg.vault_dir,
+            f"render: {today.isoformat()} {out['week_label']} ({out['files']} files)",
+            verified_manifest=out["verified_manifest"],
+        )
+    except VerifiedTreeMismatch as error:
+        print(f"render: {error}; nothing pushed", file=sys.stderr)
+        return 1
     print(
         f"rendered {out['files']} files -> {cfg.vault_dir}"
         f" ({'committed' if committed else 'no changes'})"
@@ -813,7 +819,7 @@ def meeting_alert_path(cfg: Config, occurrence_id: str) -> Path:
     return cfg.meeting_alerts / f"{occurrence_path_segment(occurrence_id)}.json"
 
 
-def prepare_meeting_dirs(cfg: Config, *, create: bool = True) -> None:
+def prepare_meeting_dirs(cfg: Config, *, create: bool = True, fields=MEETING_PATH_SETTINGS) -> None:
     """Create the meeting directories privately, or refuse an exposed one.
 
     Meeting bundles carry transcripts and the audio store carries recordings, so
@@ -825,8 +831,10 @@ def prepare_meeting_dirs(cfg: Config, *, create: bool = True) -> None:
     nothing half-made behind.
     """
     absent = []
-    for field, key in MEETING_PATH_SETTINGS:
+    for field, key in fields:
         path = getattr(cfg, field)
+        if path is None:
+            raise ValueError(f"{key} is not set")
         if path.is_symlink():
             raise ValueError(f"{key} must not be a symlink: {path}")
         if not path.exists():
@@ -1072,13 +1080,14 @@ def execute_expire_meeting_audio(
     now: str,
     conn: sqlite3.Connection,
     dry_run: bool = False,
+    alerts_enabled: bool = True,
 ) -> RetentionResult:
     """Delete every expired recording and warn before an incomplete one is lost."""
     return expire_meeting_audio(
         conn,
         cfg.meeting_audio_store,
         now=now,
-        alert_path=partial(meeting_alert_path, cfg),
+        alert_path=partial(meeting_alert_path, cfg) if alerts_enabled else None,
         warn_days=cfg.meeting_warn_days,
         dry_run=dry_run,
     )
@@ -1094,15 +1103,51 @@ def run_expire_meeting_audio(
     """CLI entry: 0 clean, 1 an alert or a retryable failure, 2 misconfigured."""
     try:
         _utc_day(now)
-        validate_meeting_settings(cfg)
-        if not cfg.meetings_enabled:
+        if cfg.meeting_audio_store is None:
             raise ValueError(
-                "TEAMMEM_MEETING_INBOX is not set; this hub processes no meetings"
+                "TEAMMEM_MEETING_AUDIO_STORE is not set; this hub processes no meetings"
             )
-        prepare_meeting_dirs(cfg, create=not dry_run)
-    except ValueError as failure:
+        store = _physical_path(cfg.meeting_audio_store)
+        vault = _physical_path(cfg.vault_dir)
+        if (not cfg.meeting_audio_store.is_absolute()
+                or _path_within(store, vault) or _path_within(vault, store)):
+            raise ValueError("TEAMMEM_MEETING_AUDIO_STORE must be absolute and outside the vault")
+    except (ValueError, OSError, RuntimeError) as failure:
         print(f"error: {redact_secrets(failure, cfg)}", file=sys.stderr)
         return 2
+
+    # Publication settings and metadata spools cannot veto governed deletion.
+    # Diagnose them visibly, then enable alert writes only after their own
+    # private-path and containment checks have succeeded.
+    configuration_errors = []
+    try:
+        validate_meeting_settings(cfg)
+    except (ValueError, OSError) as failure:
+        configuration_errors.append(str(failure))
+    for field, key in MEETING_PATH_SETTINGS:
+        try:
+            prepare_meeting_dirs(cfg, create=False, fields=((field, key),))
+        except (ValueError, OSError) as failure:
+            configuration_errors.append(str(failure))
+    alerts_enabled = False
+    try:
+        path = cfg.meeting_alerts
+        if path is None or not path.is_absolute() or ".." in path.parts:
+            raise ValueError("TEAMMEM_MEETING_ALERTS must be an absolute path")
+        alerts = _physical_path(path)
+        for other in [cfg.vault_dir] + [getattr(cfg, field) for field, _ in MEETING_PATH_SETTINGS
+                                       if field != "meeting_alerts"]:
+            if other is not None:
+                physical = _physical_path(other)
+                if _path_within(alerts, physical) or _path_within(physical, alerts):
+                    raise ValueError("TEAMMEM_MEETING_ALERTS overlaps another configured directory")
+        prepare_meeting_dirs(cfg, create=not dry_run,
+                             fields=(("meeting_alerts", "TEAMMEM_MEETING_ALERTS"),))
+        alerts_enabled = True
+    except (ValueError, OSError, RuntimeError) as failure:
+        configuration_errors.append(str(failure))
+    for failure in dict.fromkeys(configuration_errors):
+        print(f"error: {redact_secrets(failure, cfg)}", file=sys.stderr)
 
     prefix = "dry-run: " if dry_run else ""
     try:
@@ -1112,7 +1157,8 @@ def run_expire_meeting_audio(
         print(f"error: {redact_secrets(failure, cfg)}", file=sys.stderr)
         return 2
     try:
-        result = execute_expire_meeting_audio(cfg, now=now, conn=connection, dry_run=dry_run)
+        result = execute_expire_meeting_audio(cfg, now=now, conn=connection, dry_run=dry_run,
+                                             alerts_enabled=alerts_enabled)
     finally:
         if dry_run or conn is None:
             connection.close()
@@ -1151,4 +1197,4 @@ def run_expire_meeting_audio(
     for occurrence_id, revision in result.source_cleanup_pending:
         print(f"{prefix}source_cleanup_pending {occurrence_id} revision {revision}: "
               "retry required; retention is not extended", file=sys.stderr)
-    return result.exit_code
+    return 2 if configuration_errors else result.exit_code

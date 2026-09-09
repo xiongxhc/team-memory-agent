@@ -117,8 +117,12 @@ What it generates:
 | systemd (Linux) | `teammem-meetings.service`, `teammem-meetings.timer`, `teammem-meeting-retention.service`, `teammem-meeting-retention.timer` |
 | launchd (macOS) | `org.teammem.meetings`, `org.teammem.meeting-retention` |
 
-Publication runs every 15 minutes. Audio expiry runs once a day, one hour after
-the daily run, so the two do not contend for the vault lock.
+Publication polls every minute, leaving room for processing within the initial
+ten-minute URL target; real end-to-end timing still requires acceptance evidence.
+Audio expiry currently runs once a day, one hour after the daily run. This does
+not satisfy the exact fourteen-day deletion deadline. The retention scheduling
+contract is unresolved; do not treat generated definitions as deployment-ready
+proof of the deadline.
 
 Files land in `~/.config/systemd/user/` on Linux and `~/Library/LaunchAgents/`
 on macOS.

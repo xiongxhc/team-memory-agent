@@ -512,10 +512,38 @@ was nothing to say, `1` when it warned or a deletion is left to retry, and `2`
 when the configuration is wrong. `--dry-run` reports what a real run would do
 and writes nothing: no file removed, no row changed, no alert.
 
+Publication URL or receipt/archive/alert configuration faults are reported with
+a nonzero exit but do not prevent accessible due audio from being destroyed.
+An unsafe alert spool receives no writes. The recorded final remains authoritative
+after an audio-root setting change: its inode is destroyed, including same-inode
+hard links, without inspecting old sibling names outside the current root.
+
+Publishing and committing renders use a coherent ledger view and compare every
+verified page's bytes with the actual Git tree. Ignored required pages or changed
+bytes from clean filters are refused. Configured Git hooks still run; a hook-mutated
+commit is refused and removed from the current ref only when ownership is proven
+with a compare-and-swap. An interrupted commit or failed rollback leaves
+`teammem-publication-pending` in the vault's private Git directory, blocking later
+automatic commits and pushes. Recovery requires inspecting and repairing the
+reachable history before explicitly removing that guard; a retry does not clear it.
+
+The complete-short-transcript check matches ordered whole turns without changing
+their case or punctuation. Its supported presentation grammar allows whitespace,
+Markdown bullet/number/quote prefixes, inline or standalone colon-terminated
+speaker labels (including Unicode names and fullwidth colons), and bold, italic,
+inline-code or strike markers around turns,
+including nested wrappers. Identifiers and near-word matches remain distinct
+from Markdown emphasis. Intervening ordinary prose is not treated as formatting;
+this is a bounded presentation check, not arbitrary encoding or paraphrase detection.
+
 Configuring meetings adds `teammem-meetings` and `teammem-meeting-retention`
 beside the daily job the next time the schedule is installed — publication every
-quarter hour, audio expiry an hour after the daily run. Removing the meeting
-settings and reinstalling takes both away again. The daily job's own definition
+minute, leaving processing time within the initial ten-minute URL target.
+That polling interval is not proof of end-to-end delivery latency. The current
+audio-expiry definition still runs an hour after the daily run; it does not
+deliver deletion at each exact fourteen-day deadline. That unattended-retention
+timing requirement remains unresolved and must be reconciled before deployment.
+Removing the meeting settings and reinstalling takes both away again. The daily job's own definition
 is byte-for-byte what it always was, and `teammem run-daily` neither reads nor
 requires any meeting setting. This repository holds the generator; the
 operator's deployment overlay holds the exact deployed copy of each generated

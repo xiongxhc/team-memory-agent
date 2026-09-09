@@ -1794,10 +1794,10 @@ def test_the_generated_meeting_units_run_the_unattended_commands(tmp_path):
         ' "expire-meeting-audio"\n')
 
     timer = (directory / "teammem-meetings.timer").read_text()
-    assert "OnCalendar=*-*-* *:00/15:00" in timer      # every quarter hour
+    assert "OnCalendar=*-*-* *:00/01:00" in timer      # one-minute publication poll
     assert "Unit=teammem-meetings.service" in timer
     assert "WantedBy=timers.target" in timer
-    # retention runs an hour after the daily job, so the two never contend
+    # Legacy retention cadence remains pending an explicit timing decision.
     retention_timer = (directory / "teammem-meeting-retention.timer").read_text()
     assert "OnCalendar=*-*-* 19:20:00" in retention_timer
     assert "Unit=teammem-meeting-retention.service" in retention_timer
@@ -1816,7 +1816,7 @@ def test_the_generated_launchd_meeting_jobs_run_the_unattended_commands(tmp_path
     assert process["ProgramArguments"] == [
         "/opt/pipx/bin/teammem", "--env-file", str(tmp_path / "hub.env"),
         "process-meetings"]
-    assert process["StartInterval"] == 900
+    assert process["StartInterval"] == 60
     assert process["RunAtLoad"] is False
 
     retention = plistlib.loads(

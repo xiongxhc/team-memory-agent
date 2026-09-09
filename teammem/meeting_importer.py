@@ -534,8 +534,10 @@ def _digest_descriptor(descriptor: int) -> tuple[str, int]:
 
 def _digest_file(path: Path) -> tuple[str, int]:
     """`(sha256:<hex>, size)` read back from disk, not from what was written."""
-    descriptor = os.open(path, os.O_RDONLY | _FILE_FLAGS)
+    descriptor = os.open(path, os.O_RDONLY | _FILE_FLAGS | getattr(os, "O_NONBLOCK", 0))
     try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("audio candidate is not a regular file")
         return _digest_descriptor(descriptor)
     finally:
         os.close(descriptor)
