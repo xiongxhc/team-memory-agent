@@ -68,6 +68,12 @@ def _current_ref(path: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else "HEAD"
 
 
+def _owns_commit(path: Path, ref: str, parent: str | None, commit: str) -> bool:
+    ancestry = _git(path, "rev-list", "--parents", "-n", "1", commit).stdout.split()
+    return (_current_ref(path) == ref and _head_or_none(path) == commit
+            and ancestry == [commit] + ([parent] if parent else []))
+
+
 def _reject_owned_commit(path: Path, ref: str, parent: str | None, rejected: str) -> None:
     """Remove only our rejected unpushed commit from the current branch.
 
@@ -75,8 +81,7 @@ def _reject_owned_commit(path: Path, ref: str, parent: str | None, rejected: str
     A ref/parent change or failed compare-and-swap refuses rollback rather than
     rewriting somebody else's work.
     """
-    ancestry = _git(path, "rev-list", "--parents", "-n", "1", rejected).stdout.split()
-    if _current_ref(path) != ref or ancestry != [rejected] + ([parent] if parent else []):
+    if not _owns_commit(path, ref, parent, rejected):
         raise VerifiedTreeMismatch("rejected Git commit ownership changed; rollback refused")
     try:
         if parent is None:
@@ -116,12 +121,18 @@ def commit_all(path: Path, msg: str, *, verified_manifest: dict[str, bytes] | No
         raise
     if verified_manifest is not None:
         committed = head_commit(path)
+        # Exact tip bytes do not validate hook-created ancestors or ref moves.
+        # Leave unowned history and the recovery guard intact on uncertainty.
+        if not _owns_commit(path, ref, parent, committed):
+            raise VerifiedTreeMismatch("Git commit ownership changed; publication refused")
         try:
             verify_tree_manifest(path, committed, verified_manifest)
         except VerifiedTreeMismatch:
             _reject_owned_commit(path, ref, parent, committed)
             guard.unlink()
             raise
+        if not _owns_commit(path, ref, parent, committed):
+            raise VerifiedTreeMismatch("Git commit ownership changed; publication refused")
         guard.unlink()
     return True
 

@@ -923,16 +923,27 @@ def _only_turn_scaffolding(gap: str) -> bool:
 
 
 def _ordered_turns_present(text: str, turns: tuple[re.Pattern, ...]) -> bool:
-    for first in turns[0].finditer(text):
-        end = first.end()
-        for turn in turns[1:]:
-            following = turn.search(text, end)
-            if following is None or not _only_turn_scaffolding(text[end:following.start()]):
-                break
-            end = following.end()
-        else:
-            return True
-    return False
+    # A spoken turn can also occur inside the next speaker label. Keep every
+    # viable endpoint instead of committing to that first (possibly dead-end)
+    # occurrence. Deduplication bounds state to text offsets per turn, rather
+    # than exponentially many paths through repeated labels/turns.
+    def placements(turn):
+        start = 0
+        while (match := turn.search(text, start)) is not None:
+            yield match
+            # finditer skips overlapping phrases (e.g. both "A A" placements
+            # in "A A A"), even when the later one is the viable spoken turn.
+            start = match.start() + 1
+
+    ends = {match.end() for match in placements(turns[0])}
+    for turn in turns[1:]:
+        if not ends:
+            return False
+        ends = {match.end() for match in placements(turn)
+                if any(end <= match.start()
+                       and _only_turn_scaffolding(text[end:match.start()])
+                       for end in ends)}
+    return bool(ends)
 
 
 def _forbidden_values(conn: sqlite3.Connection, occurrence_ids
