@@ -1791,13 +1791,13 @@ def test_the_generated_meeting_units_run_the_unattended_commands(tmp_path):
     retention = (directory / "teammem-meeting-retention.service").read_text()
     assert retention.endswith(
         f'ExecStart="/opt/pipx/bin/teammem" "--env-file" "{env_file}"'
-        ' "expire-meeting-audio"\n')
+        ' "expire-meeting-audio" "--watch"\n')
 
     timer = (directory / "teammem-meetings.timer").read_text()
     assert "OnCalendar=*-*-* *:00/01:00" in timer      # one-minute publication poll
     assert "Unit=teammem-meetings.service" in timer
     assert "WantedBy=timers.target" in timer
-    # Legacy retention cadence remains pending an explicit timing decision.
+    # Daily recovery supports the worker; individual expiries are ledger-driven.
     retention_timer = (directory / "teammem-meeting-retention.timer").read_text()
     assert "OnCalendar=*-*-* 19:20:00" in retention_timer
     assert "Unit=teammem-meeting-retention.service" in retention_timer
@@ -1822,8 +1822,9 @@ def test_the_generated_launchd_meeting_jobs_run_the_unattended_commands(tmp_path
     retention = plistlib.loads(
         (directory / "org.teammem.meeting-retention.plist").read_bytes())
     assert retention["Label"] == "org.teammem.meeting-retention"
-    assert retention["ProgramArguments"][-1] == "expire-meeting-audio"
-    assert retention["StartCalendarInterval"] == {"Hour": 19, "Minute": 20}
+    assert retention["ProgramArguments"][-2:] == ["expire-meeting-audio", "--watch"]
+    assert retention["RunAtLoad"] is True
+    assert retention["KeepAlive"] is True
 
 
 def test_a_failed_meeting_timer_start_restores_every_previous_definition(tmp_path):

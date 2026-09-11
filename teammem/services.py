@@ -1101,6 +1101,14 @@ def run_expire_meeting_audio(
     conn: sqlite3.Connection | None = None,
 ) -> int:
     """CLI entry: 0 clean, 1 an alert or a retryable failure, 2 misconfigured."""
+    return _run_expire_meeting_audio(cfg, now=now, dry_run=dry_run, conn=conn)[1]
+
+
+def _run_expire_meeting_audio(
+    cfg: Config, *, now: str, dry_run: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> tuple[RetentionResult | None, int]:
+    """One diagnosed retention pass, shared by one-shot CLI and Unix worker."""
     try:
         _utc_day(now)
         if cfg.meeting_audio_store is None:
@@ -1114,7 +1122,7 @@ def run_expire_meeting_audio(
             raise ValueError("TEAMMEM_MEETING_AUDIO_STORE must be absolute and outside the vault")
     except (ValueError, OSError, RuntimeError) as failure:
         print(f"error: {redact_secrets(failure, cfg)}", file=sys.stderr)
-        return 2
+        return None, 2
 
     # Publication settings and metadata spools cannot veto governed deletion.
     # Diagnose them visibly, then enable alert writes only after their own
@@ -1155,7 +1163,7 @@ def run_expire_meeting_audio(
                       else conn if conn is not None else open_db(cfg.db_path))
     except ValueError as failure:
         print(f"error: {redact_secrets(failure, cfg)}", file=sys.stderr)
-        return 2
+        return None, 2
     try:
         result = execute_expire_meeting_audio(cfg, now=now, conn=connection, dry_run=dry_run,
                                              alerts_enabled=alerts_enabled)
@@ -1197,4 +1205,4 @@ def run_expire_meeting_audio(
     for occurrence_id, revision in result.source_cleanup_pending:
         print(f"{prefix}source_cleanup_pending {occurrence_id} revision {revision}: "
               "retry required; retention is not extended", file=sys.stderr)
-    return 2 if configuration_errors else result.exit_code
+    return result, 2 if configuration_errors else result.exit_code

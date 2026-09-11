@@ -21,6 +21,7 @@ behind, not even the artifact row.
 """
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -456,6 +457,40 @@ def _foreign_keys_enforced(conn: sqlite3.Connection):
 
 
 def import_meeting_revision(
+    conn: sqlite3.Connection,
+    *,
+    payload: dict,
+    occurrence_id: str,
+    revision: int,
+    artifact_hash: str,
+    audio: StagedAudio,
+    imported_at: str,
+    before_commit: Callable[[], None],
+    source_cleanup: SourceCleanup | None = None,
+) -> RevisionImportResult:
+    """Commit a revision/source obligation, then best-effort wake retention.
+
+    Keep notification outside every rollback/discard boundary, including replay.
+    A worker fault cannot turn a committed import into a rejected bundle.
+    """
+    result = _import_meeting_revision(
+        conn, payload=payload, occurrence_id=occurrence_id, revision=revision,
+        artifact_hash=artifact_hash, audio=audio, imported_at=imported_at,
+        before_commit=before_commit, source_cleanup=source_cleanup)
+    if result.status == "imported" or source_cleanup is not None:
+        try:
+            from .meeting_retention_worker import notify_committed_import
+            notify_committed_import(conn)
+        except Exception:
+            try:
+                logging.getLogger(__name__).warning(
+                    "retention notification unavailable; committed import preserved; recovery required")
+            except Exception:
+                pass  # a broken diagnostic sink cannot reject committed audio
+    return result
+
+
+def _import_meeting_revision(
     conn: sqlite3.Connection,
     *,
     payload: dict,
@@ -1245,6 +1280,35 @@ def _read_audio(conn: sqlite3.Connection, key: tuple[str, int]) -> dict | None:
 
 
 # --- retention --------------------------------------------------------------
+
+
+def retention_deadlines(
+    conn: sqlite3.Connection, *, after: datetime, warn_days: int,
+) -> tuple[datetime | None, datetime | None]:
+    """Next future boundary and oldest overdue obligation, including history.
+
+    Past warning boundaries never force a zero wait. Pending source copies keep
+    their own original expiry even when the primary row was previously marked.
+    """
+    rows = conn.execute(
+        "SELECT a.audio_expires_at, a.deleted_at, "
+        "m.current_revision = a.revision AND m.transcript_complete = 0 "
+        "FROM meeting_audio a LEFT JOIN meetings m USING (occurrence_id) "
+        "WHERE a.deleted_at IS NULL OR EXISTS (SELECT 1 FROM meeting_source_cleanup s "
+        "WHERE s.occurrence_id = a.occurrence_id AND s.revision = a.revision AND s.completed = 0)"
+    ).fetchall()
+    future, overdue = [], []
+    for value, deleted, incomplete in rows:
+        expiry = _parse_instant(value, "audio_expires_at")
+        if expiry > after:
+            future.append(expiry)
+        else:
+            overdue.append(expiry)
+        if not deleted and incomplete and warn_days > 0:
+            warning = expiry - timedelta(days=warn_days)
+            if warning > after:
+                future.append(warning)
+    return min(future, default=None), min(overdue, default=None)
 
 
 def audio_due_for_expiry(conn: sqlite3.Connection, now: str) -> list[dict]:

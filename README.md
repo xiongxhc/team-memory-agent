@@ -349,7 +349,7 @@ teammem schedule install --time 18:20
 teammem schedule status
 ```
 
-The built-in schedule invokes only `teammem run-daily`; it does not pull or
+Without meeting configuration, the built-in schedule invokes only `teammem run-daily`; it does not pull or
 export a private MemberKit inbox and it does not install extra capture triggers.
 Any intraday `--capture-only` trigger is an explicit operator-managed scheduler
 choice. On Windows it is a current-user, logged-in-only
@@ -457,13 +457,34 @@ commits and pushes nothing and exits `1`.
 #### Audio retention
 
 TeamMem computes one expiry for a recording, `ended_at` plus fourteen days, and
-a bundle asking for longer is provenance only. `expire-meeting-audio` destroys
-the encrypted file at that instant:
+a bundle asking for longer is provenance only. The one-shot command destroys
+every recording already due at the supplied instant:
 
 ```bash
 teammem expire-meeting-audio --now 2026-09-16T14:52:00Z
 teammem expire-meeting-audio --dry-run
+teammem expire-meeting-audio --watch
 ```
+
+On Linux and macOS, `--watch` runs retention immediately, then waits for the
+earliest stored expiry or current incomplete transcript's warning boundary.
+Durable imports wake it before source archival or publication, including direct
+store imports and unchanged replays enrolling another source copy. It uses a
+private mode-0700 directory beside the canonical ledger (`ledger.db.retention`
+for `ledger.db`), a retention-only directory lock and a mode-0600 FIFO containing
+only wake bytes. The FIFO is removed on orderly exit; the directory remains as
+the stable lock identity. Do not remove that directory while a worker runs.
+Only one worker per ledger runs, and SIGTERM/SIGINT release it cleanly.
+`--watch` cannot combine with `--now` or `--dry-run`; Windows keeps one-shot mode.
+
+Failed work retries after five seconds while earlier healthy deadlines still
+take precedence. A sixty-second recovery check reconciles lost import wakes and
+wall-clock changes. Neither interval changes the original expiry. Startup and
+overdue passes report late/catch-up work and retain actual deletion timestamps.
+OS suspension, power loss, a blocked/failing filesystem, scheduling latency and
+a process crash between commit and notification can cause late deletion; the
+worker catches up when execution resumes. This is not a hard-real-time physical
+deletion guarantee, and local clock-injected tests do not establish live acceptance.
 
 What goes is the ciphertext and nothing else. The meeting, its transcript, its
 synthesis, its revision history, and the recording's hash, format, duration and
@@ -509,7 +530,8 @@ the spool is a warning that still applies. Retention is never extended for a war
 meeting: backfill arrives as a higher revision from the producer, and a warning
 nobody acts on still ends in deletion on time. The command exits `0` when there
 was nothing to say, `1` when it warned or a deletion is left to retry, and `2`
-when the configuration is wrong. `--dry-run` reports what a real run would do
+when the configuration is wrong. These are one-shot exit codes; the worker keeps
+retrying and reports failures while running. `--dry-run` reports what a real run would do
 and writes nothing: no file removed, no row changed, no alert.
 
 Publication URL or receipt/archive/alert configuration faults are reported with
@@ -539,15 +561,27 @@ this is a bounded presentation check, not arbitrary encoding or paraphrase detec
 Configuring meetings adds `teammem-meetings` and `teammem-meeting-retention`
 beside the daily job the next time the schedule is installed — publication every
 minute, leaving processing time within the initial ten-minute URL target.
-That polling interval is not proof of end-to-end delivery latency. The current
-audio-expiry definition still runs an hour after the daily run; it does not
-deliver deletion at each exact fourteen-day deadline. That unattended-retention
-timing requirement remains unresolved and must be reconciled before deployment.
+That polling interval is not proof of end-to-end delivery latency. Unix retention
+runs `expire-meeting-audio --watch`. The systemd service uses `Type=simple` and
+`Restart=always` with five-second backoff. Its existing timer remains for
+one-second activation bootstrap and daily recovery one hour after the daily run,
+with explicit `AccuracySec=1us`; the timer does not schedule individual expiries
+or restart an already-active service. Installation explicitly restarts the worker
+after loading definitions, including upgrades with an already-active timer.
+Launchd retains the retention label with `RunAtLoad`, `KeepAlive` and a five-second
+restart throttle. Disable/remove stops the worker before unlinking definitions;
+failed installation restores previous definitions and manager states.
 Removing the meeting settings and reinstalling takes both away again. The daily job's own definition
 is byte-for-byte what it always was, and `teammem run-daily` neither reads nor
 requires any meeting setting. This repository holds the generator; the
 operator's deployment overlay holds the exact deployed copy of each generated
 unit.
+
+`teammem schedule status` reports only the existing daily job. Inspect retention
+separately with `systemctl --user status teammem-meeting-retention.service` or
+`launchctl print gui/$(id -u)/org.teammem.meeting-retention`. Generated definitions
+and local tests are not evidence that any live host has installed or accepted
+the worker; follow [the human checklist](docs/HUMAN-CHECKLIST.md).
 
 ### Reviewed bundle inbox
 

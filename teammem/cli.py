@@ -132,6 +132,8 @@ def _parser() -> argparse.ArgumentParser:
     p_expire.add_argument("--now", type=str, default=None, metavar="ISO",
                           help="UTC instant of this run (default: now)")
     p_expire.add_argument("--dry-run", action="store_true")
+    p_expire.add_argument("--watch", action="store_true",
+                          help="Unix worker: wait for stored expiry and warning deadlines")
 
     p_schedule = sub.add_parser(
         "schedule", help="manage the explicit daily hub schedule"
@@ -244,6 +246,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
 
+    if args.cmd == "expire-meeting-audio" and args.watch:
+        if args.now is not None or args.dry_run:
+            parser.error("--watch cannot combine with --now or --dry-run")
+        if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+            parser.error("--watch requires Linux or macOS")
+
     if args.cmd == "schedule":
         try:
             backend = _schedule_backend()
@@ -315,6 +323,9 @@ def main(argv: list[str] | None = None) -> int:
         return run_process_meetings(cfg, ids, now=now, dry_run=args.dry_run)
 
     if args.cmd == "expire-meeting-audio":
+        if args.watch:
+            from .meeting_retention_worker import watch_meeting_audio
+            return watch_meeting_audio(cfg)
         now = args.now or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         return run_expire_meeting_audio(cfg, now=now, dry_run=args.dry_run)
 
