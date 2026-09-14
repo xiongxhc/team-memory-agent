@@ -1,9 +1,12 @@
 """GitLab connector adapter with legacy event identities preserved."""
 
 import json
+import logging
 import re
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
 from teammem.config import Config
@@ -15,6 +18,8 @@ from .config import ConnectorSettings
 
 
 _PER_PAGE = 100
+_RATE_LIMIT_RETRIES = 5
+_RATE_LIMIT_WAIT_BUDGET = 300
 # GitLab reserves this username namespace for group/project access-token bot
 # accounts; humans cannot register such names.
 _TOKEN_BOT_RE = re.compile(r"(group|project)_\d+_bot_")
@@ -23,6 +28,18 @@ FetchJson = Callable[[str, dict], list | dict]
 
 def _parse_iso8601(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _retry_delay(header: str | None, attempt: int) -> float:
+    if header is not None:
+        value = header.strip()
+        if value.isascii() and value.isdigit():
+            return int(value)
+        try:
+            return max(0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return min(30 * 2 ** attempt, 120)
 
 
 class GitLabConnector:
@@ -46,9 +63,23 @@ class GitLabConnector:
         session.headers["PRIVATE-TOKEN"] = cfg.gitlab_token
 
         def fetch(path: str, params: dict) -> list | dict:
-            response = session.get(f"{cfg.gitlab_url}/api/v4{path}", params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
+            waited = 0.0
+            for attempt in range(_RATE_LIMIT_RETRIES + 1):
+                response = session.get(f"{cfg.gitlab_url}/api/v4{path}", params=params, timeout=30)
+                if response.status_code != 429 or attempt == _RATE_LIMIT_RETRIES:
+                    response.raise_for_status()
+                    return response.json()
+                delay = _retry_delay(response.headers.get("Retry-After"), attempt)
+                # Never retry before the server permits, or wait indefinitely.
+                if delay > _RATE_LIMIT_WAIT_BUDGET - waited:
+                    response.raise_for_status()
+                response.close()
+                logging.getLogger(__name__).warning(
+                    "GitLab rate limited; retry %s/%s in %s seconds",
+                    attempt + 1, _RATE_LIMIT_RETRIES, delay,
+                )
+                time.sleep(delay)
+                waited += delay
 
         return fetch
 

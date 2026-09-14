@@ -159,6 +159,15 @@ documentation.
 | Feishu | `TEAMMEM_FEISHU_APP_ID`, `TEAMMEM_FEISHU_APP_SECRET` | `feishu` member IDs; `feishu_channels`; `enabled: true` | Custom app with bot capability, installed in the tenant and visibly added to each allowlisted group. Use app-identity group-read permission (`im:chat:readonly`), message read (`im:message:readonly`), and group-message history (`im:message.group_msg`). See official [tenant token](https://open.feishu.cn/document/server-docs/authentication-management/access-token/tenant_access_token_internal), [group information](https://open.feishu.cn/document/server-docs/group/chat/get-2), and [conversation history](https://open.feishu.cn/document/server-docs/im-v1/message/list) documentation | Human messages only in allowlisted group chat IDs; no direct chats or unlisted groups |
 | Discord | `TEAMMEM_DISCORD_BOT_TOKEN` | `discord` member IDs; `discord_channels`; `enabled: true` | Bot installed in the guild with `VIEW_CHANNEL` and `READ_MESSAGE_HISTORY` for each allowlisted channel, plus the `MESSAGE_CONTENT` privileged intent in the Developer Portal. See [Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages), [permissions](https://docs.discord.com/developers/topics/permissions), and [Message Content Intent](https://docs.discord.com/developers/events/gateway#message-content-intent) | Human content messages in allowlisted guild channels; no DM/group-DM channels, unlisted guild channels, bots, or webhooks |
 
+GitLab requests retry HTTP 429 responses up to five times, honoring
+[`Retry-After`](https://docs.gitlab.com/administration/settings/user_and_ip_rate_limits/)
+as seconds or an HTTP date. Missing or invalid headers use exponential waits
+starting at 30 seconds, capped at 120 seconds. Each request has a total retry
+wait budget of 300 seconds; a longer server delay fails the request rather than
+retrying early. Retries keep the same page and collection scope. Exhausted
+mandatory lookups fail collection; optional lookups retain their deferred-backfill
+warnings. Other HTTP errors are not retried.
+
 For Slack, the adapter requests 15 messages per history page and globally waits
 at least 60 seconds between all `conversations.history` calls across pages and
 channels. `Retry-After` is authoritative when Slack returns it. Slack's tighter
