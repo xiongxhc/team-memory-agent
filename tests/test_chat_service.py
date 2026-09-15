@@ -1,0 +1,362 @@
+import asyncio
+import json
+
+from teammem.chat.feishu import normalize_event, session_key
+from teammem.chat.service import ChatService
+from teammem.chat.state import ChatState, Evidence
+
+
+def _event(**changes):
+    raw = {"tenant": "tenant", "app": "app", "message": {"message_id": "m1", "chat_id": "dm-chat", "chat_type": "p2p", "message_type": "text", "content": '{"text":"hello"}'}, "sender": {"sender_id": {"open_id": "alice"}}}
+    raw.update(changes)
+    return normalize_event(raw)
+
+
+def test_duplicate_dm_event_makes_one_model_call_and_replies_to_original_chat(tmp_path):
+    calls, sent = [], []
+    def model(*args, **kwargs):
+        calls.append(args)
+        return "answer", []
+    def send(chat_id, message_id, reply_id, text, **kwargs):
+        sent.append((chat_id, message_id, reply_id, text))
+        return "platform-message"
+    service = ChatService(ChatState(tmp_path / "chat.db"), {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}, model, send)
+
+    asyncio.run(service.handle(_event()))
+    asyncio.run(service.handle(_event()))
+
+    assert len(calls) == 1
+    assert [(chat, message, text) for chat, message, _, text in sent] == [("dm-chat", "m1", "answer")]
+
+
+def test_group_without_exact_bot_mention_never_calls_model(tmp_path):
+    called = []
+    service = ChatService(ChatState(tmp_path / "chat.db"), {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {"chat": []}, "group_admins": {}}}, lambda *a, **k: called.append(1), lambda *a, **k: "x")
+    event = _event(message={"message_id": "m1", "chat_id": "chat", "chat_type": "group", "message_type": "text", "content": '{"text":"hello"}'})
+
+    asyncio.run(service.handle(event))
+
+    assert called == []
+
+
+def test_dm_new_resets_and_calls_invalidation_callback(tmp_path):
+    invalidated = []
+    service = ChatService(ChatState(tmp_path / "chat.db"), {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}, lambda *a, **k: ("x", []), lambda *a, **k: "x", invalidate_session=lambda key: invalidated.append(key))
+    asyncio.run(service.handle(_event(message={"message_id": "new", "chat_id": "dm-chat", "chat_type": "p2p", "message_type": "text", "content": '{"text":"/new"}'})))
+    assert invalidated and service.state.generation(invalidated[0]) == 1
+
+
+def test_group_forget_requires_explicit_group_admin(tmp_path):
+    invalidated = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {"chat": []}, "group_admins": {"chat": ["admin"]}}}
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, lambda *a, **k: ("x", []), lambda *a, **k: "x", invalidate_session=lambda key: invalidated.append(key))
+    event = _event(message={"message_id": "forget", "chat_id": "chat", "chat_type": "group", "message_type": "text", "content": '{"text":"/forget"}'}, mentions=[{"id": {"open_id": "ou_bot"}}])
+    asyncio.run(service.handle(event))
+    assert invalidated == []
+
+
+def test_dm_file_event_with_no_text_is_admitted_and_passes_attachment_context(tmp_path):
+    seen = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    def model(*args, **kwargs):
+        seen.append(kwargs["attachments"])
+        return "file answer", []
+    async def attachments(event, key, generation, cancelled):
+        assert event.resources and key.owner == "alice" and generation == 0
+        return [{"id":"f1", "filename":"notes.pdf", "locator":"page 1", "text":"hello"}]
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, model, lambda *args, **kwargs: "sent", prepare_attachments=attachments)
+    event = _event(message={"message_id":"file", "chat_id":"dm-chat", "chat_type":"p2p", "message_type":"file", "content":'{"file_key":"key","file_name":"notes.pdf"}'})
+
+    asyncio.run(service.handle(event))
+
+    assert seen == [[{"id":"f1", "filename":"notes.pdf", "locator":"page 1", "text":"hello"}]]
+
+
+def test_duplicate_reset_event_only_changes_generation_once(tmp_path):
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, lambda *args, **kwargs: ("x", []), lambda *args, **kwargs: "sent")
+    event = _event(message={"message_id":"reset", "chat_id":"dm-chat", "chat_type":"p2p", "message_type":"text", "content":'{"text":"/new"}'})
+
+    asyncio.run(service.handle(event))
+    asyncio.run(service.handle(event))
+
+    assert service.state.generation(session_key(event)) == 1
+
+
+def test_denied_after_admission_is_marked_failed_without_model_call(tmp_path):
+    allowed = {"value": True}
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    def authorize(*args):
+        if not allowed["value"]:
+            from teammem.chat.access import AccessDenied
+            raise AccessDenied("revoked")
+        return frozenset()
+    calls = []
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, lambda *args, **kwargs: calls.append(1), lambda *args, **kwargs: "sent", authorize_fn=authorize)
+    event = _event()
+
+    async def run():
+        assert await service.enqueue(event)
+        allowed["value"] = False
+        await service._tasks[("tenant", "app", "m1")]
+    asyncio.run(run())
+
+    assert calls == []
+    assert service.state.start_incoming(session_key(event), "m1") is False
+
+
+def test_new_thread_receives_only_its_recorded_parent_interaction(tmp_path):
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": ["alpha"]}, "groups": {"chat": ["alpha"]}, "group_admins": {}}}
+    histories = []
+    def model(_config, history, *_args, **_kwargs):
+        histories.append(history)
+        return "answer", []
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, model, lambda *args, **kwargs: "sent")
+    parent = _event(message={"message_id":"parent", "chat_id":"chat", "chat_type":"group", "message_type":"text", "content":'{"text":"parent question"}'}, mentions=[{"id":{"open_id":"ou_bot"}}])
+    child = _event(message={"message_id":"child", "chat_id":"chat", "chat_type":"group", "root_id":"root", "parent_id":"parent", "message_type":"text", "content":'{"text":"follow up"}'}, mentions=[{"id":{"open_id":"ou_bot"}}])
+
+    asyncio.run(service.handle(parent))
+    asyncio.run(service.handle(child))
+
+    assert [(turn.role, turn.text) for turn in histories[-1]] == [
+        ("user", "parent question"), ("assistant", "answer"), ("user", "follow up"),
+    ]
+
+
+def test_startup_recovery_sends_clear_resend_request(tmp_path):
+    path = tmp_path / "chat.db"
+    state = ChatState(path)
+    key = session_key(_event())
+    state.record_incoming(key, "interrupted", "alice", "hello", chat_id="dm-chat")
+    state.close()
+    sent = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    service = ChatService(ChatState(path), config, lambda *args, **kwargs: ("unused", []), lambda *args, **kwargs: sent.append(args) or "sent")
+
+    asyncio.run(service.flush_outbox())
+
+    assert service.recovered_interrupted == 1
+    assert len(sent) == 1 and "send it again" in sent[0][3].lower()
+
+
+def test_document_failure_is_sanitized_and_flushed_immediately(tmp_path):
+    from teammem.chat.document_worker import DocumentError
+    sent = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    def model(*args, **kwargs):
+        raise DocumentError("unsafe_path", "/private/secret/token")
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, model, lambda *args, **kwargs: sent.append(args) or "sent")
+
+    asyncio.run(service.handle(_event()))
+
+    assert len(sent) == 1
+    assert "unsafe_path" in sent[0][3]
+    assert "secret" not in sent[0][3]
+
+
+def test_reset_while_waiting_for_global_model_slot_never_calls_old_generation(tmp_path):
+    import threading
+
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "session": {"max_concurrent_model_calls": 2}, "access": {"default": "deny", "users": {"alice": [], "bob": [], "charlie": []}, "groups": {}, "group_admins": {}}}
+    calls, ready, release = [], threading.Event(), threading.Event()
+    active = {"count": 0}
+    lock = threading.Lock()
+    def model(_config, history, *_args, **_kwargs):
+        text = history[-1].text if history else "<empty>"
+        calls.append(text)
+        if text in {"one", "two"}:
+            with lock:
+                active["count"] += 1
+                if active["count"] == 2:
+                    ready.set()
+            release.wait(2)
+        return "answer", []
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, model, lambda *args, **kwargs: "sent")
+    def event(message_id, sender, text):
+        return _event(message={"message_id":message_id, "chat_id":f"{sender}-chat", "chat_type":"p2p", "message_type":"text", "content":json.dumps({"text":text})}, sender={"sender_id":{"open_id":sender}})
+
+    async def run():
+        assert await service.enqueue(event("one", "alice", "one"))
+        assert await service.enqueue(event("two", "bob", "two"))
+        await asyncio.to_thread(ready.wait, 2)
+        assert await service.enqueue(event("three", "charlie", "three"))
+        await asyncio.sleep(0)
+        assert await service.enqueue(event("reset", "charlie", "/new"))
+        release.set()
+        await asyncio.gather(*tuple(service._tasks.values()))
+    asyncio.run(run())
+
+    assert calls == ["one", "two"]
+    assert service.state.history(session_key(event("ignored", "charlie", "ignored")), frozenset()) == []
+
+
+def test_uses_configured_model_concurrency_with_hard_cap(tmp_path):
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "session": {"max_concurrent_model_calls": 1}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, lambda *args, **kwargs: ("x", []), lambda *args, **kwargs: "sent")
+
+    assert service._limit._value == 1
+
+
+def test_forget_cancels_running_model_and_blocks_late_answer_and_attachment_cleanup(tmp_path):
+    import threading
+
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    entered, release, cancelled, invalidated = threading.Event(), threading.Event(), threading.Event(), []
+    def model(*args, **kwargs):
+        entered.set()
+        release.wait(2)
+        cancelled.set() if kwargs["cancel_event"].is_set() else None
+        return "late answer", []
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, model, lambda *args, **kwargs: "sent", invalidate_session=lambda key: invalidated.append(key))
+    turn = _event(message={"message_id":"turn", "chat_id":"dm-chat", "chat_type":"p2p", "message_type":"text", "content":'{"text":"keep working"}'})
+    forget = _event(message={"message_id":"forget", "chat_id":"dm-chat", "chat_type":"p2p", "message_type":"text", "content":'{"text":"/forget"}'})
+
+    async def run():
+        assert await service.enqueue(turn)
+        await asyncio.to_thread(entered.wait, 2)
+        assert await service.enqueue(forget)
+        release.set()
+        await asyncio.gather(*tuple(service._tasks.values()))
+    asyncio.run(run())
+
+    assert cancelled.is_set()
+    assert invalidated == [session_key(turn)]
+    assert service.state.history(session_key(turn), frozenset()) == []
+    assert service.state.pending_replies() == []
+
+
+def test_ambiguous_send_reuses_persisted_uuid_after_reopen_and_quarantines_after_hour(tmp_path):
+    path = tmp_path / "chat.db"
+    state = ChatState(path)
+    key = session_key(_event())
+    state.record_incoming(key, "message", "alice", "hello", chat_id="dm-chat")
+    assert state.start_incoming(key, "message")
+    assert state.queue_reply(key, "message", "00000000-0000-0000-0000-000000000004", "answer", frozenset(), generation=0)
+    state.close()
+    sent = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    def send(_chat, _message, reply_id, _text, **_kwargs):
+        sent.append(reply_id)
+        if len(sent) == 1:
+            raise RuntimeError("ambiguous")
+        return "platform-reply"
+    service = ChatService(ChatState(path), config, lambda *args, **kwargs: ("unused", []), send)
+
+    async def run():
+        await service.flush_outbox()
+        await service.flush_outbox()
+    asyncio.run(run())
+
+    assert sent == ["00000000-0000-0000-0000-000000000004"] * 2
+    assert service.state.pending_replies() == []
+    state = ChatState(tmp_path / "expired.db")
+    state.record_incoming(key, "expired", "alice", "hello", chat_id="dm-chat", now_ms=0)
+    state.start_incoming(key, "expired", now_ms=0)
+    state.queue_reply(key, "expired", "00000000-0000-0000-0000-000000000005", "answer", frozenset(), generation=0, now_ms=0)
+    state.close()
+    state = ChatState(tmp_path / "expired.db")
+    assert state.quarantine_expired_replies(now_ms=3_600_001) == 1
+    assert state.pending_replies() == []
+
+
+def test_grant_revocation_hides_old_project_history_and_quarantines_pending_answer(tmp_path):
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": ["alpha"]}, "groups": {}, "group_admins": {}}}
+    def model(*args, **kwargs):
+        return "private alpha answer", [Evidence("e1", "alpha", "2026-01-01", "evidence", None)]
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("ambiguous")
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, model, unavailable)
+    event = _event()
+
+    asyncio.run(service.handle(event))
+    config["access"]["users"]["alice"] = []
+    asyncio.run(service.flush_outbox())
+
+    assert [turn.text for turn in service.state.history(session_key(event), frozenset())] == ["hello"]
+    assert service.state.pending_replies() == []
+
+
+def test_reconcile_access_forgets_revoked_dm_and_removed_group_sessions(tmp_path):
+    current = {"config": {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot", "direct_messages": True}, "access": {"default": "deny", "users": {"alice": [], "bob": []}, "groups": {"chat": []}, "group_admins": {"chat": ["alice"]}}}}
+    state = ChatState(tmp_path / "chat.db")
+    dm_alice = session_key(_event())
+    dm_bob = session_key(_event(sender={"sender_id": {"open_id": "bob"}}))
+    group = session_key(_event(message={"message_id":"g", "chat_id":"chat", "chat_type":"group", "message_type":"text", "content":'{"text":"group"}'}, mentions=[{"id":{"open_id":"ou_bot"}}]))
+    thread = session_key(_event(message={"message_id":"t", "chat_id":"chat", "chat_type":"group", "root_id":"root", "message_type":"text", "content":'{"text":"thread"}'}, mentions=[{"id":{"open_id":"ou_bot"}}]))
+    for key in (dm_alice, dm_bob, group, thread):
+        state.append(key, __import__('teammem.chat.state', fromlist=['Turn']).Turn("user", "alice", key.kind, frozenset()))
+    invalidated = []
+    service = ChatService(state, current["config"], lambda *args, **kwargs: ("x", []), lambda *args, **kwargs: "sent", config_loader=lambda: current["config"], invalidate_session=lambda key: invalidated.append(key))
+
+    current["config"]["access"]["users"].pop("alice")
+    assert asyncio.run(service.reconcile_access()) == [dm_alice]
+    assert state.history(dm_alice, frozenset()) == []
+    assert state.history(dm_bob, frozenset()) != []
+    assert state.history(group, frozenset()) != []
+    current["config"]["access"]["groups"].pop("chat")
+
+    purged = asyncio.run(service.reconcile_access())
+
+    assert set(purged) == {group, thread}
+    assert state.history(group, frozenset()) == []
+    assert state.history(thread, frozenset()) == []
+    assert set(invalidated) == {dm_alice, group, thread}
+    assert invalidated.count(dm_alice) == 2  # repairs attachments after an interrupted first purge
+
+
+def test_fresh_config_loader_honors_direct_message_disable(tmp_path):
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot", "direct_messages": False}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    called = []
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, lambda *args, **kwargs: called.append(1), lambda *args, **kwargs: "sent", config_loader=lambda: config)
+
+    assert asyncio.run(service.enqueue(_event())) is False
+    assert called == []
+
+
+def test_direct_message_toggle_quarantines_pending_reply_but_retains_history(tmp_path):
+    current = {"config": {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot", "direct_messages": True}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}}
+    sent = []
+    def send(*args, **kwargs):
+        sent.append(args)
+        raise RuntimeError("ambiguous send")
+    service = ChatService(ChatState(tmp_path / "chat.db"), current["config"], lambda *args, **kwargs: ("answer", []), send, config_loader=lambda: current["config"])
+    event = _event()
+
+    asyncio.run(service.handle(event))
+    assert len(sent) == 1 and len(service.state.pending_replies()) == 1
+    current["config"]["feishu"]["direct_messages"] = False
+    assert asyncio.run(service.reconcile_access()) == []
+    asyncio.run(service.flush_outbox())
+
+    assert len(sent) == 1
+    assert service.state.pending_replies() == []
+    assert [turn.text for turn in service.state.history(session_key(event), frozenset())] == ["hello", "answer"]
+
+
+def test_direct_message_toggle_cancels_inflight_model_and_discards_late_answer(tmp_path):
+    import threading
+
+    current = {"config": {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot", "direct_messages": True}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}}
+    entered, release, observed_cancel = threading.Event(), threading.Event(), threading.Event()
+    def model(*args, **kwargs):
+        entered.set()
+        release.wait(2)
+        if kwargs["cancel_event"].is_set():
+            observed_cancel.set()
+        return "late answer", []
+    service = ChatService(ChatState(tmp_path / "chat.db"), current["config"], model, lambda *args, **kwargs: "sent", config_loader=lambda: current["config"])
+    event = _event()
+
+    async def run():
+        assert await service.enqueue(event)
+        await asyncio.to_thread(entered.wait, 2)
+        current["config"]["feishu"]["direct_messages"] = False
+        assert await service.reconcile_access() == []
+        release.set()
+        await asyncio.gather(*tuple(service._tasks.values()))
+    asyncio.run(run())
+
+    assert observed_cancel.is_set()
+    assert [turn.text for turn in service.state.history(session_key(event), frozenset())] == ["hello"]
+    assert service.state.pending_replies() == []

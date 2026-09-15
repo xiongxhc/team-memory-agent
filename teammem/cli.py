@@ -51,6 +51,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    p_chat = sub.add_parser("chat", help="run the separate conversational service")
+    chat_sub = p_chat.add_subparsers(dest="chat_cmd", required=True)
+    for action in ("check", "serve"):
+        command = chat_sub.add_parser(action)
+        command.add_argument("--config", type=Path, required=True)
+
     p_connectors = sub.add_parser(
         "connectors", help="list or validate built-in connectors"
     )
@@ -228,6 +234,10 @@ def _schedule_error(
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+
+    if args.cmd == "chat":
+        from .chat.runtime import chat_command
+        return chat_command(args.chat_cmd, args.config)
 
     if args.cmd == "schedule":
         try:
