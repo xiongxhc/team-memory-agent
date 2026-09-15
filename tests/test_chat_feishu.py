@@ -97,3 +97,22 @@ def test_reaction_delete_uses_exact_message_and_reaction_id(monkeypatch):
     client.delete_reaction('om/source', 'reaction/id')
 
     assert calls == [('DELETE', '/im/v1/messages/om%2Fsource/reactions/reaction%2Fid', {'deadline': None})]
+
+
+def test_reply_embeds_citation_url_in_native_link_and_preserves_thread(monkeypatch):
+    import json
+    from teammem.chat.feishu import FeishuClient
+    client = FeishuClient('app', 'secret')
+    monkeypatch.setattr(client, 'get_message', lambda *_: {'root_id':'thread-root'})
+    sent = []
+    monkeypatch.setattr(client, '_json', lambda *a, **kw: sent.append(kw['json']) or {'data':{'message_id':'reply'}})
+    text = "Released [E1].\n\n[E1] [project \\[draft\\] · 2026-09-15](https://example.com/a%28b%29)"
+    client.send_reply('chat', 'message', 'stable-uuid', text)
+    payload = sent[0]
+    assert payload['msg_type'] == 'post' and payload['reply_in_thread'] is True
+    assert payload['uuid'] == 'stable-uuid'
+    rows = json.loads(payload['content'])['en_us']['content']
+    assert rows[0] == [{'tag':'text', 'text':'Released [E1].'}]
+    assert rows[2] == [{'tag':'text', 'text':'[E1] '},
+                       {'tag':'a', 'text':'project [draft] · 2026-09-15', 'href':'https://example.com/a%28b%29'}]
+    assert all('https://' not in node.get('text', '') for row in rows for node in row)

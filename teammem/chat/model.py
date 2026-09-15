@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 
@@ -307,7 +308,13 @@ def answer(config, turns, search, transport, *, attachments=(), cancel_event=Non
             if isinstance(source, Evidence):
                 url = source.url if source.url and source.url.startswith(("https://", "http://")) else None
                 detail = f"{source.project} · {source.timestamp}"
-                sources.append(f"[{label}] {detail}" + (f" — {url}" if url else ""))
+                if url:
+                    # Keep source-controlled punctuation inside the label/target.
+                    link_label = re.sub(r"([\\`*_{}\[\]<>])", r"\\\1", " ".join(detail.split()))
+                    target = quote(url, safe="/:?#@!$&'*+,;=%~-._")
+                    sources.append(f"[{label}] [{link_label}]({target})")
+                else:
+                    sources.append(f"[{label}] {detail}")
             else:
                 sources.append(f"[{label}] {source}")
         if sources:
