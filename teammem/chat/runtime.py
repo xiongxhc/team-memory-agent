@@ -117,6 +117,8 @@ def check_readiness(path, *, verify_bot=None):
     if config.attachments['enabled']:
         required.add('im:message:readonly')
     checks.append(('declared scopes', required <= set(config.feishu['required_scopes']), 'message and attachment scopes'))
+    reaction_scope = 'im:message.reactions:write_only' in set(config.feishu['required_scopes'])
+    checks.append(('processing reaction', True, 'scope declared; permission not verified' if reaction_scope else 'best effort; optional scope not declared'))
     credentials = {}
     try:
         credentials = load_credentials(config.paths['credentials_env'])
@@ -290,7 +292,8 @@ def build_service(config_path, *, client=None, transport=None, parser=None):
     prepare = AttachmentPreparer(config,state,store,client,authorize_current=authorize_current,parser=parser)
     service = ChatService(state,config,answer,client.send_reply,authorize_fn=authorize_current,
         invalidate_session=store.invalidate_session,search_factory=search_factory,transport=transport,
-        prepare_attachments=prepare, config_loader=lambda: load_chat_config(config_path))
+        prepare_attachments=prepare, config_loader=lambda: load_chat_config(config_path),
+        add_reaction=client.create_reaction, remove_reaction=client.delete_reaction)
     return service, store, client
 
 
@@ -310,6 +313,7 @@ def serve(config_path):
         try:
             service, store, client = build_service(config_path)
             loop.run_until_complete(service.reconcile_access())
+            loop.run_until_complete(service.cleanup_reactions())
             holder.update(service=service,store=store,client=client)
         except Exception as exc:
             holder['error'] = type(exc).__name__
@@ -322,6 +326,7 @@ def serve(config_path):
                     service.state.expire_idle()
                     store.cleanup_expired()
                     await service.flush_outbox()
+                    await service.cleanup_reactions()
                 except Exception:
                     logger.error('Chat maintenance failed; details withheld from logs')
                 await asyncio.sleep(15)

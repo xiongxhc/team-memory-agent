@@ -49,6 +49,14 @@ class QueuedReply:
     status: str
 
 
+@dataclass(frozen=True)
+class PendingReaction:
+    tenant: str
+    app: str
+    message_id: str
+    reaction_id: str
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     tenant TEXT NOT NULL, app TEXT NOT NULL, kind TEXT NOT NULL,
@@ -91,6 +99,14 @@ CREATE TABLE IF NOT EXISTS interactions (
     UNIQUE (tenant, app, platform_reply_message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_interactions_chat ON interactions(tenant, app, chat_id);
+CREATE TABLE IF NOT EXISTS reactions (
+    tenant TEXT NOT NULL, app TEXT NOT NULL, message_id TEXT NOT NULL,
+    kind TEXT NOT NULL, owner TEXT NOT NULL, root TEXT NOT NULL,
+    generation INTEGER NOT NULL, emoji_type TEXT NOT NULL,
+    reaction_id TEXT, status TEXT NOT NULL, updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (tenant, app, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reactions_cleanup ON reactions(status, updated_at_ms);
 """
 
 
@@ -196,6 +212,10 @@ class ChatState:
         )
         self._conn.execute(
             "UPDATE incoming SET status = 'invalidated', updated_at_ms = ? WHERE tenant = ? AND app = ? AND kind = ? AND owner = ? AND root = ? AND generation = ? AND status IN ('queued', 'processing')",
+            (now_ms, *values, generation),
+        )
+        self._conn.execute(
+            "UPDATE reactions SET status = 'cleanup', updated_at_ms = ? WHERE tenant = ? AND app = ? AND kind = ? AND owner = ? AND root = ? AND generation = ? AND status IN ('creating', 'active')",
             (now_ms, *values, generation),
         )
         if forget:
@@ -374,6 +394,98 @@ class ChatState:
             (key.tenant, key.app, message_id, key.kind, key.owner, key.root),
         ).fetchone()
         return None if row is None else int(row["generation"])
+
+    def request_reaction(self, key: SessionKey, message_id: str, emoji_type: str, *, generation: int, now_ms: int | None = None) -> bool:
+        """Reserve one platform reaction for a durably admitted message."""
+        if not message_id or not emoji_type:
+            raise ValueError("reaction message ID and emoji type are required")
+        current_time = _now_ms() if now_ms is None else now_ms
+        with self._conn:
+            if self._current_generation(key) != generation:
+                return False
+            result = self._conn.execute(
+                "INSERT INTO reactions (tenant, app, message_id, kind, owner, root, generation, emoji_type, status, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'creating', ?) ON CONFLICT(tenant, app,message_id) DO NOTHING",
+                (key.tenant, key.app, message_id, key.kind, key.owner, key.root, generation, emoji_type, current_time),
+            )
+            return bool(result.rowcount)
+
+    def record_reaction_created(self, tenant: str, app: str, message_id: str, reaction_id: str, *, now_ms: int | None = None) -> bool:
+        """Persist the platform ID; return whether the reaction is still wanted."""
+        if not reaction_id:
+            raise ValueError("reaction_id is required")
+        current_time = _now_ms() if now_ms is None else now_ms
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT status FROM reactions WHERE tenant = ? AND app = ? AND message_id = ?",
+                (tenant, app, message_id),
+            ).fetchone()
+            if row is None or row["status"] not in {"creating", "cleanup"}:
+                return False
+            status = "active" if row["status"] == "creating" else "cleanup"
+            self._conn.execute(
+                "UPDATE reactions SET reaction_id = ?, status = ?, updated_at_ms = ? WHERE tenant = ? AND app = ? AND message_id = ?",
+                (reaction_id, status, current_time, tenant, app, message_id),
+            )
+            return status == "active"
+
+    def mark_reaction_create_failed(self, tenant: str, app: str, message_id: str, *, now_ms: int | None = None) -> bool:
+        current_time = _now_ms() if now_ms is None else now_ms
+        with self._conn:
+            result = self._conn.execute(
+                "UPDATE reactions SET status = 'done', updated_at_ms = ? WHERE tenant = ? AND app = ? AND message_id = ? AND reaction_id IS NULL AND status IN ('creating', 'cleanup')",
+                (current_time, tenant, app, message_id),
+            )
+            return bool(result.rowcount)
+
+    def request_reaction_cleanup(self, tenant: str, app: str, message_id: str, *, now_ms: int | None = None) -> str | None:
+        current_time = _now_ms() if now_ms is None else now_ms
+        with self._conn:
+            self._conn.execute(
+                "UPDATE reactions SET status = 'cleanup', updated_at_ms = ? WHERE tenant = ? AND app = ? AND message_id = ? AND status IN ('creating', 'active')",
+                (current_time, tenant, app, message_id),
+            )
+            row = self._conn.execute(
+                "SELECT reaction_id FROM reactions WHERE tenant = ? AND app = ? AND message_id = ? AND status = 'cleanup'",
+                (tenant, app, message_id),
+            ).fetchone()
+            return None if row is None else row["reaction_id"]
+
+    def request_session_reaction_cleanup(self, key: SessionKey, *, now_ms: int | None = None) -> int:
+        current_time = _now_ms() if now_ms is None else now_ms
+        with self._conn:
+            return self._conn.execute(
+                "UPDATE reactions SET status = 'cleanup', updated_at_ms = ? WHERE tenant = ? AND app = ? AND kind = ? AND owner = ? AND root = ? AND status IN ('creating', 'active')",
+                (current_time, *self._key_values(key)),
+            ).rowcount
+
+    def pending_reaction_cleanup(self) -> list[PendingReaction]:
+        rows = self._conn.execute(
+            "SELECT tenant, app, message_id, reaction_id FROM reactions WHERE status = 'cleanup' AND reaction_id IS NOT NULL ORDER BY updated_at_ms, message_id"
+        ).fetchall()
+        return [PendingReaction(row["tenant"], row["app"], row["message_id"], row["reaction_id"]) for row in rows]
+
+    def mark_reaction_removed(self, tenant: str, app: str, message_id: str, reaction_id: str, *, now_ms: int | None = None) -> bool:
+        current_time = _now_ms() if now_ms is None else now_ms
+        with self._conn:
+            result = self._conn.execute(
+                "UPDATE reactions SET status = 'done', updated_at_ms = ? WHERE tenant = ? AND app = ? AND message_id = ? AND reaction_id = ? AND status = 'cleanup'",
+                (current_time, tenant, app, message_id, reaction_id),
+            )
+            return bool(result.rowcount)
+
+    def recover_reactions(self, *, now_ms: int | None = None) -> int:
+        """Queue known active reactions for deletion; never retry an ambiguous create."""
+        current_time = _now_ms() if now_ms is None else now_ms
+        with self._conn:
+            result = self._conn.execute(
+                "UPDATE reactions SET status = 'cleanup', updated_at_ms = ? WHERE status = 'active' AND reaction_id IS NOT NULL",
+                (current_time,),
+            )
+            self._conn.execute(
+                "UPDATE reactions SET status = 'done', updated_at_ms = ? WHERE status = 'creating' AND reaction_id IS NULL",
+                (current_time,),
+            )
+            return result.rowcount
 
     def start_incoming(self, key: SessionKey, message_id: str, *, now_ms: int | None = None) -> bool:
         current_time = _now_ms() if now_ms is None else now_ms

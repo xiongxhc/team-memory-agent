@@ -61,6 +61,14 @@ def test_search_context_is_untrusted_and_citations_resolve_only_known_evidence()
     assert payload["input"][-1]["type"] == "function_call_output"
 
 
+def test_search_timeout_reports_failure_instead_of_absence():
+    from teammem.chat.retrieval import RetrievalTimeoutError
+    def search(query):
+        raise RetrievalTimeoutError("deadline reached")
+    with pytest.raises(ModelError, match="search took too long"):
+        answer(CONFIG, [Turn("user", "u", "release?", frozenset())], search, Transport(function()))
+
+
 @pytest.mark.parametrize("response", [completed("Invented [E9]"), completed("Invented [F1]"),
     function('{"query":"ok","sql":"SELECT secret"}'), function("invalid"),
     function(name="shell"), {"status": "incomplete", "output": []}])

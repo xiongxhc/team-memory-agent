@@ -262,3 +262,34 @@ def test_idle_expiry_purges_content_without_attachment_maintenance(tmp_path):
     assert state._conn.execute("SELECT COUNT(*) FROM interactions").fetchone()[0] == 0
     assert state.record_incoming(key, "message-1", "alice", "new private content", now_ms=86_400_001) is False
     state.close()
+
+
+def test_reaction_identity_survives_reopen_for_cleanup(tmp_path):
+    path = tmp_path / "chat.sqlite3"
+    key = SessionKey("tenant", "app", "dm", "alice")
+    state = ChatState(path)
+    assert state.generation(key) == 0
+    assert state.request_reaction(key, "message-1", "Typing", generation=0)
+    assert state.record_reaction_created("tenant", "app", "message-1", "reaction-1") is True
+    state.close()
+
+    state = ChatState(path)
+    assert state.recover_reactions() == 1
+    cleanup = state.pending_reaction_cleanup()
+    assert [(item.message_id, item.reaction_id) for item in cleanup] == [("message-1", "reaction-1")]
+    assert state.mark_reaction_removed("tenant", "app", "message-1", "reaction-1")
+    assert state.pending_reaction_cleanup() == []
+    state.close()
+
+
+def test_reset_requests_cleanup_for_active_reaction(tmp_path):
+    state = ChatState(tmp_path / "chat.sqlite3")
+    key = SessionKey("tenant", "app", "dm", "alice")
+    assert state.generation(key) == 0
+    state.request_reaction(key, "message-1", "Typing", generation=0)
+    state.record_reaction_created("tenant", "app", "message-1", "reaction-1")
+
+    state.reset(key)
+
+    assert [item.reaction_id for item in state.pending_reaction_cleanup()] == ["reaction-1"]
+    state.close()

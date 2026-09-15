@@ -4,7 +4,7 @@ import sys
 from types import SimpleNamespace
 
 from teammem.chat.feishu import NormalizedEvent
-from teammem.chat.runtime import build_service, create_transport
+from teammem.chat.runtime import build_service, check_readiness, create_transport
 from teammem.store import open_db
 from tests.test_chat_config import FIXTURE
 from tests.test_chat_model import Transport, completed
@@ -41,6 +41,10 @@ class Client:
     def send_reply(self, *args, **kwargs):
         self.sent.append(args)
         return 'reply1'
+    def create_reaction(self, *args, **kwargs):
+        return 'reaction1'
+    def delete_reaction(self, *args, **kwargs):
+        return None
 
 
 def test_real_composition_casual_dm_and_restart_dedup(tmp_path):
@@ -86,3 +90,34 @@ def test_transport_factory_uses_logged_in_codex_cli_without_api_key(monkeypatch)
     transport = create_transport({'provider': 'codex_cli'}, {})
 
     assert isinstance(transport, StubTransport)
+
+
+def test_build_service_wires_reaction_transport(tmp_path):
+    path = configured(tmp_path)
+    client = Client()
+    service, store, _ = build_service(path, client=client, transport=Transport(completed('Hello')))
+
+    assert service.add_reaction == client.create_reaction
+    assert service.remove_reaction == client.delete_reaction
+    store.close(); service.state.close()
+
+
+def test_readiness_describes_optional_reaction_scope_as_best_effort(tmp_path):
+    path = configured(tmp_path)
+
+    status = check_readiness(path, verify_bot=lambda *_: True)
+
+    detail = next(detail for name, _, detail in status.checks if name == 'processing reaction')
+    assert detail == 'best effort; optional scope not declared'
+
+
+def test_readiness_does_not_claim_declared_reaction_permission_is_verified(tmp_path):
+    path = configured(tmp_path)
+    document = json.loads(path.read_text())
+    document['feishu']['required_scopes'].append('im:message.reactions:write_only')
+    path.write_text(json.dumps(document))
+
+    status = check_readiness(path, verify_bot=lambda *_: True)
+
+    detail = next(detail for name, _, detail in status.checks if name == 'processing reaction')
+    assert detail == 'scope declared; permission not verified'
