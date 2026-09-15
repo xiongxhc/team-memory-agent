@@ -479,3 +479,10 @@ TEAMMEM_PUBLIC_DENY_REGEX='<private-regex>' ./scripts/check-public.sh
 
 This project is licensed under Apache-2.0. The code owner authorized publication
 under that license on 2026-07-27.
+
+### Optional conversational bot
+
+A separate Feishu chat service supports ordinary conversation, project-scoped
+read-only team evidence, and session-local document/image questions. Install the
+optional chat extras and follow [the chat setup guide](docs/chat.md). Chat uses
+its own credentials and state; collector scheduling and reports are independent.

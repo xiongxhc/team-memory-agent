@@ -19,8 +19,23 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e '.[dev]'
-      - run: pytest -q tests --ignore=tests/test_memberkit_integration.py
+      - run: pytest -q tests --ignore=tests/test_memberkit_integration.py --ignore-glob=tests/test_chat_*.py
       - run: ./scripts/check-public.sh
+
+  chat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e '.[dev,chat,chat-documents,chat-test]'
+      - run: pytest -q tests/test_chat_*.py --ignore=tests/test_chat_document_worker.py
+      # Only synthetic source is copied into this disposable parser-test container.
+      # It has no network, host mounts or credentials; nested namespaces need privilege.
+      - run: docker build --target test -f scripts/chat-document-runtime.Dockerfile -t teammem-parser-test .
+      - run: docker run --rm --privileged --network none teammem-parser-test
+      - run: python scripts/eval-chat.py
 
   memberkit:
     runs-on: ubuntu-latest

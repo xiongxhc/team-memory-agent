@@ -30,6 +30,9 @@ Changelog = "https://github.com/xiongxhc/team-memory-agent/blob/main/CHANGELOG.m
 
 [project.optional-dependencies]
 dev = ["build>=1.2", "pytest>=8.0"]
+chat = ["lark-oapi==1.7.3"]
+chat-documents = ["defusedxml==0.7.1", "pypdf==6.18.1", "pypdfium2==5.13.0", "Pillow==12.3.0", "olefile==0.47"]
+chat-test = ["python-docx==1.2.0", "python-pptx==1.0.2", "openpyxl==3.1.5", "reportlab==5.0.1"]
 
 [project.scripts]
 teammem = "teammem.cli:main"
