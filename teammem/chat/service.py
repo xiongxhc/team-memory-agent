@@ -16,19 +16,23 @@ from .state import ChatState, Turn
 
 
 class ChatService:
-    def __init__(self, state: ChatState, config: Mapping[str, Any], model: Callable[..., tuple[str, list]], send_reply: Callable[..., str], *, authorize_fn: Callable = authorize, invalidate_session: Callable | None = None, search_factory: Callable | None = None, transport: Any = None, prepare_attachments: Callable | None = None, config_loader: Callable[[], Any] | None = None):
+    def __init__(self, state: ChatState, config: Mapping[str, Any], model: Callable[..., tuple[str, list]], send_reply: Callable[..., str], *, authorize_fn: Callable = authorize, invalidate_session: Callable | None = None, search_factory: Callable | None = None, transport: Any = None, prepare_attachments: Callable | None = None, config_loader: Callable[[], Any] | None = None, add_reaction: Callable | None = None, remove_reaction: Callable | None = None):
         self.state, self.config, self.model, self.send_reply, self.authorize = state, config, model, send_reply, authorize_fn
         self.invalidate_session = invalidate_session
         self.search_factory, self.transport, self.prepare_attachments = search_factory, transport, prepare_attachments
         self.config_loader = config_loader
+        self.add_reaction, self.remove_reaction = add_reaction, remove_reaction
         self._sessions: dict[object, asyncio.Lock] = {}
         self._cancel: dict[object, threading.Event] = {}
         self._sending: dict[object, threading.Event] = {}
         self._outbox_lock = asyncio.Lock()
         self._limit = asyncio.Semaphore(self._model_call_limit())
         self._tasks: dict[tuple[str, str, str], asyncio.Task] = {}
+        self._reaction_tasks: set[asyncio.Task] = set()
+        self._reaction_deleting: set[tuple[str, str, str, str]] = set()
         # Event resources are intentionally not persisted, so a restart cannot safely replay them.
         self.recovered_interrupted = self.state.recover_interrupted()
+        self.recovered_reactions = self.state.recover_reactions()
 
     def _current_config(self) -> Any:
         return self.config if self.config_loader is None else self.config_loader()
@@ -96,21 +100,30 @@ class ChatService:
                 result = self.invalidate_session(key)
                 if hasattr(result, "__await__"):
                     await result
+            self._schedule_pending_reaction_cleanup()
             return True
         text = event.text or "Please analyze the attached file or image."
         if not self.state.record_incoming(key, event.message_id, event.sender, text, chat_id=event.chat_id, projects=projects):
             return False
+        if self.add_reaction is not None and self.remove_reaction is not None:
+            generation = self.state.incoming_generation(key, event.message_id)
+            if generation is not None and self.state.request_reaction(key, event.message_id, "Typing", generation=generation):
+                self._spawn_reaction(self._create_reaction(event.tenant, event.app, event.message_id))
         lock = self._sessions.setdefault(key, asyncio.Lock())
         task = asyncio.create_task(self._process_admitted(event, key, lock))
-        self._tasks[(event.tenant, event.app, event.message_id)] = task
+        identity = (event.tenant, event.app, event.message_id)
+        self._tasks[identity] = task
+        task.add_done_callback(lambda done: self._admitted_done(identity, done))
         return True
 
+    def _admitted_done(self, identity: tuple[str, str, str], task: asyncio.Task) -> None:
+        if self._tasks.get(identity) is task:
+            self._tasks.pop(identity, None)
+        self._request_reaction_cleanup(*identity)
+
     async def _process_admitted(self, event, key, lock):
-        try:
-            async with lock:
-                await self._handle_locked(event, key)
-        finally:
-            self._tasks.pop((event.tenant, event.app, event.message_id), None)
+        async with lock:
+            await self._handle_locked(event, key)
 
     async def _handle_locked(self, event, key):
         generation = self.state.incoming_generation(key, event.message_id)
@@ -120,6 +133,7 @@ class ChatService:
             projects = self.authorize(self._current_config(), key, event.sender)
         except AccessDenied:
             self.state.fail_incoming(key, event.message_id)
+            self._request_reaction_cleanup(event.tenant, event.app, event.message_id)
             return
         if not self.state.start_incoming(key, event.message_id):
             return
@@ -138,6 +152,7 @@ class ChatService:
                 projects = self.authorize(self._current_config(), key, event.sender)
             except AccessDenied:
                 self.state.fail_incoming(key, event.message_id)
+                self._request_reaction_cleanup(event.tenant, event.app, event.message_id)
                 return
             cancelled = threading.Event()
             self._cancel[key] = cancelled
@@ -149,6 +164,7 @@ class ChatService:
                     projects = self.authorize(self._current_config(), key, event.sender)
                 except AccessDenied:
                     self.state.fail_incoming(key, event.message_id)
+                    self._request_reaction_cleanup(event.tenant, event.app, event.message_id)
                     return
                 search = (lambda *_: []) if self.search_factory is None else self.search_factory(key, event.sender, projects)
                 history = self.state.history(key, projects)
@@ -162,6 +178,7 @@ class ChatService:
                     projects = self.authorize(self._current_config(), key, event.sender)
                 except AccessDenied:
                     self.state.fail_incoming(key, event.message_id)
+                    self._request_reaction_cleanup(event.tenant, event.app, event.message_id)
                     return
             except (ModelError, FeishuError, DocumentError, AttachmentAdmissionError) as error:
                 cancelled.set()
@@ -214,12 +231,15 @@ class ChatService:
                 current = self.authorize(self._current_config(), reply.session, reply.sender)
             except AccessDenied:
                 self.state.quarantine_reply(reply.reply_id)
+                self._request_reaction_cleanup(reply.session.tenant, reply.session.app, reply.message_id)
                 continue
             if not reply.projects.issubset(current):
                 self.state.quarantine_reply(reply.reply_id)
+                self._request_reaction_cleanup(reply.session.tenant, reply.session.app, reply.message_id)
                 continue
             if self.state.generation(reply.session) != reply.generation:
                 self.state.quarantine_reply(reply.reply_id)
+                self._request_reaction_cleanup(reply.session.tenant, reply.session.app, reply.message_id)
                 continue
             cancelled = threading.Event()
             self._sending[reply.session] = cancelled
@@ -229,12 +249,75 @@ class ChatService:
                     cancel_event=cancelled, deadline=time.monotonic() + 15,
                 )
             except Exception:
+                self._request_reaction_cleanup(reply.session.tenant, reply.session.app, reply.message_id)
                 continue
             finally:
                 if self._sending.get(reply.session) is cancelled:
                     self._sending.pop(reply.session, None)
             if platform_id:
                 self.state.mark_reply_delivered(reply.reply_id, str(platform_id))
+                self._request_reaction_cleanup(reply.session.tenant, reply.session.app, reply.message_id)
+
+    def _spawn_reaction(self, coroutine) -> None:
+        task = asyncio.create_task(coroutine)
+        self._reaction_tasks.add(task)
+        task.add_done_callback(self._reaction_tasks.discard)
+
+    async def _create_reaction(self, tenant: str, app: str, message_id: str) -> None:
+        try:
+            reaction_id = await asyncio.to_thread(
+                self.add_reaction, message_id, "Typing", deadline=time.monotonic() + 2,
+            )
+        except Exception:
+            # An ambiguous timeout can leave a reaction whose ID is unknowable without
+            # read scope. Never retry the create and risk duplicate indicators.
+            self.state.mark_reaction_create_failed(tenant, app, message_id)
+            return
+        if not reaction_id:
+            self.state.mark_reaction_create_failed(tenant, app, message_id)
+            return
+        still_active = self.state.record_reaction_created(tenant, app, message_id, str(reaction_id))
+        if not still_active:
+            self._schedule_reaction_delete(tenant, app, message_id, str(reaction_id))
+
+    def _request_reaction_cleanup(self, tenant: str, app: str, message_id: str) -> None:
+        reaction_id = self.state.request_reaction_cleanup(tenant, app, message_id)
+        if reaction_id:
+            self._schedule_reaction_delete(tenant, app, message_id, reaction_id)
+
+    def _schedule_reaction_delete(self, tenant: str, app: str, message_id: str, reaction_id: str) -> None:
+        identity = (tenant, app, message_id, reaction_id)
+        if self.remove_reaction is None or identity in self._reaction_deleting:
+            return
+        self._reaction_deleting.add(identity)
+
+        async def remove():
+            try:
+                await asyncio.to_thread(
+                    self.remove_reaction, message_id, reaction_id, deadline=time.monotonic() + 2,
+                )
+            except Exception:
+                return
+            else:
+                self.state.mark_reaction_removed(tenant, app, message_id, reaction_id)
+            finally:
+                self._reaction_deleting.discard(identity)
+
+        self._spawn_reaction(remove())
+
+    def _schedule_pending_reaction_cleanup(self) -> None:
+        for item in self.state.pending_reaction_cleanup():
+            self._schedule_reaction_delete(item.tenant, item.app, item.message_id, item.reaction_id)
+
+    async def cleanup_reactions(self) -> None:
+        self._schedule_pending_reaction_cleanup()
+        await self.wait_for_reactions()
+
+    async def wait_for_reactions(self) -> None:
+        while self._reaction_tasks:
+            tasks = tuple(self._reaction_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._reaction_tasks.difference_update(tasks)
 
     async def reconcile_access(self) -> list[object]:
         """Forget sessions whose explicit identity or group grant was fully removed."""
@@ -257,6 +340,8 @@ class ChatService:
                         if pending is not None:
                             pending.set()
                     self.state.quarantine_session_replies(key)
+                    self.state.request_session_reaction_cleanup(key)
+                    self._schedule_pending_reaction_cleanup()
                 continue
             for pending in (self._cancel.get(key), self._sending.get(key)):
                 if pending is not None:
@@ -268,4 +353,5 @@ class ChatService:
                     await result
             if first_revocation:
                 purged.append(key)
+            self._schedule_pending_reaction_cleanup()
         return purged

@@ -360,3 +360,114 @@ def test_direct_message_toggle_cancels_inflight_model_and_discards_late_answer(t
     assert observed_cancel.is_set()
     assert [turn.text for turn in service.state.history(session_key(event), frozenset())] == ["hello"]
     assert service.state.pending_replies() == []
+
+
+def test_accepted_message_gets_one_typing_reaction_removed_after_delivery(tmp_path):
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    added, removed = [], []
+    service = ChatService(
+        ChatState(tmp_path / "chat.db"), config,
+        lambda *args, **kwargs: ("answer", []), lambda *args, **kwargs: "reply",
+        add_reaction=lambda message_id, emoji, **kwargs: added.append((message_id, emoji)) or "reaction-1",
+        remove_reaction=lambda message_id, reaction_id, **kwargs: removed.append((message_id, reaction_id)),
+    )
+
+    async def run():
+        await service.handle(_event())
+        await service.wait_for_reactions()
+    asyncio.run(run())
+
+    assert added == [("m1", "Typing")]
+    assert removed == [("m1", "reaction-1")]
+
+
+def test_denied_and_duplicate_events_do_not_create_reactions(tmp_path):
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    added = []
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, lambda *a, **k: ("answer", []), lambda *a, **k: "reply",
+        add_reaction=lambda *args, **kwargs: added.append(args) or "reaction-1", remove_reaction=lambda *a, **k: None)
+
+    async def run():
+        await service.handle(_event())
+        await service.handle(_event())
+        await service.handle(_event(sender={"sender_id": {"open_id": "mallory"}}, message={"message_id":"denied", "chat_id":"dm", "chat_type":"p2p", "message_type":"text", "content":'{"text":"hello"}'}))
+        await service.wait_for_reactions()
+    asyncio.run(run())
+
+    assert len(added) == 1
+
+
+def test_reset_and_revocation_remove_inflight_reaction(tmp_path):
+    import threading
+    current = {"config": {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot", "direct_messages": True}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}}
+    entered, release, removed = threading.Event(), threading.Event(), []
+    def model(*args, **kwargs):
+        entered.set(); release.wait(2)
+        return "late", []
+    service = ChatService(ChatState(tmp_path / "chat.db"), current["config"], model, lambda *a, **k: "reply",
+        config_loader=lambda: current["config"], add_reaction=lambda *a, **k: "reaction-1",
+        remove_reaction=lambda message_id, reaction_id, **kwargs: removed.append((message_id, reaction_id)))
+
+    async def run():
+        assert await service.enqueue(_event())
+        await asyncio.to_thread(entered.wait, 2)
+        current["config"]["access"]["users"].pop("alice")
+        await service.reconcile_access()
+        release.set()
+        await asyncio.gather(*tuple(service._tasks.values()))
+        await service.wait_for_reactions()
+    asyncio.run(run())
+
+    assert removed == [("m1", "reaction-1")]
+
+
+def test_provider_and_send_failures_remove_reaction_without_masking_reply_state(tmp_path):
+    from teammem.chat.model import ModelError
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    removed = []
+    service = ChatService(ChatState(tmp_path / "chat.db"), config,
+        lambda *a, **k: (_ for _ in ()).throw(ModelError("provider failed")),
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("send failed")),
+        add_reaction=lambda *a, **k: "reaction-1",
+        remove_reaction=lambda message_id, reaction_id, **kwargs: removed.append((message_id, reaction_id)))
+
+    async def run():
+        await service.handle(_event())
+        await service.wait_for_reactions()
+    asyncio.run(run())
+
+    assert removed == [("m1", "reaction-1")]
+    assert len(service.state.pending_replies()) == 1
+
+
+def test_reaction_create_failure_does_not_block_model_or_reply(tmp_path):
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    sent = []
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, lambda *a, **k: ("answer", []),
+        lambda *a, **k: sent.append(1) or "reply",
+        add_reaction=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reaction failed")),
+        remove_reaction=lambda *a, **k: None)
+
+    async def run():
+        await service.handle(_event())
+        await service.wait_for_reactions()
+    asyncio.run(run())
+
+    assert sent == [1]
+
+
+def test_cancel_before_processing_starts_still_removes_reaction(tmp_path):
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    removed = []
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, lambda *a, **k: ("unused", []), lambda *a, **k: "reply",
+        add_reaction=lambda *a, **k: "reaction-1",
+        remove_reaction=lambda message_id, reaction_id, **kwargs: removed.append((message_id, reaction_id)))
+
+    async def run():
+        assert await service.enqueue(_event())
+        service._tasks[("tenant", "app", "m1")].cancel()
+        await asyncio.gather(*tuple(service._tasks.values()), return_exceptions=True)
+        await service.wait_for_reactions()
+    asyncio.run(run())
+
+    assert removed == [("m1", "reaction-1")]

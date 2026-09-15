@@ -71,3 +71,29 @@ def test_actual_bot_info_must_match_expected_identity(monkeypatch):
     assert client.verify_identity('correct')
     with pytest.raises(FeishuError):
         client.verify_identity('other-bot')
+
+
+def test_typing_reaction_uses_exact_message_endpoint_and_returned_identity(monkeypatch):
+    from teammem.chat.feishu import FeishuClient
+    client = FeishuClient('app', 'secret')
+    calls = []
+    def request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {'data': {'reaction_id': 'reaction-1'}}
+    monkeypatch.setattr(client, '_json', request)
+
+    assert client.create_reaction('om/source', 'Typing') == 'reaction-1'
+    assert calls == [('POST', '/im/v1/messages/om%2Fsource/reactions', {
+        'json': {'reaction_type': {'emoji_type': 'Typing'}}, 'deadline': None,
+    })]
+
+
+def test_reaction_delete_uses_exact_message_and_reaction_id(monkeypatch):
+    from teammem.chat.feishu import FeishuClient
+    client = FeishuClient('app', 'secret')
+    calls = []
+    monkeypatch.setattr(client, '_json', lambda method, path, **kwargs: calls.append((method, path, kwargs)) or {'data': {}})
+
+    client.delete_reaction('om/source', 'reaction/id')
+
+    assert calls == [('DELETE', '/im/v1/messages/om%2Fsource/reactions/reaction%2Fid', {'deadline': None})]

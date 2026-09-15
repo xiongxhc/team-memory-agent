@@ -100,13 +100,17 @@ class FeishuClient:
         self._token, self._expires = "", 0
         self._token_lock = threading.Lock()
 
-    def _auth(self):
-        with self._token_lock:
+    def _auth(self, *, deadline=None):
+        wait = max(0, deadline-time.monotonic()) if deadline is not None else -1
+        if not self._token_lock.acquire(timeout=wait):
+            raise FeishuError("Bot authentication timed out.")
+        try:
             if time.monotonic() < self._expires:
                 return self._token
+            timeout = min(10, max(.1, deadline-time.monotonic())) if deadline is not None else 10
             try:
                 with self.http.post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-                    json={"app_id":self.app_id,"app_secret":self.app_secret},timeout=10,allow_redirects=False) as response:
+                    json={"app_id":self.app_id,"app_secret":self.app_secret},timeout=timeout,allow_redirects=False) as response:
                     body = response.json()
                     if response.status_code != 200 or body.get("code") != 0:
                         raise FeishuError("Bot authentication failed.")
@@ -115,10 +119,12 @@ class FeishuClient:
                 return self._token
             except (requests.RequestException, ValueError, KeyError) as exc:
                 raise FeishuError("Bot authentication failed.") from exc
+        finally:
+            self._token_lock.release()
 
     def _json(self, method, path, *, cancel_event=None, deadline=None, **kwargs):
         try:
-            token = self._auth()
+            token = self._auth(deadline=deadline)
             if (cancel_event is not None and cancel_event.is_set()) or (deadline is not None and time.monotonic() >= deadline):
                 raise FeishuError("Reply delivery was cancelled or timed out.")
             timeout = min(10, max(.1, deadline-time.monotonic())) if deadline is not None else 10
@@ -196,6 +202,22 @@ class FeishuClient:
         if not message_id:
             raise FeishuError("Feishu did not confirm reply delivery.")
         return message_id
+
+    def create_reaction(self, message_id, emoji_type="Typing", *, deadline=None):
+        body = self._json(
+            "POST", "/im/v1/messages/"+quote(message_id, safe="")+"/reactions",
+            json={"reaction_type":{"emoji_type":emoji_type}}, deadline=deadline,
+        )
+        reaction_id = body.get("data", {}).get("reaction_id")
+        if not reaction_id:
+            raise FeishuError("Feishu did not confirm reaction creation.")
+        return str(reaction_id)
+
+    def delete_reaction(self, message_id, reaction_id, *, deadline=None):
+        self._json(
+            "DELETE", "/im/v1/messages/"+quote(message_id, safe="")+"/reactions/"+quote(reaction_id, safe=""),
+            deadline=deadline,
+        )
 
     def start(self, callback):
         import lark_oapi as lark

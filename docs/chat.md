@@ -25,6 +25,10 @@ project scope is the intersection of sender and group grants. Explicit `[]` allo
 casual conversation with no project evidence. Removing an entry revokes access.
 Project attribution in collector configuration does not grant chat access.
 
+While an accepted request is being processed, the bot can show a temporary
+`Typing` reaction on the original message. It does not send a separate thinking
+message. Reactions are best-effort: a platform failure must not prevent an answer.
+
 ## Files
 
 Authorized DMs can upload files or images. In groups, reply to a file message and
@@ -102,6 +106,10 @@ The Feishu app needs Bot capability and these tenant scopes:
 - `im:message:send_as_bot`
 - `im:message:readonly`
 
+For the temporary working reaction, also grant `im:message.reactions:write_only`
+(add and remove reactions). It is optional for answering messages; missing reaction
+permission disables the indicator rather than failing a conversation.
+
 Publish scope changes. Configure a long connection and the
 `im.message.receive_v1` event with the running service. Verify the bot open ID
 using bot info, and establish trusted tenant/user/group mappings before enabling
@@ -116,6 +124,25 @@ Readiness reports no secrets. It checks configuration, credentials, scopes, SDK,
 ledger read access, separate writable state, document runtime and actual bot
 identity. `serve` refuses failed readiness. Readiness does not establish semantic
 model quality or successful message/file delivery; test those separately.
+
+## Team knowledge retrieval
+
+Search ranks topic keywords and phrases instead of requiring the entire question
+to appear as one substring. It supports Chinese terms and common date spellings.
+Matching GitLab issues and merge requests prefer their latest authorized update within any
+requested time/person filters, so an older failure report does not displace its
+later resolution merely because it repeats more query words.
+
+The ledger is opened read-only. Detailed project grants allow short event summaries
+and validated original Feishu text, GitLab comments, and commit messages from the
+same event. Arbitrary raw metadata and unrelated issue descriptions are not passed
+to the model. Count-only project grants return commit aggregates only. Results
+remain bounded to eight excerpts; each search has a five-second SQL deadline.
+
+Person/day and team/week cached summaries have no complete project-level source
+provenance, so chat does not expose them or infer access from their headings. The
+generated vault is not independently searched. Missing or incomplete search
+results do not prove that a fact or plan does not exist.
 
 ## Delivery and recovery
 
