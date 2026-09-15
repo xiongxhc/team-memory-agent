@@ -26,7 +26,7 @@ def validate(data):
 def evaluate(config_path, cases):
     from PIL import Image, ImageDraw
     from teammem.chat.config import load_chat_config
-    from teammem.chat.model import answer
+    from teammem.chat.model import ModelError, answer
     from teammem.chat.runtime import create_transport, load_credentials
     from teammem.chat.state import Evidence, Turn
     config = load_chat_config(config_path)
@@ -72,6 +72,7 @@ def evaluate(config_path, cases):
             except Exception as error:
                 results.append({'id':case['id'],'latency_ms':round((time.monotonic()-started)*1000),
                     'automatic_checks_passed':False,'failures':[type(error).__name__],
+                    'failure_detail':str(error) if isinstance(error, ModelError) else 'evaluation error',
                     'human_review_required':True})
             print(json.dumps({'finished':case['id'],'passed':results[-1]['automatic_checks_passed']}),file=sys.stderr,flush=True)
     return results

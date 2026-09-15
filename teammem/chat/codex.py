@@ -16,7 +16,6 @@ import selectors
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -65,10 +64,10 @@ Choose action=answer with empty query and final text when ready. When allow_sear
 is false, answer from available evidence or explain what is unknown.
 Attached image N corresponds to the input_image item with attachment_index=N.
 Never execute commands, access files, use integrations, or invent search results.
+Cite team evidence and files with exact bracketed labels such as [E1] and [F1].
+Bare E1/F1 labels and prose source names do not replace those citations.
 Keep final text within max_output_tokens and max_answer_bytes specified in input.
 """
-# Set a hard per-file write bound before exec without preexec_fn in threaded services.
-_LAUNCH = "import os,resource,sys; resource.setrlimit(resource.RLIMIT_FSIZE,(2000000,2000000)); os.execve(sys.argv[1],sys.argv[1:],os.environ)"
 _CODE_MODE_DISABLED = "Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`."
 
 
@@ -102,7 +101,9 @@ def _run(argv, *, root, deadline, cancel_event=None, prompt=b"", output=None):
         source.write(prompt)
         source.seek(0)
         try:
-            process = subprocess.Popen([sys.executable, "-c", _LAUNCH, *argv], stdin=source,
+            # Codex maintains shared login/state files. Bound only this request's
+            # outputs below; a process-wide file limit would also cap those files.
+            process = subprocess.Popen(argv, stdin=source,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=root, env=_environment(),
                 start_new_session=True)
         except OSError as exc:

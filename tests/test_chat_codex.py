@@ -1,10 +1,12 @@
 import base64
 import json
 import os
-import signal
+import resource
+import struct
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 
 import pytest
@@ -71,6 +73,13 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':2,'output_toke
         return [found]
     result, evidence = answer({"name":"gpt-5.6-luna"}, [Turn("user","alice","release?",frozenset())], search, CodexTransport(cli))
     assert "Released [E1]" in result and evidence == [found] and queries == ["release"]
+
+
+def test_cli_preserves_inherited_file_limit_for_shared_auth_and_state(tmp_path):
+    capture = tmp_path / "file-limit.json"
+    extra = f"import resource\nPath({str(capture)!r}).write_text(json.dumps(resource.getrlimit(resource.RLIMIT_FSIZE)))"
+    CodexTransport(fake_cli(tmp_path, success(extra=extra)))(payload(), deadline=time.monotonic()+5)
+    assert json.loads(capture.read_text()) == list(resource.getrlimit(resource.RLIMIT_FSIZE))
 
 
 def test_inner_conversation_roles_remain_data_under_explicit_response_policy(tmp_path):
@@ -187,7 +196,10 @@ def test_shared_deadline_times_out_without_waiting_for_cli(tmp_path):
 
 def test_validated_images_are_private_staged_inputs_and_removed(tmp_path):
     capture = tmp_path / "images.json"
-    png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
+    def chunk(kind, data):
+        return struct.pack("!I", len(data)) + kind + data + struct.pack("!I", zlib.crc32(kind+data) & 0xffffffff)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack("!2I5B", 8, 8, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress((b"\0" + b"\0\0\xff"*8)*8)) + chunk(b"IEND", b""))
     extra = f"""images=[Path(args[i+1]) for i,a in enumerate(args[:-1]) if a=='--image']
 Path({str(capture)!r}).write_text(json.dumps({{'bytes':[p.read_bytes().hex() for p in images],'modes':[p.stat().st_mode & 511 for p in images],'paths':[str(p) for p in images],'prompt':json.loads(data)}}))"""
     cli = fake_cli(tmp_path, success(extra=extra))
