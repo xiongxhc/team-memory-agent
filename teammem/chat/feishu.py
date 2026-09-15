@@ -1,6 +1,7 @@
 """Narrow Feishu event normalization; SDK objects are converted at the boundary."""
 
 import json
+import re
 import threading
 import time
 from urllib.parse import quote
@@ -88,6 +89,20 @@ def is_own_bot_mention(event: NormalizedEvent, expected_bot_open_id: str) -> boo
 
 class FeishuError(RuntimeError):
     """Safe platform failure; provider bodies and credentials are never surfaced."""
+
+
+def _reply_content(text):
+    """Render generated citation footers as native Feishu links."""
+    rows = []
+    for line in text.split("\n"):
+        citation = re.fullmatch(r"(\[E\d+\] )\[((?:\\.|[^\]\\])*)\]\((https?://[^\s()]*)\)", line)
+        if citation:
+            prefix, label, url = citation.groups()
+            rows.append([{"tag":"text", "text":prefix},
+                         {"tag":"a", "text":re.sub(r"\\(.)", r"\1", label), "href":url}])
+        else:
+            rows.append([{"tag":"text", "text":line}])
+    return {"en_us":{"title":"", "content":rows}}
 
 
 class FeishuClient:
@@ -195,7 +210,7 @@ class FeishuClient:
             raise FeishuError("Reply delivery was cancelled.")
         original = self.get_message(message_id, chat_id)
         body = self._json("POST", "/im/v1/messages/"+quote(message_id,safe="")+"/reply",
-            json={"msg_type":"text","content":json.dumps({"text":text},ensure_ascii=False),"uuid":reply_id,
+            json={"msg_type":"post","content":json.dumps(_reply_content(text),ensure_ascii=False),"uuid":reply_id,
                   "reply_in_thread":bool(original and original.get("root_id"))},
             cancel_event=cancel_event, deadline=deadline)
         message_id = body.get("data", {}).get("message_id")

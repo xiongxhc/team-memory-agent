@@ -125,6 +125,9 @@ ledger read access, separate writable state, document runtime and actual bot
 identity. `serve` refuses failed readiness. Readiness does not establish semantic
 model quality or successful message/file delivery; test those separately.
 
+Replies use Feishu rich text. Source footers show clickable project/date labels;
+the source URL is embedded in the link instead of displayed in full.
+
 ## Team knowledge retrieval
 
 Search ranks topic keywords and phrases instead of requiring the entire question
