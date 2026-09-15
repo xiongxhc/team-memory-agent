@@ -163,3 +163,16 @@ def test_transport_timeout_has_safe_message():
     with pytest.raises(ModelError) as error:
         ResponsesTransport('synthetic-key',session=Http())({},deadline=time.monotonic()+5)
     assert 'secret provider body' not in str(error.value)
+
+
+@pytest.mark.parametrize("reference", ["[F99, page 1]", "[F1, F99]", "[F1; E99]", "[source: F99]", "[details — E99]", "[F99\npage 1]"])
+def test_compound_citation_cannot_hide_unknown_source(reference):
+    with pytest.raises(ModelError, match="source references"):
+        answer(CONFIG, [], lambda q: [], Transport(completed("42 " + reference)),
+            attachments=[{"filename":"budget.pdf","locator":"page 1","text":"42"}])
+
+
+def test_compound_citation_resolves_the_trusted_file_name_and_location():
+    text, _ = answer(CONFIG, [], lambda q: [], Transport(completed("42 [F1, page 1]")),
+        attachments=[{"filename":"budget.pdf","locator":"page 1","text":"42"}])
+    assert "[F1] budget.pdf, page 1" in text
