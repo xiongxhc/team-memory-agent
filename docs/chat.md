@@ -4,6 +4,35 @@ The optional chat service answers ordinary conversation and retrieves cited team
 facts from permitted projects. Its SQLite conversation state is separate from the
 team ledger. It never calls collection, publication, or team-memory writes.
 
+## Local Team Vault context
+
+Optionally configure the existing local Markdown checkout alongside the ledger:
+
+```json
+"vault": {
+  "root": "/srv/teammem/vault",
+  "web_url": "https://git.example/team/team-vault",
+  "ref": "master"
+}
+```
+
+Search reads the local Person journals, permitted Projects/Areas pages and
+project Docs, followed by precise ledger records. It does not fetch GitLab pages
+or pull a repository for each question. The operator keeps the checkout current;
+on the publishing host this is the vault that TeamMem already generates.
+Set `retrieval.max_snippets` to at least two to retain room for both sources.
+The operator must keep `web_url` and `ref` aligned with the published checkout;
+branch links can change after a subsequent render.
+
+Vault citations are labelled **Team Vault** and link to the published Markdown.
+Event citations are labelled **Original source** and retain their Feishu/GitLab
+links. Journals and documentation are dated snapshots, not live-status proof.
+Files and excerpts are bounded; unavailable or unverified summaries fall back to
+the ledger. Person journals can span projects: a daily section is eligible only
+when its exact text and synthesis input match the ledger and every contributing
+project remains authorized for detailed access. Hidden, count-only and
+unclassified evidence is never upgraded to prose through the vault.
+
 ## Conversation behavior
 
 | Conversation | Context | Trigger |
@@ -194,10 +223,11 @@ same event. Arbitrary raw metadata and unrelated issue descriptions are not pass
 to the model. Count-only project grants return commit aggregates only. Results
 remain bounded to eight excerpts; each search has a five-second SQL deadline.
 
-Person/day and team/week cached summaries have no complete project-level source
-provenance, so chat does not expose them or infer access from their headings. The
-generated vault is not independently searched. Missing or incomplete search
-results do not prove that a fact or plan does not exist.
+Without optional `vault` configuration, chat searches only the ledger. With it,
+local Markdown retrieval has a separate three-second deadline and contributes at
+most three of the eight excerpts. Person/day summaries require the provenance
+checks described above; global Work Journal and team/week summaries are excluded.
+Missing or incomplete search results do not prove that a fact or plan does not exist.
 
 ## Delivery and recovery
 

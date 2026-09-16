@@ -222,7 +222,7 @@ class ChatService:
             finally:
                 if self._cancel.get(key) is cancelled:
                     self._cancel.pop(key, None)
-        evidence_projects = frozenset(item.project for item in evidence)
+        evidence_projects = frozenset(project for item in evidence for project in ({item.project} | item.projects))
         context_projects = frozenset() if team_context is None else frozenset(team_context.get("_project_dependencies", ()))
         answer_projects = evidence_projects | context_projects | frozenset(project for turn in history for project in turn.projects)
         if not answer_projects.issubset(projects):

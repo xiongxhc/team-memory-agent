@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -26,6 +27,7 @@ class ChatConfig:
     access: Mapping[str, Any]
     paths: Mapping[str, Path]
     context: Mapping[str, Any] | None = None
+    vault: Mapping[str, Any] | None = None
 
 
 _TOP = frozenset({"schema_version", "enabled", "feishu", "model", "session", "retrieval", "attachments", "access", "paths"})
@@ -186,6 +188,21 @@ def _validate_paths(value: dict[str, Any]) -> Mapping[str, Path]:
     return MappingProxyType(paths)
 
 
+def _validate_vault(value: dict[str, Any]) -> Mapping[str, Any]:
+    _keys(value, frozenset({"root", "web_url", "ref"}), "vault")
+    root = Path(_string(value['root'], 'vault.root')).expanduser()
+    if not root.is_absolute():
+        raise ChatConfigError('vault.root must be absolute')
+    url = _string(value['web_url'], 'vault.web_url').rstrip('/')
+    parsed = urlsplit(url)
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ChatConfigError('vault.web_url must be a repository URL without credentials, query, or fragment')
+    ref = _string(value['ref'], 'vault.ref')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,199}', ref) or '..' in ref:
+        raise ChatConfigError('vault.ref must be a branch or commit reference')
+    return MappingProxyType({'root': root, 'web_url': url, 'ref': ref})
+
+
 def _validate_context(value: dict[str, Any]) -> Mapping[str, Any]:
     _keys(value, frozenset({"timezone", "user_people"}), "context")
     timezone_name = _string(value["timezone"], "context.timezone")
@@ -216,7 +233,7 @@ def load_chat_config(path: Path) -> ChatConfig:
     except (OSError, json.JSONDecodeError) as exc:
         raise ChatConfigError(f"cannot read chat config: {exc}") from exc
     document = _object(document, "chat config")
-    unknown = set(document) - (_TOP | {"context"})
+    unknown = set(document) - (_TOP | {"context", "vault"})
     missing = _TOP - set(document)
     if unknown:
         raise ChatConfigError(f"chat config has unknown keys: {', '.join(sorted(unknown))}")
@@ -226,16 +243,20 @@ def load_chat_config(path: Path) -> ChatConfig:
         raise ChatConfigError("unsupported chat schema_version")
     enabled = _boolean(document["enabled"], "enabled")
     sections = {name: _object(document[name], name) for name in _SECTIONS}
+    retrieval = _validate_retrieval(sections["retrieval"])
+    if 'vault' in document and retrieval['max_snippets'] < 2:
+        raise ChatConfigError('vault retrieval requires at least two snippets for vault and original evidence')
     return ChatConfig(
         schema_version=1,
         enabled=enabled,
         feishu=_validate_feishu(sections["feishu"], enabled),
         model=_validate_model(sections["model"]),
         session=_validate_session(sections["session"]),
-        retrieval=_validate_retrieval(sections["retrieval"]),
+        retrieval=retrieval,
         attachments=_validate_attachments(sections["attachments"]),
         access=_validate_access(sections["access"]),
         paths=_validate_paths(sections["paths"]),
+        vault=None if 'vault' not in document else _validate_vault(_object(document['vault'], 'vault')),
         context=(MappingProxyType({"timezone": "UTC", "user_people": MappingProxyType({})})
                  if "context" not in document
                  else _validate_context(_object(document["context"], "context"))),

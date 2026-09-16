@@ -140,6 +140,10 @@ def check_readiness(path, *, verify_bot=None):
     paths = config.paths
     state_paths = [paths['chat_db'].resolve(), paths['attachment_dir'].resolve()]
     protected = [paths['ledger_db'].resolve(), paths['credentials_env'].resolve(), paths['source_config_dir'].resolve()]
+    if config.vault:
+        root = config.vault['root']
+        protected.append(root.resolve())
+        checks.append(('local vault', root.is_dir() and not root.is_symlink(), 'read-only Markdown root'))
     separate = all(a != b and a not in b.parents and b not in a.parents for a in state_paths for b in protected)
     checks.append(('isolated paths', separate, 'state must not contain or overlap ledger, credentials, or source config'))
     checks.append(('state writable', all(_writable_parent(p.parent) for p in state_paths), 'writable state parents'))
@@ -276,6 +280,7 @@ def build_service(config_path, *, client=None, transport=None, parser=None):
         team_context_input_cost,
     )
     from .retrieval import search_evidence
+    from .vault import search_vault
     from .service import ChatService
     from .state import ChatState
     config = load_chat_config(config_path)
@@ -366,8 +371,17 @@ def build_service(config_path, *, client=None, transport=None, parser=None):
             raw_allowed = frozenset(project for project in allowed if not project.startswith(POLICY_DEPENDENCY_PREFIX))
             if 'project' in structured:
                 raw_allowed &= frozenset({structured['project']})
-            return search_evidence(current.paths['ledger_db'], policy, raw_allowed, structured,
-                limit=current.retrieval['max_snippets'])
+            limit = current.retrieval['max_snippets']
+            # Keep original event evidence alongside the broader local summaries.
+            vault = search_vault(current.paths['ledger_db'], current.paths['source_config_dir'],
+                current.vault, policy, raw_allowed, structured, limit=min(3, limit - 1)) if current.vault and limit > 1 else []
+            records = search_evidence(current.paths['ledger_db'], policy, raw_allowed, structured, limit=limit)
+            # A grant or projection can change while local files are being read.
+            refreshed = load_chat_config(config_path)
+            refreshed_policy = project_policy_from_source_config(source_config(refreshed))
+            permitted = strict_scope(refreshed_policy, authorize_current(refreshed,key,sender) & admitted)
+            candidates = vault + records[:limit - len(vault)]
+            return [item for item in candidates if ({item.project} | item.projects).issubset(permitted)]
         return search
 
     def context_factory(*, config, authorization, requester_id, query):
