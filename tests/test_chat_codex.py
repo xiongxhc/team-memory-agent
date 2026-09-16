@@ -188,9 +188,30 @@ def test_only_exact_known_startup_warning_is_allowed_before_turn(tmp_path, durin
 
 
 def test_answer_byte_budget_is_enforced_even_on_successful_cli_exit(tmp_path):
-    cli = fake_cli(tmp_path, success({'action':'answer','query':'','text':'x'*1201}))
-    with pytest.raises(ModelError):
+    cli = fake_cli(tmp_path, success({'action':'answer','query':'','text':'x'*4801}))
+    with pytest.raises(ModelError, match='invalid or oversized answer'):
         CodexTransport(cli)(payload(), deadline=time.monotonic()+5)
+
+
+@pytest.mark.parametrize('text', ['Architecture detail. ' * 70, '团队项目架构。' * 100], ids=['english','chinese'])
+def test_normal_answer_is_not_rejected_by_treating_tokens_as_utf8_bytes(tmp_path, text):
+    assert 1200 < len(text.encode()) < 4800
+    capture = tmp_path/'prompt.json'
+    cli = fake_cli(tmp_path, success({'action':'answer','query':'','text':text},
+        extra=f"Path({str(capture)!r}).write_text(data)"))
+
+    result = CodexTransport(cli)(payload(), deadline=time.monotonic()+5)
+
+    assert result['output'][0]['content'][0]['text'] == text.strip()
+    prompt = json.loads(capture.read_text())
+    assert prompt['max_output_tokens'] == 1200 and prompt['max_answer_bytes'] == 4800
+
+
+def test_answer_byte_ceiling_counts_utf8_and_scales_with_lower_output_setting(tmp_path):
+    request = payload(); request['max_output_tokens'] = 100
+    cli = fake_cli(tmp_path, success({'action':'answer','query':'','text':'字'*134}))
+    with pytest.raises(ModelError, match='invalid or oversized answer'):
+        CodexTransport(cli)(request, deadline=time.monotonic()+5)
 
 
 @pytest.mark.parametrize("channel", ["stdout", "stderr", "file"])

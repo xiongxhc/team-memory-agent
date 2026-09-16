@@ -121,8 +121,10 @@ Choose one explicit `model.provider`:
 
 Both routes use the privately configured model, a shared 45-second model deadline,
 at most three requests and two read-only retrieval rounds. There is no provider or
-model fallback. Codex CLI output is bounded after generation and by the deadline;
-the API additionally enforces its requested output-token limit. Codex ephemeral
+model fallback. Codex requests the configured output-token budget and separately
+enforces a final UTF-8 byte cap of four times that setting (at most 4,800 bytes).
+This is a response-size bound, not an exact token count or a reasoning-token cap.
+The API route enforces its requested output-token limit. Codex ephemeral
 execution prevents local session rollouts; it does not promise zero provider retention.
 
 Install bubblewrap, LibreOffice, Tesseract with English and Simplified Chinese

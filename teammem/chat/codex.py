@@ -1,9 +1,10 @@
 """Stateless Codex CLI transport using the operator's existing ChatGPT login.
 
 The CLI has no documented hard output-token option. We request the configured
-token budget and enforce a conservative UTF-8 byte budget on final answer text;
-wall time and all process output are bounded independently. This limits returned
-text, not provider reasoning-token consumption.
+token budget and separately cap final UTF-8 text at four bytes per requested
+token (at most 4800 bytes). This is a response-size bound, not token counting.
+Wall time and process output are bounded independently; provider reasoning-token
+consumption is not capped by this adapter.
 """
 
 import base64
@@ -256,6 +257,7 @@ class CodexTransport:
             or effort not in {"minimal", "low", "medium", "high", "xhigh", "max"}
             or type(limit) is not int or not 1 <= limit <= 1200):
             raise ModelError("Invalid Codex model settings.")
+        answer_byte_limit = 4 * limit
         allow_search = payload.get("tool_choice") == "auto"
         with tempfile.TemporaryDirectory(prefix="teammem-codex-") as directory:
             root = Path(directory)
@@ -267,7 +269,7 @@ class CodexTransport:
             policy.write_text(_INSTRUCTIONS + "\n" + instructions)
             schema.write_text(json.dumps(_SCHEMA))
             prompt = json.dumps({"input":inputs, "allow_search":allow_search,
-                "max_output_tokens":limit, "max_answer_bytes":limit}, ensure_ascii=False).encode()
+                "max_output_tokens":limit, "max_answer_bytes":answer_byte_limit}, ensure_ascii=False).encode()
             if len(prompt) > 100_000:
                 raise ModelError("The conversation exceeded the context limit.")
             argv = [self.binary, "exec", "--model", model, "--ephemeral", "--sandbox", "read-only",
@@ -331,7 +333,7 @@ class CodexTransport:
                 item = {"type":"function_call", "name":"search_teammem", "call_id":"codex_"+uuid.uuid4().hex,
                         "arguments":json.dumps(arguments, ensure_ascii=False)}
             elif (action == "answer" and not query and all(value is None for value in filters.values())
-                  and text and len(text.encode()) <= limit):
+                  and text and len(text.encode()) <= answer_byte_limit):
                 item = {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":text}]}
             else:
                 raise ModelError("Codex returned an invalid or oversized answer.")
