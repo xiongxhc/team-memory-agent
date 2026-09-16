@@ -1,4 +1,47 @@
 from teammem.chat.feishu import normalize_event, session_key
+import json
+from types import SimpleNamespace
+
+
+def test_person_mention_survives_normalization_in_dm():
+    event = normalize_event({'message': {'message_type': 'text',
+        'content': json.dumps({'text': 'What did @_user_1 do yesterday?'}),
+        'mentions': [{'key': '@_user_1', 'id': {'open_id': 'ou_sam'}, 'name': 'Sam Lee'}]}})
+    assert event.text == 'What did Sam Lee do yesterday?'
+    assert event.mentions == frozenset({'ou_sam'})
+
+
+def test_mention_can_touch_chinese_text_without_a_space():
+    event = normalize_event({'message': {'message_type': 'text',
+        'content': json.dumps({'text': '@_user_1昨天做了什么？'}),
+        'mentions': [{'key': '@_user_1', 'name': '小林'}]}})
+    assert event.text == '小林昨天做了什么？'
+
+
+def test_only_configured_bot_is_removed_from_sdk_mentions():
+    mentions = [SimpleNamespace(key='@_user_1', id=SimpleNamespace(open_id='ou_bot'), name='Team Bot'),
+                SimpleNamespace(key='@_user_10', id=SimpleNamespace(open_id='ou_sam'), name='Sam Lee')]
+    message = SimpleNamespace(message_type='text', mentions=mentions,
+        content=json.dumps({'text': '@_user_1 What did @_user_10 do? @_user_10'}))
+    event = normalize_event(SimpleNamespace(message=message), own_bot_open_id='ou_bot')
+    assert event.text == 'What did Sam Lee do? Sam Lee'
+    assert event.mentions == frozenset({'ou_bot', 'ou_sam'})
+
+
+def test_unknown_mentions_are_not_erased_or_replaced_recursively():
+    event = normalize_event({'message': {'message_type': 'text',
+        'content': json.dumps({'text': '@_user_1 / @_user_2 / @_user_3'}),
+        'mentions': [{'key': '@_user_1', 'name': '@_user_2'},
+                     {'key': '@_user_2', 'name': 'Sam'}, {'key': '@_user_3'}]}})
+    assert event.text == '@_user_2 / Sam / @_user_3'
+
+
+def test_bot_mention_does_not_break_session_commands():
+    event = normalize_event({'message': {'message_type': 'text',
+        'content': json.dumps({'text': '@_user_1 /forget'}),
+        'mentions': [{'key': '@_user_1', 'id': {'open_id': 'ou_bot'}, 'name': 'Team Bot'}]}},
+        own_bot_open_id='ou_bot')
+    assert event.text == '/forget'
 
 
 def test_group_event_uses_thread_root_and_exact_open_id_mentions():

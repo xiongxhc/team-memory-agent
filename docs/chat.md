@@ -19,6 +19,11 @@ own session; group/thread commands require an explicit group administrator grant
 Reset cancels queued work and suppresses late results. A message already accepted
 by Feishu cannot be recalled by a local reset.
 
+People mentioned with `@` remain in the question using Feishu's supplied display
+name, which is resolved through the authorized team directory during retrieval.
+Only the configured bot's own mention is removed as routing syntax. Mentions
+with missing names remain visible as placeholders rather than disappearing.
+
 Both sender and group must appear in the access configuration. Grants use the
 **new bot application's open IDs**, not another collector's IDs. The effective
 project scope is the intersection of sender and group grants. Explicit `[]` allows

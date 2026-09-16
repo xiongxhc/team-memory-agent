@@ -439,7 +439,7 @@ def serve(config_path):
     if not ready.wait(15) or 'error' in holder:
         raise RuntimeError('Chat service initialization failed.')
     def callback(raw):
-        event = normalize_event(raw)
+        event = normalize_event(raw, own_bot_open_id=load_chat_config(config_path).feishu['expected_bot_open_id'])
         # Wait only for durable admission, never for parsing/model work.
         future = asyncio.run_coroutine_threadsafe(holder['service'].enqueue(event), loop)
         future.result(timeout=5)
