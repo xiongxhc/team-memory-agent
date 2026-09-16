@@ -145,6 +145,59 @@ def test_build_service_wires_scoped_directory_and_structured_alias_search(tmp_pa
     store.close(); service.state.close()
 
 
+def test_local_vault_search_keeps_original_records_and_canonical_filters(tmp_path):
+    path = directory_configured(tmp_path)
+    config = json.loads(path.read_text())
+    vault = tmp_path/'vault'
+    docs = vault/'Docs'/'alpha'
+    docs.mkdir(parents=True)
+    (docs/'architecture.md').write_text('# Project Alpha\n\nRelease status uses a local ledger.\n')
+    config['vault'] = {'root':str(vault),'web_url':'https://git.example/team/vault','ref':'main'}
+    config['retrieval']['max_snippets'] = 2
+    path.write_text(json.dumps(config))
+    service, store, _ = build_service(path, client=Client(), transport=Transport())
+    event = NormalizedEvent('tenant','cli_exampleapp123','m1','dmchat','ou_requester123','p2p','','',frozenset(),'status','text',())
+    key = session_key(event)
+    admitted = service.authorize(service.config, key, event.sender)
+
+    evidence = service.search_factory(key, event.sender, admitted)({'query':'release status','project':'Alpha'})
+
+    assert len(evidence) == 2
+    assert [item.kind for item in evidence] == ['vault','source']
+    assert {item.project for item in evidence} == {'alpha'}
+    assert evidence[0].url.endswith('/-/blob/main/Docs/alpha/architecture.md')
+    store.close(); service.state.close()
+
+
+def test_vault_rechecks_every_project_dependency_after_local_read(tmp_path, monkeypatch):
+    from teammem.chat.state import Evidence
+    path = directory_configured(tmp_path)
+    config = json.loads(path.read_text())
+    config['vault'] = {'root':str(tmp_path/'vault'),'web_url':'https://git.example/team/vault','ref':'main'}
+    config['access']['users']['ou_requester123'].append('beta')
+    path.write_text(json.dumps(config))
+    (tmp_path/'source_config_dir'/'projects.yaml').write_text('projects:\n  alpha: {}\n  beta: {}\n')
+    service, store, _ = build_service(path, client=Client(), transport=Transport())
+    event = NormalizedEvent('tenant','cli_exampleapp123','m1','dmchat','ou_requester123','p2p','','',frozenset(),'status','text',())
+    key = session_key(event)
+    admitted = service.authorize(service.config, key, event.sender)
+
+    def changing_read(*args, **kwargs):
+        config['access']['users']['ou_requester123'].remove('beta')
+        path.write_text(json.dumps(config))
+        return [Evidence('vault:daily','alpha','2026-09-16','Mixed alpha and beta',None,
+                         kind='vault',projects=frozenset({'alpha','beta'}))]
+    monkeypatch.setattr('teammem.chat.vault.search_vault', changing_read)
+    # build_service captures the reader; rebuild after patching.
+    store.close(); service.state.close()
+    service, store, _ = build_service(path, client=Client(), transport=Transport())
+    evidence = service.search_factory(key, event.sender, admitted)({'query':'release'})
+
+    assert evidence and all(item.kind == 'source' for item in evidence)
+    assert all(item.project == 'alpha' for item in evidence)
+    store.close(); service.state.close()
+
+
 def test_mentioned_person_reaches_model_and_retrieval_after_other_person_history(tmp_path):
     path = directory_configured(tmp_path)
     client = Client()

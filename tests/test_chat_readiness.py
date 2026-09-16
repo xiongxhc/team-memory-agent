@@ -65,3 +65,23 @@ def test_codex_provider_readiness_requires_login_but_not_api_key(tmp_path, monke
 
     assert checks['credentials'] is True
     assert checks['Codex CLI login'] is True
+
+
+def test_readiness_rejects_missing_or_symlink_vault_and_state_overlap(tmp_path):
+    from tests.test_chat_runtime import configured
+    path = configured(tmp_path)
+    config = json.loads(path.read_text())
+    root = tmp_path/'vault'
+    config['vault'] = {'root':str(root),'web_url':'https://git.example/team/vault','ref':'main'}
+    path.write_text(json.dumps(config))
+    checks = {name:ok for name,ok,_ in check_readiness(path).checks}
+    assert checks['local vault'] is False
+    target = tmp_path/'real-vault'; target.mkdir()
+    root.symlink_to(target, target_is_directory=True)
+    checks = {name:ok for name,ok,_ in check_readiness(path).checks}
+    assert checks['local vault'] is False
+    root.unlink(); root.mkdir()
+    config['paths']['attachment_dir'] = str(root/'attachments')
+    path.write_text(json.dumps(config))
+    checks = {name:ok for name,ok,_ in check_readiness(path).checks}
+    assert checks['local vault'] is True and checks['isolated paths'] is False

@@ -64,6 +64,24 @@ def test_loads_optional_directory_context(tmp_path):
     }
 
 
+def test_loads_optional_local_vault(tmp_path):
+    config = load_chat_config(_write(tmp_path, lambda doc: doc.update(vault={
+        'root':str(tmp_path/'vault'), 'web_url':'https://git.example/team/vault/', 'ref':'master'})))
+    assert config.vault == {'root':tmp_path/'vault', 'web_url':'https://git.example/team/vault', 'ref':'master'}
+
+
+@pytest.mark.parametrize('field,value', [
+    ('root','relative/vault'), ('web_url','file:///etc'),
+    ('web_url','https://user:secret@git.example/vault'),
+    ('web_url','https://git.example/vault?token=secret'), ('ref','../secret'),
+])
+def test_rejects_unsafe_vault_configuration(tmp_path, field, value):
+    vault={'root':str(tmp_path/'vault'),'web_url':'https://git.example/team/vault','ref':'master'}
+    vault[field]=value
+    with pytest.raises(ChatConfigError):
+        load_chat_config(_write(tmp_path, lambda doc: doc.update(vault=vault)))
+
+
 @pytest.mark.parametrize("context", [
     {"timezone": "Mars/Olympus", "user_people": {}},
     {"timezone": "UTC", "user_people": {"display name": "alex"}},
@@ -192,3 +210,11 @@ def test_rejects_reserved_policy_dependency_as_project_grant(tmp_path):
                 "ou_exampleuser123": ["\x00teammem-policy-v1:collision"],
             }),
         ))
+
+
+def test_vault_requires_room_for_original_evidence(tmp_path):
+    def change(doc):
+        doc['vault'] = {'root':str(tmp_path/'vault'),'web_url':'https://git.example/team/vault','ref':'main'}
+        doc['retrieval']['max_snippets'] = 1
+    with pytest.raises(ChatConfigError, match='at least two snippets'):
+        load_chat_config(_write(tmp_path, change))

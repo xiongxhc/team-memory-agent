@@ -33,6 +33,10 @@ class Evidence:
     text: str
     url: str | None
     person: str | None = None
+    kind: str = "source"
+    title: str | None = None
+    projects: frozenset[str] = frozenset()
+    coverage: str | None = None
 
 
 @dataclass(frozen=True)
