@@ -6,9 +6,10 @@ import re
 import threading
 import time
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -332,6 +333,23 @@ def _structured_search(args):
     return {"text": query, **{name: value for name, value in values.items() if value is not None}}
 
 
+def _citation_time(value, config):
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return "Date unavailable"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return moment.strftime("%d %b %Y").lstrip("0")
+    context = config.get("context") if isinstance(config, Mapping) else config.context
+    zone_name = (context or {}).get("timezone", "UTC")
+    zone = timezone.utc if zone_name == "UTC" else ZoneInfo(zone_name)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    local = moment.astimezone(zone)
+    label = "UAE" if zone_name == "Asia/Dubai" else local.tzname()
+    return f"{local.strftime('%d %b %Y, %H:%M').lstrip('0')} {label}"
+
+
 def answer(config, turns, search, transport, *, attachments=(), team_context=None,
            cancel_event=None, deadline=None):
     """Return final text and ALL supplied ledger evidence, for conservative grant rechecks."""
@@ -433,7 +451,7 @@ def answer(config, turns, search, transport, *, attachments=(), team_context=Non
             source = labels[label]
             if isinstance(source, Evidence):
                 url = source.url if source.url and source.url.startswith(("https://", "http://")) else None
-                detail = f"{source.project} · {source.timestamp}"
+                detail = f"{source.project} · {_citation_time(source.timestamp, config)}"
                 if url:
                     # Keep source-controlled punctuation inside the label/target.
                     link_label = re.sub(r"([\\`*_{}\[\]<>])", r"\\\1", " ".join(detail.split()))
