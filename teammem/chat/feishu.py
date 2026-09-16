@@ -34,7 +34,7 @@ def _get(source: Any, name: str, default: Any = None) -> Any:
     return source.get(name, default) if isinstance(source, dict) else getattr(source, name, default)
 
 
-def normalize_event(source: Any) -> NormalizedEvent:
+def normalize_event(source: Any, *, own_bot_open_id: str = "") -> NormalizedEvent:
     event = _get(source, "event", source)
     header = _get(source, "header", {})
     message = _get(event, "message", {})
@@ -50,12 +50,23 @@ def normalize_event(source: Any) -> NormalizedEvent:
     except (TypeError, ValueError):
         parsed = {}
     text = parsed.get("text") if isinstance(parsed.get("text"), str) and message_type == "text" else None
-    # Strip the platform's exact mention placeholders, never names guessed from text.
+    # Keep human mentions as platform-provided names; only our bot mention is routing.
     if text is not None:
+        replacements = {}
         for mention in mentions:
             key = _get(mention, "key", "")
-            if key:
-                text = text.replace(key, "")
+            if not isinstance(key, str) or not key:
+                continue
+            open_id = _get(_get(mention, "id", mention), "open_id", "")
+            name = _get(mention, "name", "")
+            if own_bot_open_id and open_id == own_bot_open_id:
+                replacements[key] = ""
+            elif isinstance(name, str) and name.strip():
+                replacements[key] = name.strip()
+        if replacements:
+            # Single pass avoids rewriting names or matching @_user_1 inside @_user_10.
+            pattern = "(?:" + "|".join(re.escape(key) for key in sorted(replacements, key=len, reverse=True)) + r")(?!\d)"
+            text = re.sub(pattern, lambda match: replacements[match.group()], text)
         text = text.strip()
     resources = _resources(message_type, parsed)
     def value(obj, key, default=""):

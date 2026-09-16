@@ -7,7 +7,8 @@ import pytest
 
 from teammem.chat.context import POLICY_DEPENDENCY_PREFIX
 from teammem.chat.config import load_chat_config
-from teammem.chat.feishu import NormalizedEvent, session_key
+from teammem.chat.feishu import NormalizedEvent, normalize_event, session_key
+from teammem.chat.state import Turn
 from teammem.chat.model import ModelError, team_context_input_budget, team_context_input_cost
 from teammem.chat.runtime import build_service, check_readiness, create_transport
 from teammem.store import open_db
@@ -141,6 +142,34 @@ def test_build_service_wires_scoped_directory_and_structured_alias_search(tmp_pa
     assert {person['slug'] for person in context['people']} == {'alex','sam'}
     assert any(item.startswith(POLICY_DEPENDENCY_PREFIX) for item in context['_project_dependencies'])
     assert len(evidence) == 1 and evidence[0].project == 'alpha'
+    store.close(); service.state.close()
+
+
+def test_mentioned_person_reaches_model_and_retrieval_after_other_person_history(tmp_path):
+    path = directory_configured(tmp_path)
+    client = Client()
+    service, store, _ = build_service(path, client=client, transport=Transport())
+    event = normalize_event({'tenant':'tenant','app':'cli_exampleapp123',
+        'sender':{'sender_id':{'open_id':'ou_requester123'}},
+        'message':{'message_id':'mention-person','chat_id':'dmchat','chat_type':'p2p',
+            'message_type':'text','content':json.dumps({'text':'What did @_user_1 do today?'}),
+            'mentions':[{'key':'@_user_1','id':{'open_id':'ou_sam'},'name':'Sam'}]}})
+    key = session_key(event)
+    admitted = service.authorize(service.config, key, event.sender)
+    service.state.append(key, Turn('user',event.sender,'What did Alex do today?',admitted))
+    service.state.append(key, Turn('assistant','bot','Alex worked on documentation.',admitted))
+    calls = []
+    def model(config, history, search, transport, **kwargs):
+        assert 'Alex' in history[-2].text
+        assert history[-1].text == 'What did Sam do today?'
+        evidence = search({'query':'','person':'Sam'})
+        assert evidence and {item.person for item in evidence} == {'sam'}
+        calls.append(history[-1].text)
+        return 'Sam updated the release status.', evidence
+    service.model = model
+    asyncio.run(service.handle(event))
+    assert calls == ['What did Sam do today?']
+    assert client.sent[0][-1] == 'Sam updated the release status.'
     store.close(); service.state.close()
 
 
