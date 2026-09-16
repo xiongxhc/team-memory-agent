@@ -96,6 +96,7 @@ def test_search_is_read_only_and_preserves_source_fields(tmp_path):
     assert found[0].timestamp == "2026-09-02T10:00:00Z"
     assert found[0].url is None
     assert found[0].id.isdigit()
+    assert found[0].person == "alice"
     assert "feishu" not in found[0].text.lower()
     assert path.read_bytes() == before
     with open_ledger_readonly(path) as conn:
@@ -117,6 +118,7 @@ def test_count_only_project_returns_aggregate_without_memberkit_detail(tmp_path)
     assert "7" in found[0].text
     assert "MemberKit" not in found[0].text
     assert found[0].url is None
+    assert found[0].person is None
 
 
 def test_sql_injection_text_is_a_literal_and_cannot_bypass_scope(tmp_path):
@@ -133,6 +135,11 @@ def test_sql_injection_text_is_a_literal_and_cannot_bypass_scope(tmp_path):
     _query("endpoint", start="not-a-date"),
     _query("endpoint", end="2026-09-01T00:00:00Z", start="2026-09-02T00:00:00Z"),
     _query("x" * 401),
+    _query("endpoint", unsupported=True),
+    _query("endpoint", project=7),
+    _query("", person="   "),
+    _query("", project=""),
+    _query("", start="2026-09-01T00:00:00Z"),
 ])
 def test_invalid_query_bounds_are_rejected_before_reading(tmp_path, query):
     """Accepting malformed or reversed bounds makes the reader's resource scope unbounded."""
@@ -149,6 +156,65 @@ def test_hidden_unknown_and_empty_scopes_return_no_evidence(tmp_path):
     assert search_evidence(path, {"hidden": "hidden"}, frozenset({"hidden"}), _query("launch")) == []
     assert search_evidence(path, {}, frozenset({"detail"}), _query("endpoint")) == []
     assert search_evidence(path, {"detail": "detail"}, frozenset(), _query("endpoint")) == []
+
+
+def test_project_filter_only_narrows_existing_authorized_scope(tmp_path):
+    path = _ledger(tmp_path)
+
+    found = search_evidence(
+        path,
+        {"detail": "detail", "other": "detail", "counts": "count_only"},
+        frozenset({"detail", "other", "counts"}),
+        _query("", project="detail"),
+    )
+
+    assert found
+    assert {item.project for item in found} == {"detail"}
+    assert search_evidence(
+        path, {"detail": "detail"}, frozenset({"detail"}),
+        _query("", project="unknown"),
+    ) == []
+
+
+def test_person_only_daily_activity_uses_exact_author_and_chronological_offsets(tmp_path):
+    path = _ledger(tmp_path)
+    conn = open_db(path)
+    insert_events(conn, [
+        Event(person="alex", project="detail", ts="2026-09-16T01:00:00+08:00",
+              source="gitlab", kind="commit", summary="Before UAE day", refs=None,
+              raw=None, hash="before-uae-day"),
+        Event(person="alex", project="detail", ts="2026-09-15T20:30:00Z",
+              source="gitlab", kind="commit", summary="Inside UAE day early", refs=None,
+              raw=None, hash="inside-uae-early"),
+        Event(person="alex", project="detail", ts="2026-09-17T02:00:00+08:00",
+              source="gitlab", kind="commit", summary="Inside UAE day late", refs=None,
+              raw=None, hash="inside-uae-late"),
+        Event(person="alexander", project="detail", ts="2026-09-16T12:00:00+04:00",
+              source="gitlab", kind="commit", summary="Wrong exact person", refs=None,
+              raw=None, hash="wrong-person"),
+    ])
+    conn.close()
+
+    found = search_evidence(
+        path, {"detail": "detail"}, frozenset({"detail"}),
+        _query("", person="alex", start="2026-09-16T00:00:00+04:00",
+               end="2026-09-17T00:00:00+04:00"),
+    )
+
+    assert [item.text for item in found] == ["Inside UAE day late", "Inside UAE day early"]
+    assert all(item.person == "alex" for item in found)
+
+
+@pytest.mark.parametrize("filters", [
+    {"person": "alex' OR 1=1 --"},
+    {"project": "detail' OR 1=1 --"},
+])
+def test_structured_filter_injection_is_exact_and_fails_closed(tmp_path, filters):
+    path = _ledger(tmp_path)
+    assert search_evidence(
+        path, {"detail": "detail", "other": "detail"}, frozenset({"detail", "other"}),
+        _query("", **filters),
+    ) == []
 
 
 def test_natural_question_matches_topic_date_wording_and_returns_full_message(tmp_path):
@@ -403,6 +469,32 @@ def test_natural_count_question_returns_only_authorized_aggregate(tmp_path):
     ]
 
 
+def test_daily_bounds_do_not_relabel_weekly_count_as_daily_activity(tmp_path):
+    path = _ledger(tmp_path)
+
+    found = search_evidence(
+        path, {"counts": "count_only"}, frozenset({"counts"}),
+        _query("", person="alice", start="2026-09-01T00:00:00Z",
+               end="2026-09-02T00:00:00Z"),
+    )
+
+    assert found == []
+
+
+def test_full_utc_week_bounds_return_weekly_count(tmp_path):
+    path = _ledger(tmp_path)
+
+    found = search_evidence(
+        path, {"counts": "count_only"}, frozenset({"counts"}),
+        _query("", person="alice", start="2026-09-01T00:00:00Z",
+               end="2026-09-08T00:00:00Z"),
+    )
+
+    assert [item.text for item in found] == [
+        "7 commits by alice for week starting 2026-09-01",
+    ]
+
+
 def test_search_has_an_independent_sql_deadline(tmp_path, monkeypatch):
     path = _ledger(tmp_path)
     calls = 0
@@ -478,6 +570,35 @@ def test_thread_freshness_lookup_respects_end_and_person_filters(tmp_path):
     assert [item.text for item in found] == [
         "[#330] Assistant deployment failure under review",
     ]
+
+
+def test_thread_freshness_uses_real_instants_for_mixed_offset_day_bounds(tmp_path):
+    path = _ledger(tmp_path)
+    parent = "https://gitlab.example/group/project/-/issues/331"
+    conn = open_db(path)
+    insert_events(conn, [
+        Event(
+            person="alex", project="agent-assistant", ts="2026-09-15T20:30:00Z",
+            source="gitlab", kind="comment",
+            summary="[#331] Deployment failure under review",
+            refs=json.dumps({"url": parent + "#note_100"}), raw=None, hash="offset-old-thread",
+        ),
+        Event(
+            person="alex", project="agent-assistant", ts="2026-09-17T02:00:00+08:00",
+            source="gitlab", kind="comment", summary="[#331] Verified fixed",
+            refs=json.dumps({"url": parent + "#note_200"}), raw=None, hash="offset-new-thread",
+        ),
+    ])
+    conn.close()
+
+    found = search_evidence(
+        path, {"agent-assistant": "detail"}, frozenset({"agent-assistant"}),
+        _query("deployment failure", person="alex",
+               start="2026-09-16T00:00:00+04:00", end="2026-09-17T00:00:00+04:00"),
+        limit=1,
+    )
+
+    assert [item.text for item in found] == ["[#331] Verified fixed"]
 
 
 def test_thread_freshness_never_crosses_project_scope(tmp_path):

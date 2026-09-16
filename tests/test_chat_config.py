@@ -46,6 +46,33 @@ def test_loads_complete_disabled_luna_config(tmp_path):
     assert config.model["store"] is False
     assert config.attachments["max_file_bytes"] == 31_457_280
     assert config.paths["chat_db"].name == "chat.sqlite3"
+    assert config.context == {"timezone": "UTC", "user_people": {}}
+
+
+def test_loads_optional_directory_context(tmp_path):
+    config = load_chat_config(_write(
+        tmp_path,
+        lambda doc: doc.update(context={
+            "timezone": "Asia/Dubai",
+            "user_people": {"ou_exampleuser123": "alex"},
+        }),
+    ))
+
+    assert config.context == {
+        "timezone": "Asia/Dubai",
+        "user_people": {"ou_exampleuser123": "alex"},
+    }
+
+
+@pytest.mark.parametrize("context", [
+    {"timezone": "Mars/Olympus", "user_people": {}},
+    {"timezone": "UTC", "user_people": {"display name": "alex"}},
+    {"timezone": "UTC", "user_people": {"ou_exampleuser123": ""}},
+    {"timezone": "UTC", "user_people": {}, "guess_from_name": True},
+])
+def test_rejects_unsafe_directory_context(tmp_path, context):
+    with pytest.raises(ChatConfigError):
+        load_chat_config(_write(tmp_path, lambda doc: doc.update(context=context)))
 
 
 @pytest.mark.parametrize(
@@ -108,6 +135,20 @@ def test_accepts_codex_cli_provider_without_changing_model_limits(tmp_path):
     assert config.model["provider"] == "codex_cli"
 
 
+def test_accepts_24000_input_tokens_but_rejects_more(tmp_path):
+    config = load_chat_config(_write(
+        tmp_path,
+        lambda doc: doc["model"].update(max_input_tokens=24_000),
+    ))
+    assert config.model["max_input_tokens"] == 24_000
+
+    with pytest.raises(ChatConfigError):
+        load_chat_config(_write(
+            tmp_path,
+            lambda doc: doc["model"].update(max_input_tokens=24_001),
+        ))
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -141,3 +182,13 @@ def test_accepts_explicit_group_administrators_separate_from_project_grants(tmp_
     ))
 
     assert config.access["group_admins"] == {"group-chat": ["new-app-user"]}
+
+
+def test_rejects_reserved_policy_dependency_as_project_grant(tmp_path):
+    with pytest.raises(ChatConfigError, match="project lists"):
+        load_chat_config(_write(
+            tmp_path,
+            lambda doc: doc["access"].update(users={
+                "ou_exampleuser123": ["\x00teammem-policy-v1:collision"],
+            }),
+        ))

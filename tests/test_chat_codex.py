@@ -75,6 +75,41 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':2,'output_toke
     assert "Released [E1]" in result and evidence == [found] and queries == ["release"]
 
 
+def test_structured_search_round_trips_through_codex_envelope(tmp_path):
+    action = {"action":"search", "query":"", "person":"alex", "project":"alpha",
+              "start":"2026-09-16T00:00:00+04:00", "end":"2026-09-17T00:00:00+04:00",
+              "text":""}
+    cli = fake_cli(tmp_path, success(action))
+
+    result = CodexTransport(cli)(payload(), deadline=time.monotonic()+5)
+
+    arguments = json.loads(result["output"][0]["arguments"])
+    assert arguments == {"query":"", "person":"alex", "project":"alpha",
+                         "start":"2026-09-16T00:00:00+04:00", "end":"2026-09-17T00:00:00+04:00"}
+
+
+def test_codex_schema_requires_nullable_structured_search_fields(tmp_path):
+    capture = tmp_path / "schema.json"
+    extra = f"""schema=Path(args[args.index('--output-schema')+1])
+Path({str(capture)!r}).write_text(schema.read_text())"""
+    CodexTransport(fake_cli(tmp_path, success(extra=extra)))(payload(), deadline=time.monotonic()+5)
+
+    schema = json.loads(capture.read_text())
+    assert schema["required"] == ["action", "query", "person", "project", "start", "end", "text"]
+    assert schema["properties"]["project"]["type"] == ["string", "null"]
+
+
+@pytest.mark.parametrize("start,end", [
+    ("not-a-date", None),
+    ("2026-09-17T00:00:00Z", "2026-09-16T00:00:00Z"),
+])
+def test_structured_search_rejects_invalid_date_bounds(tmp_path, start, end):
+    action = {"action":"search", "query":"release", "person":None, "project":None,
+              "start":start, "end":end, "text":""}
+    with pytest.raises(ModelError):
+        CodexTransport(fake_cli(tmp_path, success(action)))(payload(), deadline=time.monotonic()+5)
+
+
 def test_cli_preserves_inherited_file_limit_for_shared_auth_and_state(tmp_path):
     capture = tmp_path / "file-limit.json"
     extra = f"import resource\nPath({str(capture)!r}).write_text(json.dumps(resource.getrlimit(resource.RLIMIT_FSIZE)))"
@@ -102,6 +137,9 @@ Path({str(capture)!r}).write_text(json.dumps({{'policy':policy,'input':json.load
     assert 'list content' in seen["policy"] and 'file evidence' in seen["policy"]
     assert 'Speaker <id>:' in seen["policy"] and 'attribution metadata' in ' '.join(seen["policy"].split())
     assert 'short topic fragments' in seen["policy"]
+    normalized = ' '.join(seen["policy"].split())
+    assert 'Across action=search retries' in normalized
+    assert 'For action=answer, set query="" and person, project, start, and end to null' in normalized
 
 
 @pytest.mark.parametrize("action", [
@@ -110,6 +148,11 @@ Path({str(capture)!r}).write_text(json.dumps({{'policy':policy,'input':json.load
     {"action":"shell","query":"cat secret","text":""},
     {"action":"answer","query":"unexpected","text":"hello"},
     {"action":"answer","query":"","text":""},
+    {"action":"search","query":"","person":None,"project":None,"start":None,"end":None,"text":""},
+    {"action":"search","query":"release","person":7,"project":None,"start":None,"end":None,"text":""},
+    {"action":"search","query":"release","person":None,"project":None,"start":None,"end":None,"text":"","sql":"SELECT 1"},
+    {"action":"search","query":"release","person":None,"project":None,"start":"not-a-date","end":None,"text":""},
+    {"action":"search","query":"release","person":None,"project":None,"start":"2026-09-17T00:00:00Z","end":"2026-09-16T00:00:00Z","text":""},
 ])
 def test_invalid_or_disallowed_actions_fail_closed(tmp_path, action):
     transport = CodexTransport(fake_cli(tmp_path, success(action)))

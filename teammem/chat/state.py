@@ -32,6 +32,7 @@ class Evidence:
     timestamp: str
     text: str
     url: str | None
+    person: str | None = None
 
 
 @dataclass(frozen=True)

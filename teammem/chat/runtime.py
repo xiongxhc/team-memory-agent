@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -260,8 +261,20 @@ def build_service(config_path, *, client=None, transport=None, parser=None):
     import yaml
     from .access import AccessDenied, authorize, project_policy_from_source_config
     from .attachments import AttachmentStore
+    from .context import (
+        POLICY_DEPENDENCY_PREFIX,
+        bind_policy_dependencies,
+        build_team_context,
+        policy_dependency,
+        resolve_directory_alias,
+    )
     from .feishu import FeishuClient
-    from .model import answer
+    from .model import (
+        ModelError,
+        answer,
+        team_context_input_budget,
+        team_context_input_cost,
+    )
     from .retrieval import search_evidence
     from .service import ChatService
     from .state import ChatState
@@ -274,24 +287,103 @@ def build_service(config_path, *, client=None, transport=None, parser=None):
     client = client or FeishuClient(credentials['TEAMMEM_CHAT_FEISHU_APP_ID'], credentials['TEAMMEM_CHAT_FEISHU_APP_SECRET'])
     transport = transport or create_transport(config.model, credentials)
 
+    def source_config(current):
+        try:
+            source = yaml.safe_load((current.paths['source_config_dir']/'projects.yaml').read_text()) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise ModelError('The team directory could not be loaded safely.') from exc
+        if not isinstance(source, Mapping):
+            raise ModelError('The team directory could not be loaded safely.')
+        return source
+
     def authorize_current(_config, key, sender):
         current = load_chat_config(config_path)
         if not current.enabled or key.tenant != current.feishu['tenant_key'] or key.app != current.feishu['app_id']:
             raise AccessDenied('Chat access is disabled.')
-        return authorize(current, key, sender)
+        granted = authorize(current, key, sender)
+        try:
+            return bind_policy_dependencies(source_config(current), granted)
+        except ModelError as exc:
+            raise AccessDenied('Chat access is disabled.') from exc
 
     def search_factory(key, sender, admitted):
+        def strict_scope(policy, values):
+            result = set()
+            for project in values:
+                if project.startswith(POLICY_DEPENDENCY_PREFIX):
+                    continue
+                mode = policy.get(project)
+                if mode in {'detail','count_only'}:
+                    token = policy_dependency(project, mode)
+                    if token in values:
+                        result.update((project, token))
+            return frozenset(result)
+
         def search(query):
-            allowed = authorize_current(config,key,sender) & admitted
-            source = yaml.safe_load((config.paths['source_config_dir']/'projects.yaml').read_text())
+            current = load_chat_config(config_path)
+            allowed = authorize_current(current,key,sender) & admitted
+            source = source_config(current)
             policy = project_policy_from_source_config(source)
-            return search_evidence(config.paths['ledger_db'], policy, allowed, {'text':query[:400]},
-                limit=config.retrieval['max_snippets'])
+            allowed = strict_scope(policy, allowed)
+            if isinstance(query, str):
+                structured = {'text':query[:400]}
+            elif isinstance(query, Mapping):
+                unknown = set(query) - {'text','query','person','project','start','end'}
+                if unknown:
+                    raise ModelError('The structured search request is invalid.')
+                text = query.get('text', query.get('query', ''))
+                if not isinstance(text, str):
+                    raise ModelError('The structured search request is invalid.')
+                structured = {'text':text[:400]}
+                for name in ('start','end'):
+                    value = query.get(name)
+                    if value is not None:
+                        if not isinstance(value, str):
+                            raise ModelError('The structured search request is invalid.')
+                        structured[name] = value
+                directory_query = " ".join(
+                    value for value in (text, query.get('person'), query.get('project'))
+                    if isinstance(value, str) and value.strip()
+                )
+                directory = context_factory(
+                    config=current, authorization=allowed,
+                    requester_id=sender, query=directory_query,
+                )
+                for name in ('person','project'):
+                    value = query.get(name)
+                    if value is not None:
+                        if not isinstance(value, str) or len(value) > 200:
+                            raise ModelError('The structured search request is invalid.')
+                        structured[name] = resolve_directory_alias(directory, name, value)
+                if 'project' in structured:
+                    allowed = frozenset({structured['project']})
+            else:
+                raise ModelError('The structured search request is invalid.')
+            current = load_chat_config(config_path)
+            source = source_config(current)
+            policy = project_policy_from_source_config(source)
+            allowed = strict_scope(policy, authorize_current(current,key,sender) & admitted)
+            raw_allowed = frozenset(project for project in allowed if not project.startswith(POLICY_DEPENDENCY_PREFIX))
+            if 'project' in structured:
+                raw_allowed &= frozenset({structured['project']})
+            return search_evidence(current.paths['ledger_db'], policy, raw_allowed, structured,
+                limit=current.retrieval['max_snippets'])
         return search
+
+    def context_factory(*, config, authorization, requester_id, query):
+        budget = min(8000, team_context_input_budget(
+            config, sender=requester_id, text=query,
+        ))
+        return build_team_context(
+            config, authorization, requester_id=requester_id, query=query,
+            max_bytes=budget, measure_bytes=team_context_input_cost,
+            require_policy_dependencies=True,
+        )
 
     prepare = AttachmentPreparer(config,state,store,client,authorize_current=authorize_current,parser=parser)
     service = ChatService(state,config,answer,client.send_reply,authorize_fn=authorize_current,
-        invalidate_session=store.invalidate_session,search_factory=search_factory,transport=transport,
+        invalidate_session=store.invalidate_session,search_factory=search_factory,
+        context_factory=context_factory,transport=transport,
         prepare_attachments=prepare, config_loader=lambda: load_chat_config(config_path),
         add_reaction=client.create_reaction, remove_reaction=client.delete_reaction)
     return service, store, client

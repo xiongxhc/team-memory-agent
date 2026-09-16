@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class ChatConfigError(ValueError):
@@ -24,6 +25,7 @@ class ChatConfig:
     attachments: Mapping[str, Any]
     access: Mapping[str, Any]
     paths: Mapping[str, Path]
+    context: Mapping[str, Any] | None = None
 
 
 _TOP = frozenset({"schema_version", "enabled", "feishu", "model", "session", "retrieval", "attachments", "access", "paths"})
@@ -113,7 +115,7 @@ def _validate_model(value: dict[str, Any]) -> Mapping[str, Any]:
     _string(value["name"], "model.name")
     if value["reasoning_effort"] not in {"low", "medium", "high"} or value["store"] is not False or value["automatic_escalation"] is not False:
         raise ChatConfigError("chat model privacy and reasoning policy is invalid")
-    for name, maximum in {"max_output_tokens": 1200, "max_input_tokens": 12000, "max_requests_per_message": 3, "max_retrieval_rounds": 2}.items():
+    for name, maximum in {"max_output_tokens": 1200, "max_input_tokens": 24000, "max_requests_per_message": 3, "max_retrieval_rounds": 2}.items():
         _integer(value[name], f"model.{name}", maximum=maximum)
     return _frozen_mapping(value)
 
@@ -167,7 +169,7 @@ def _validate_access(value: dict[str, Any]) -> Mapping[str, Any]:
         raise ChatConfigError("access.default must deny")
     for name in ("users", "groups", "group_admins"):
         entries = value[name]
-        if not isinstance(entries, dict) or any(not isinstance(identifier, str) or not isinstance(projects, list) or any(not isinstance(project, str) or not project for project in projects) for identifier, projects in entries.items()):
+        if not isinstance(entries, dict) or any(not isinstance(identifier, str) or not isinstance(projects, list) or any(not isinstance(project, str) or not project or project.startswith("\x00teammem-policy-v1:") for project in projects) for identifier, projects in entries.items()):
             raise ChatConfigError(f"access.{name} must map IDs to project lists")
     return _frozen_mapping(value)
 
@@ -184,6 +186,29 @@ def _validate_paths(value: dict[str, Any]) -> Mapping[str, Path]:
     return MappingProxyType(paths)
 
 
+def _validate_context(value: dict[str, Any]) -> Mapping[str, Any]:
+    _keys(value, frozenset({"timezone", "user_people"}), "context")
+    timezone_name = _string(value["timezone"], "context.timezone")
+    if timezone_name != "UTC":
+        try:
+            ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ChatConfigError("context.timezone is unknown") from exc
+    people = _object(value["user_people"], "context.user_people")
+    if any(
+        not isinstance(identifier, str)
+        or not _OPEN_ID.fullmatch(identifier)
+        or not isinstance(slug, str)
+        or not slug.strip()
+        for identifier, slug in people.items()
+    ):
+        raise ChatConfigError("context.user_people must map app-scoped open IDs to roster slugs")
+    return MappingProxyType({
+        "timezone": timezone_name,
+        "user_people": MappingProxyType(people.copy()),
+    })
+
+
 def load_chat_config(path: Path) -> ChatConfig:
     """Load a complete version-one chat JSON document without reading secrets."""
     try:
@@ -191,7 +216,12 @@ def load_chat_config(path: Path) -> ChatConfig:
     except (OSError, json.JSONDecodeError) as exc:
         raise ChatConfigError(f"cannot read chat config: {exc}") from exc
     document = _object(document, "chat config")
-    _keys(document, _TOP, "chat config")
+    unknown = set(document) - (_TOP | {"context"})
+    missing = _TOP - set(document)
+    if unknown:
+        raise ChatConfigError(f"chat config has unknown keys: {', '.join(sorted(unknown))}")
+    if missing:
+        raise ChatConfigError(f"chat config is missing keys: {', '.join(sorted(missing))}")
     if document["schema_version"] != 1 or isinstance(document["schema_version"], bool):
         raise ChatConfigError("unsupported chat schema_version")
     enabled = _boolean(document["enabled"], "enabled")
@@ -206,4 +236,7 @@ def load_chat_config(path: Path) -> ChatConfig:
         attachments=_validate_attachments(sections["attachments"]),
         access=_validate_access(sections["access"]),
         paths=_validate_paths(sections["paths"]),
+        context=(MappingProxyType({"timezone": "UTC", "user_people": MappingProxyType({})})
+                 if "context" not in document
+                 else _validate_context(_object(document["context"], "context"))),
     )

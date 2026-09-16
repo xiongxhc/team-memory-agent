@@ -1,9 +1,11 @@
 import asyncio
 import json
+import threading
 
+from teammem.chat.context import policy_dependency
 from teammem.chat.feishu import normalize_event, session_key
 from teammem.chat.service import ChatService
-from teammem.chat.state import ChatState, Evidence
+from teammem.chat.state import ChatState, Evidence, Turn
 
 
 def _event(**changes):
@@ -27,6 +29,144 @@ def test_duplicate_dm_event_makes_one_model_call_and_replies_to_original_chat(tm
 
     assert len(calls) == 1
     assert [(chat, message, text) for chat, message, _, text in sent] == [("dm-chat", "m1", "answer")]
+
+
+def test_context_factory_runs_off_loop_and_passes_only_public_context(tmp_path):
+    loop_thread = threading.get_ident()
+    seen = {}
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": ["alpha"]}, "groups": {}, "group_admins": {}}}
+    token = policy_dependency("alpha", "detail")
+    def context_factory(**kwargs):
+        seen["thread"] = threading.get_ident()
+        seen["factory"] = kwargs
+        return {
+            "requester": {"slug": "alex", "name": "Alex", "aliases": []},
+            "people": [], "projects": [], "clock": {}, "truncated": False,
+            "_project_dependencies": ["alpha", token],
+        }
+    def model(*args, **kwargs):
+        seen["model_context"] = kwargs["team_context"]
+        return "answer", []
+    service = ChatService(
+        ChatState(tmp_path / "chat.db"), config, model, lambda *a, **k: "sent",
+        authorize_fn=lambda *_: frozenset({"alpha", token}), context_factory=context_factory,
+    )
+
+    asyncio.run(service.handle(_event()))
+
+    assert seen["thread"] != loop_thread
+    assert seen["factory"]["requester_id"] == "alice"
+    assert seen["factory"]["query"] == "hello"
+    assert seen["model_context"] == {
+        "requester": {"slug": "alex", "name": "Alex", "aliases": []},
+        "people": [], "projects": [], "clock": {}, "truncated": False,
+    }
+
+
+def test_legacy_model_call_does_not_receive_team_context_keyword(tmp_path):
+    seen = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    def model(*args, **kwargs):
+        seen.append(kwargs)
+        return "answer", []
+
+    asyncio.run(ChatService(
+        ChatState(tmp_path / "chat.db"), config, model, lambda *a, **k: "sent",
+    ).handle(_event()))
+
+    assert "team_context" not in seen[0]
+
+
+def test_context_only_answer_is_suppressed_when_grant_changes_during_model_call(tmp_path):
+    token = policy_dependency("alpha", "detail")
+    allowed = {"value": frozenset({"alpha", token})}
+    sent = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": ["alpha"]}, "groups": {}, "group_admins": {}}}
+    def model(*args, **kwargs):
+        allowed["value"] = frozenset()
+        return "directory answer", []
+    context = {"requester": None, "people": [], "projects": [], "clock": {}, "truncated": False,
+               "_project_dependencies": ["alpha", token]}
+    service = ChatService(
+        ChatState(tmp_path / "chat.db"), config, model,
+        lambda *a, **k: sent.append(1) or "sent",
+        authorize_fn=lambda *_: allowed["value"], context_factory=lambda **_: context,
+    )
+    event = _event()
+
+    asyncio.run(service.handle(event))
+
+    assert sent == []
+    assert service.state.pending_replies() == []
+    assert [turn.text for turn in service.state.history(session_key(event), frozenset())] == ["hello"]
+
+
+def test_context_only_answer_is_suppressed_when_projection_tightens_during_model_call(tmp_path):
+    detail = policy_dependency("alpha", "detail")
+    count = policy_dependency("alpha", "count_only")
+    allowed = {"value": frozenset({"alpha", detail})}
+    sent = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": ["alpha"]}, "groups": {}, "group_admins": {}}}
+    def model(*args, **kwargs):
+        allowed["value"] = frozenset({"alpha", count})
+        return "detailed directory answer", []
+    context = {"requester": None, "people": [], "projects": [], "clock": {}, "truncated": False,
+               "_project_dependencies": ["alpha", detail]}
+    service = ChatService(
+        ChatState(tmp_path / "chat.db"), config, model,
+        lambda *a, **k: sent.append(1) or "sent",
+        authorize_fn=lambda *_: allowed["value"], context_factory=lambda **_: context,
+    )
+
+    asyncio.run(service.handle(_event()))
+
+    assert sent == []
+    assert service.state.pending_replies() == []
+
+
+def test_context_enabled_service_quarantines_legacy_unbound_outbox_reply(tmp_path):
+    state = ChatState(tmp_path / "chat.db")
+    event = _event()
+    key = session_key(event)
+    state.record_incoming(key, "legacy", "alice", "old question", chat_id="dm-chat", projects=frozenset({"alpha"}))
+    state.start_incoming(key, "legacy")
+    state.queue_reply(key, "legacy", "00000000-0000-0000-0000-000000000009", "old detailed answer", frozenset({"alpha"}), generation=0)
+    sent = []
+    detail = policy_dependency("alpha", "detail")
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": ["alpha"]}, "groups": {}, "group_admins": {}}}
+    service = ChatService(
+        state, config, lambda *a, **k: ("unused", []), lambda *a, **k: sent.append(1),
+        authorize_fn=lambda *_: frozenset({"alpha", detail}),
+        context_factory=lambda **_: {},
+    )
+
+    asyncio.run(service.flush_outbox())
+
+    assert sent == []
+    assert state.pending_replies() == []
+
+
+def test_context_enabled_service_omits_legacy_unbound_project_history(tmp_path):
+    token = policy_dependency("alpha", "detail")
+    state = ChatState(tmp_path / "chat.db")
+    key = session_key(_event())
+    state.append(key, Turn("user", "alice", "old question", frozenset()))
+    state.append(key, Turn("assistant", "bot", "old detailed answer", frozenset({"alpha"})))
+    histories = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": ["alpha"]}, "groups": {}, "group_admins": {}}}
+    def model(_config, history, *_args, **_kwargs):
+        histories.append(history)
+        return "new answer", []
+    context = {"requester": None, "people": [], "projects": [], "clock": {}, "truncated": False,
+               "_project_dependencies": ["alpha", token]}
+    service = ChatService(
+        state, config, model, lambda *a, **k: "sent",
+        authorize_fn=lambda *_: frozenset({"alpha", token}), context_factory=lambda **_: context,
+    )
+
+    asyncio.run(service.handle(_event()))
+
+    assert [turn.text for turn in histories[0]] == ["old question", "hello"]
 
 
 def test_group_without_exact_bot_mention_never_calls_model(tmp_path):
