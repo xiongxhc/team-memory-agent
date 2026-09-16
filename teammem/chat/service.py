@@ -195,7 +195,7 @@ class ChatService:
                 model_kwargs = {
                     "attachments": attachments,
                     "cancel_event": cancelled,
-                    "deadline": time.monotonic() + 45,
+                    "deadline": time.monotonic() + 90,
                 }
                 if team_context is not None:
                     model_kwargs["team_context"] = public_team_context(team_context)

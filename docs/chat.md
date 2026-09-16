@@ -33,6 +33,12 @@ when its exact text and synthesis input match the ledger and every contributing
 project remains authorized for detailed access. Hidden, count-only and
 unclassified evidence is never upgraded to prose through the vault.
 
+Replies adapt to the question: simple updates stay brief; architecture explanations
+include the necessary components, interactions, boundaries, and evidence. There is
+no fixed word target. Short paragraphs, compact labels, and bullets keep longer
+answers readable in Feishu. `model.max_output_tokens` supports up to 3000; it is
+an allowance, not an instruction to fill the entire response.
+
 ## Conversation behavior
 
 | Conversation | Context | Trigger |
@@ -119,10 +125,11 @@ Choose one explicit `model.provider`:
 - `openai_responses`: requires `OPENAI_API_KEY` in the dedicated env file and uses
   streaming Responses requests with `store=false`.
 
-Both routes use the privately configured model, a shared 45-second model deadline,
+Both routes use the privately configured model, a shared 90-second model deadline,
 at most three requests and two read-only retrieval rounds. There is no provider or
 model fallback. Codex requests the configured output-token budget and separately
-enforces a final UTF-8 byte cap of four times that setting (at most 4,800 bytes).
+enforces a UTF-8 cap on model answer text of four times that setting (at most
+12,000 bytes), before the application appends citation links.
 This is a response-size bound, not an exact token count or a reasoning-token cap.
 The API route enforces its requested output-token limit. Codex ephemeral
 execution prevents local session rollouts; it does not promise zero provider retention.
@@ -202,8 +209,11 @@ Names are data, not instructions, access grants, roles or ownership claims.
 Ambiguous retained aliases are marked so the model asks for clarification. The
 directory is capped at 8 KB and shrinks to fit the configured input allowance;
 query-mentioned entries are prioritized when it is truncated. Deployments with
-larger directories can set `model.max_input_tokens` to 24000. This is a conservative
+larger directories and multi-round searches can set `model.max_input_tokens` to 64000. This is a conservative
 serialized-input allowance, not a promise to consume that many model tokens.
+Retrieval packing includes the full serialized tool envelope and escaping, skips
+repeated evidence, and evicts older conversation or complete tool rounds when
+needed while preserving the latest question and directory context.
 
 Search can filter by person, project and time bounds. This supports questions about
 a teammate's activity or the requester's current local day without requiring their

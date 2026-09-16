@@ -117,7 +117,7 @@ def _validate_model(value: dict[str, Any]) -> Mapping[str, Any]:
     _string(value["name"], "model.name")
     if value["reasoning_effort"] not in {"low", "medium", "high"} or value["store"] is not False or value["automatic_escalation"] is not False:
         raise ChatConfigError("chat model privacy and reasoning policy is invalid")
-    for name, maximum in {"max_output_tokens": 1200, "max_input_tokens": 24000, "max_requests_per_message": 3, "max_retrieval_rounds": 2}.items():
+    for name, maximum in {"max_output_tokens": 3000, "max_input_tokens": 64000, "max_requests_per_message": 3, "max_retrieval_rounds": 2}.items():
         _integer(value[name], f"model.{name}", maximum=maximum)
     return _frozen_mapping(value)
 

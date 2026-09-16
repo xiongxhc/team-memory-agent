@@ -66,6 +66,21 @@ def test_private_model_and_only_search_tool():
     assert "previous_response_id" not in payload
 
 
+def test_answer_allows_configured_3000_output_tokens_and_caps_larger_values():
+    configured = {**CONFIG, "max_output_tokens": 3000}
+    transport = Transport(completed("Detailed answer."))
+
+    answer(configured, [Turn("user", "alice", "Explain it", frozenset())],
+           lambda _query: [], transport)
+
+    assert transport.payloads[0]["max_output_tokens"] == 3000
+
+    capped = Transport(completed("Capped answer."))
+    answer({**configured, "max_output_tokens": 9000},
+           [Turn("user", "alice", "Explain it", frozenset())], lambda _query: [], capped)
+    assert capped.payloads[0]["max_output_tokens"] == 3000
+
+
 def test_casual_chat_needs_no_retrieval_and_preserves_sender():
     transport = Transport(completed("你好！"))
     def search(query):
@@ -207,12 +222,118 @@ def test_24000_context_ceiling_keeps_full_directory_and_retrieval_loop():
         }
 
 
-def test_model_context_budget_is_hard_capped_at_24000():
-    assert chat_model.team_context_input_budget(
+def test_two_round_retrieval_packs_true_serialized_requests_with_quoted_chinese_evidence():
+    limit = 24_000
+    config = {**CONFIG, "max_input_tokens": limit}
+    escaped_text = '中"\n' * 450
+    searches = iter([
+        [Evidence("first", "wajib-2", "2026-09-15", escaped_text, None, "avery")],
+        [Evidence("second", "wajib-2", "2026-09-16", escaped_text, None, "avery")],
+    ])
+    responses = iter([
+        {"status": "completed", "output": [
+            {"type": "reasoning", "encrypted_content": "r1" * 700},
+            {"type": "function_call", "name": "search_teammem",
+             "arguments": '{"query":"WAJIB 2","person":null,"project":null,'
+                          '"start":null,"end":null}', "call_id": "call_1"},
+        ]},
+        {"status": "completed", "output": [
+            {"type": "reasoning", "encrypted_content": "r2" * 700},
+            {"type": "function_call", "name": "search_teammem",
+             "arguments": '{"query":"阶段二","person":null,"project":null,'
+                          '"start":null,"end":null}', "call_id": "call_2"},
+        ]},
+        completed("结论\n\nWAJIB 2 已完成两个阶段。[E1] [E2]"),
+    ])
+
+    class BudgetGuardTransport:
+        def __init__(self):
+            self.payloads = []
+
+        def __call__(self, payload, *, deadline, cancel_event):
+            actual = (chat_model._input_cost(payload["input"])
+                      + chat_model._bytes(payload["instructions"])
+                      + chat_model._bytes(payload["tools"][0]) + 256)
+            assert actual <= limit
+            self.payloads.append(json.loads(json.dumps(payload, ensure_ascii=False)))
+            return next(responses)
+
+    transport = BudgetGuardTransport()
+    text, used = answer(
+        config,
+        [Turn("assistant", "bot", "旧上下文：" + "x" * 7000, frozenset()),
+         Turn("user", "avery", "请详细说明 WAJIB 2 的两个阶段。", frozenset({"wajib-2"}))],
+        lambda _query: next(searches),
+        transport,
+    )
+
+    assert len(transport.payloads) == 3
+    assert "[E1]" in text and "[E2]" in text
+    assert [evidence.id for evidence in used] == ["first", "second"]
+    for payload in transport.payloads[1:]:
+        calls = {item["call_id"] for item in payload["input"]
+                 if item.get("type") == "function_call"}
+        results = {item["call_id"] for item in payload["input"]
+                   if item.get("type") == "function_call_output"}
+        assert calls == results
+
+
+def test_repeated_evidence_is_not_supplied_twice_across_retrieval_rounds():
+    evidence = Evidence("same", "alpha", "2026-09-16", "Verified once", None, "avery")
+    transport = Transport(
+        function('{"query":"first"}'),
+        {"status": "completed", "output": [{"type": "function_call",
+         "name": "search_teammem", "arguments": '{"query":"second"}',
+         "call_id": "call_2"}]},
+        completed("Verified [E1]."),
+    )
+
+    _, used = answer(CONFIG, [Turn("user", "avery", "Verify it", frozenset())],
+                     lambda _query: [evidence], transport)
+
+    assert used == [evidence]
+    second_result = json.loads(transport.payloads[2]["input"][-1]["output"])
+    assert second_result["untrusted_evidence"] == []
+
+
+def test_evicted_tool_round_deactivates_its_citation_labels():
+    evidence = Evidence("same", "alpha", "2026-09-16", "Verified once", None, "avery")
+    transport = Transport(
+        function('{"query":"first"}'),
+        {"status": "completed", "output": [
+            {"type": "reasoning", "encrypted_content": "r" * 2200},
+            {"type": "function_call", "name": "search_teammem",
+             "arguments": '{"query":"second"}', "call_id": "call_2"},
+        ]},
+        completed("Stale citation [E1]."),
+    )
+
+    with pytest.raises(ModelError, match="source references"):
+        answer({**CONFIG, "max_input_tokens": 8000},
+               [Turn("user", "avery", "Verify it", frozenset())],
+               lambda _query: [evidence], transport)
+
+    calls = {item["call_id"] for item in transport.payloads[-1]["input"]
+             if item.get("type") == "function_call"}
+    results = {item["call_id"] for item in transport.payloads[-1]["input"]
+               if item.get("type") == "function_call_output"}
+    assert calls == results == {"call_2"}
+    active_result = json.loads(transport.payloads[-1]["input"][-1]["output"])
+    assert [item["citation"] for item in active_result["untrusted_evidence"]] == ["E2"]
+
+
+def test_model_context_budget_is_hard_capped_at_64000():
+    capped = chat_model.team_context_input_budget(
         {**CONFIG, "max_input_tokens": 100_000}, sender="avery", text="hello",
-    ) == chat_model.team_context_input_budget(
+    )
+    expanded = chat_model.team_context_input_budget(
+        {**CONFIG, "max_input_tokens": 64_000}, sender="avery", text="hello",
+    )
+    old_limit = chat_model.team_context_input_budget(
         {**CONFIG, "max_input_tokens": 24_000}, sender="avery", text="hello",
     )
+    assert capped == expanded
+    assert expanded > old_limit
 
 
 def test_query_only_search_keeps_legacy_string_callback():
