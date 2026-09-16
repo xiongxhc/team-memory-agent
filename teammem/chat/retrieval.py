@@ -6,7 +6,7 @@ import sqlite3
 import time
 import unicodedata
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -22,7 +22,7 @@ _MAX_CANDIDATES = 128
 _MAX_QUERY_TOKENS = 24
 _MAX_RAW_SEARCH_TEXT = 32_768
 _SEARCH_TIMEOUT_SECONDS = 5.0
-_QUERY_KEYS = frozenset({"text", "start", "end", "person"})
+_QUERY_KEYS = frozenset({"text", "start", "end", "person", "project"})
 _WORDS = re.compile(r"[^\W_]+", re.UNICODE)
 _ORDINAL = re.compile(r"^(\d{1,2})(?:st|nd|rd|th)$")
 _STOP_WORDS = frozenset({
@@ -58,32 +58,47 @@ def open_ledger_readonly(db_path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def _timestamp(value: Any, name: str) -> str | None:
+def _timestamp(value: Any, name: str) -> tuple[str | None, datetime | None]:
     if value is None:
-        return None
+        return None, None
     if not isinstance(value, str) or len(value) > 40:
         raise ValueError(f"query {name} must be an ISO timestamp")
     try:
-        datetime.fromisoformat(value.removesuffix("Z") + ("+00:00" if value.endswith("Z") else ""))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
         raise ValueError(f"query {name} must be an ISO timestamp") from exc
-    return value
+    if parsed.utcoffset() is None:
+        raise ValueError(f"query {name} must include a timezone offset")
+    return value, parsed
 
 
-def _query(value: Mapping[str, Any]) -> tuple[str, str | None, str | None, str | None]:
+def _query(value: Mapping[str, Any]) -> tuple[str, str | None, str | None, str | None, str | None]:
     if not isinstance(value, Mapping) or set(value) - _QUERY_KEYS or "text" not in value:
-        raise ValueError("query must contain only text, start, end, and person")
+        raise ValueError("query must contain only text, start, end, person, and project")
     text = value["text"]
-    if not isinstance(text, str) or not text.strip() or len(text) > _MAX_QUERY_TEXT:
-        raise ValueError("query text must be a bounded non-empty string")
-    start = _timestamp(value.get("start"), "start")
-    end = _timestamp(value.get("end"), "end")
-    if start is not None and end is not None and start >= end:
+    if not isinstance(text, str) or len(text) > _MAX_QUERY_TEXT:
+        raise ValueError("query text must be a bounded string")
+    start, start_at = _timestamp(value.get("start"), "start")
+    end, end_at = _timestamp(value.get("end"), "end")
+    if start_at is not None and end_at is not None and start_at >= end_at:
         raise ValueError("query start must be before end")
     person = value.get("person")
-    if person is not None and (not isinstance(person, str) or not person or len(person) > 200):
+    if person is not None and (not isinstance(person, str) or not person.strip() or len(person) > 200):
         raise ValueError("query person must be a bounded non-empty string")
-    return text.strip(), start, end, person
+    project = value.get("project")
+    if project is not None and (not isinstance(project, str) or not project.strip() or len(project) > 200):
+        raise ValueError("query project must be a bounded non-empty string")
+    text = text.strip()
+    if not text and person is None and project is None:
+        raise ValueError("an empty query requires a person or project")
+    return text, start, end, person, project
+
+
+def _instant(value: str) -> float:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _is_cjk(character: str) -> bool:
@@ -303,7 +318,7 @@ def _detail_evidence(
         return []
     tokens = _tokens(text)
     patterns = _candidate_patterns(tokens)
-    if not patterns:
+    if text and not patterns:
         return []
     rich_text = (
         "CASE "
@@ -321,29 +336,30 @@ def _detail_evidence(
         "' ' || summary || ' ' || SUBSTR(" + rich_text + f", 1, {_MAX_RAW_SEARCH_TEXT}))"
     )
     matches = [f"{search_text} LIKE ? ESCAPE '\\'" for _ in patterns]
-    clauses = [
-        f"project IN ({','.join('?' for _ in projects)})",
-        "(" + " OR ".join(matches) + ")",
-    ]
-    params: list[Any] = [*projects, *patterns]
+    clauses = [f"project IN ({','.join('?' for _ in projects)})"]
+    params: list[Any] = [*projects]
+    if matches:
+        clauses.append("(" + " OR ".join(matches) + ")")
+        params.extend(patterns)
     if start is not None:
-        clauses.append("ts >= ?")
+        clauses.append("julianday(ts) >= julianday(?)")
         params.append(start)
     if end is not None:
-        clauses.append("ts < ?")
+        clauses.append("julianday(ts) < julianday(?)")
         params.append(end)
     if person is not None:
         clauses.append("person = ?")
         params.append(person)
     relevance = " + ".join(f"CASE WHEN {search_text} LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END"
-                           for _ in patterns)
-    params.extend(patterns)
+                           for _ in patterns) or "0.0"
+    if patterns:
+        params.extend(patterns)
     params.append(_MAX_CANDIDATES)
     rows = conn.execute(
         "SELECT id, project, person, ts, source, kind, summary, refs, "
         f"SUBSTR(raw, 1, {_MAX_RAW_SEARCH_TEXT}) AS raw FROM events WHERE "
         + " AND ".join(clauses)
-        + f" ORDER BY ({relevance}) DESC, ts DESC, id DESC LIMIT ?",
+        + f" ORDER BY ({relevance}) DESC, julianday(ts) DESC, id DESC LIMIT ?",
         params,
     ).fetchall()
     ranked = []
@@ -352,12 +368,13 @@ def _detail_evidence(
         evidence = Evidence(
             id=str(row["id"]), project=row["project"], timestamp=row["ts"],
             text=_snippet(full_text, tokens, row["summary"]), url=_url(row["refs"]),
+            person=row["person"],
         )
         score = _rank(
             tokens, full_text,
             f"{row['project']} {row['person']} {row['ts']} {row['kind']}",
         )
-        if score[0]:
+        if score[0] or not tokens:
             ranked.append((score, evidence))
     return ranked
 
@@ -375,27 +392,28 @@ def _count_evidence(
         return []
     tokens = _tokens(text)
     patterns = _candidate_patterns(tokens)
-    if not patterns:
+    if text and not patterns:
         return []
     search_text = "LOWER(project || ' commits ' || person || ' ' || week_start || ' ' || commit_count)"
     matches = [f"{search_text} LIKE ? ESCAPE '\\'" for _ in patterns]
-    clauses = [
-        f"project IN ({','.join('?' for _ in projects)})",
-        "(" + " OR ".join(matches) + ")",
-    ]
-    params: list[Any] = [*projects, *patterns]
+    clauses = [f"project IN ({','.join('?' for _ in projects)})"]
+    params: list[Any] = [*projects]
+    if matches:
+        clauses.append("(" + " OR ".join(matches) + ")")
+        params.extend(patterns)
     if start is not None:
-        clauses.append("week_start >= ?")
-        params.append(start[:10])
+        clauses.append("julianday(week_start) >= julianday(?)")
+        params.append(start)
     if end is not None:
-        clauses.append("week_start < ?")
-        params.append(end[:10])
+        clauses.append("julianday(week_start, '+7 days') <= julianday(?)")
+        params.append(end)
     if person is not None:
         clauses.append("person = ?")
         params.append(person)
     relevance = " + ".join(f"CASE WHEN {search_text} LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END"
-                           for _ in patterns)
-    params.extend(patterns)
+                           for _ in patterns) or "0.0"
+    if patterns:
+        params.extend(patterns)
     params.append(_MAX_CANDIDATES)
     rows = conn.execute(
         "SELECT project, week_start, person, commit_count FROM weekly_commit_counts WHERE "
@@ -413,7 +431,7 @@ def _count_evidence(
             url=None,
         )
         score = _rank(tokens, evidence.text, row["project"])
-        if score[0]:
+        if score[0] or not tokens:
             ranked.append((score, evidence))
     return ranked
 
@@ -458,19 +476,19 @@ def _latest_resource_update(
     ]
     params: list[Any] = [evidence.project, parent.rstrip("/")]
     if start is not None:
-        clauses.append("ts >= ?")
+        clauses.append("julianday(ts) >= julianday(?)")
         params.append(start)
     if end is not None:
-        clauses.append("ts < ?")
+        clauses.append("julianday(ts) < julianday(?)")
         params.append(end)
     if person is not None:
         clauses.append("person = ?")
         params.append(person)
     row = conn.execute(
-        "SELECT id, project, ts, source, kind, summary, refs, "
+        "SELECT id, project, person, ts, source, kind, summary, refs, "
         f"SUBSTR(raw, 1, {_MAX_RAW_SEARCH_TEXT}) AS raw FROM events WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY ts DESC, id DESC LIMIT 1",
+        + " ORDER BY julianday(ts) DESC, id DESC LIMIT 1",
         params,
     ).fetchone()
     if row is None or str(row["id"]) == evidence.id:
@@ -482,7 +500,7 @@ def _latest_resource_update(
     text = _rich_event_text(row)
     return Evidence(
         id=str(row["id"]), project=row["project"], timestamp=row["ts"],
-        text=_snippet(text, (), row["summary"]), url=url,
+        text=_snippet(text, (), row["summary"]), url=url, person=row["person"],
     )
 
 
@@ -501,8 +519,11 @@ def search_evidence(
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _MAX_RESULTS:
         raise ValueError("limit must be between 1 and 8")
-    text, start, end, person = _query(query)
+    text, start, end, person, project = _query(query)
     detail_projects, count_projects = _scope(project_policy, allowed_projects)
+    if project is not None:
+        detail_projects = tuple(value for value in detail_projects if value == project)
+        count_projects = tuple(value for value in count_projects if value == project)
     if not detail_projects and not count_projects:
         return []
     with open_ledger_readonly(db_path) as conn:
@@ -514,7 +535,7 @@ def search_evidence(
         try:
             ranked = _detail_evidence(conn, detail_projects, text, start, end, person, limit)
             ranked.extend(_count_evidence(conn, count_projects, text, start, end, person, limit))
-            ranked.sort(key=lambda item: (item[0], item[1].timestamp, item[1].id), reverse=True)
+            ranked.sort(key=lambda item: (item[0], _instant(item[1].timestamp), item[1].id), reverse=True)
             selected = [evidence for _, evidence in ranked[:limit]]
             visited: dict[tuple[str, str], Evidence | None] = {}
             for index, evidence in enumerate(selected):
@@ -527,7 +548,7 @@ def search_evidence(
                         conn, evidence, parent, start, end, person,
                     )
                 latest = visited[key]
-                if latest is not None and latest.timestamp >= evidence.timestamp:
+                if latest is not None and _instant(latest.timestamp) >= _instant(evidence.timestamp):
                     selected[index] = latest
         except sqlite3.OperationalError as exc:
             if "interrupted" not in str(exc).casefold():

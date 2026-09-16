@@ -9,6 +9,7 @@ from typing import Any
 
 from .access import AccessDenied, authorize
 from .attachments import AttachmentAdmissionError
+from .context import has_policy_dependencies, public_team_context
 from .document_worker import DocumentError
 from .feishu import FeishuError, NormalizedEvent, is_own_bot_mention, session_key
 from .model import ModelError
@@ -16,10 +17,11 @@ from .state import ChatState, Turn
 
 
 class ChatService:
-    def __init__(self, state: ChatState, config: Mapping[str, Any], model: Callable[..., tuple[str, list]], send_reply: Callable[..., str], *, authorize_fn: Callable = authorize, invalidate_session: Callable | None = None, search_factory: Callable | None = None, transport: Any = None, prepare_attachments: Callable | None = None, config_loader: Callable[[], Any] | None = None, add_reaction: Callable | None = None, remove_reaction: Callable | None = None):
+    def __init__(self, state: ChatState, config: Mapping[str, Any], model: Callable[..., tuple[str, list]], send_reply: Callable[..., str], *, authorize_fn: Callable = authorize, invalidate_session: Callable | None = None, search_factory: Callable | None = None, context_factory: Callable | None = None, transport: Any = None, prepare_attachments: Callable | None = None, config_loader: Callable[[], Any] | None = None, add_reaction: Callable | None = None, remove_reaction: Callable | None = None):
         self.state, self.config, self.model, self.send_reply, self.authorize = state, config, model, send_reply, authorize_fn
         self.invalidate_session = invalidate_session
-        self.search_factory, self.transport, self.prepare_attachments = search_factory, transport, prepare_attachments
+        self.search_factory, self.context_factory = search_factory, context_factory
+        self.transport, self.prepare_attachments = transport, prepare_attachments
         self.config_loader = config_loader
         self.add_reaction, self.remove_reaction = add_reaction, remove_reaction
         self._sessions: dict[object, asyncio.Lock] = {}
@@ -110,7 +112,7 @@ class ChatService:
             if generation is not None and self.state.request_reaction(key, event.message_id, "Typing", generation=generation):
                 self._spawn_reaction(self._create_reaction(event.tenant, event.app, event.message_id))
         lock = self._sessions.setdefault(key, asyncio.Lock())
-        task = asyncio.create_task(self._process_admitted(event, key, lock))
+        task = asyncio.create_task(self._process_admitted(event, key, lock, projects))
         identity = (event.tenant, event.app, event.message_id)
         self._tasks[identity] = task
         task.add_done_callback(lambda done: self._admitted_done(identity, done))
@@ -121,16 +123,16 @@ class ChatService:
             self._tasks.pop(identity, None)
         self._request_reaction_cleanup(*identity)
 
-    async def _process_admitted(self, event, key, lock):
+    async def _process_admitted(self, event, key, lock, admitted_projects):
         async with lock:
-            await self._handle_locked(event, key)
+            await self._handle_locked(event, key, admitted_projects)
 
-    async def _handle_locked(self, event, key):
+    async def _handle_locked(self, event, key, admitted_projects):
         generation = self.state.incoming_generation(key, event.message_id)
         if generation is None:
             return
         try:
-            projects = self.authorize(self._current_config(), key, event.sender)
+            projects = self.authorize(self._current_config(), key, event.sender) & admitted_projects
         except AccessDenied:
             self.state.fail_incoming(key, event.message_id)
             self._request_reaction_cleanup(event.tenant, event.app, event.message_id)
@@ -149,7 +151,7 @@ class ChatService:
             if self.state.generation(key) != generation:
                 return
             try:
-                projects = self.authorize(self._current_config(), key, event.sender)
+                projects = self.authorize(self._current_config(), key, event.sender) & admitted_projects
             except AccessDenied:
                 self.state.fail_incoming(key, event.message_id)
                 self._request_reaction_cleanup(event.tenant, event.app, event.message_id)
@@ -161,21 +163,50 @@ class ChatService:
                 if cancelled.is_set() or self.state.generation(key) != generation:
                     return
                 try:
-                    projects = self.authorize(self._current_config(), key, event.sender)
+                    projects = self.authorize(self._current_config(), key, event.sender) & admitted_projects
                 except AccessDenied:
                     self.state.fail_incoming(key, event.message_id)
                     self._request_reaction_cleanup(event.tenant, event.app, event.message_id)
                     return
+                team_context = None
+                if self.context_factory is not None:
+                    context_config = self._current_config()
+                    team_context = await asyncio.to_thread(
+                        self.context_factory,
+                        config=context_config,
+                        authorization=projects,
+                        requester_id=event.sender,
+                        query=text,
+                    )
+                    refreshed = self.authorize(self._current_config(), key, event.sender) & admitted_projects
+                    if refreshed != projects:
+                        projects = refreshed
+                        team_context = await asyncio.to_thread(
+                            self.context_factory,
+                            config=self._current_config(),
+                            authorization=projects,
+                            requester_id=event.sender,
+                            query=text,
+                        )
                 search = (lambda *_: []) if self.search_factory is None else self.search_factory(key, event.sender, projects)
                 history = self.state.history(key, projects)
+                if self.context_factory is not None:
+                    history = [turn for turn in history if has_policy_dependencies(turn.projects)]
+                model_kwargs = {
+                    "attachments": attachments,
+                    "cancel_event": cancelled,
+                    "deadline": time.monotonic() + 45,
+                }
+                if team_context is not None:
+                    model_kwargs["team_context"] = public_team_context(team_context)
                 answer, evidence = await asyncio.to_thread(
                     self.model, self._current_config(), history, search, self.transport,
-                    attachments=attachments, cancel_event=cancelled, deadline=time.monotonic() + 45,
+                    **model_kwargs,
                 )
                 if cancelled.is_set() or self.state.generation(key) != generation:
                     return
                 try:
-                    projects = self.authorize(self._current_config(), key, event.sender)
+                    projects = self.authorize(self._current_config(), key, event.sender) & admitted_projects
                 except AccessDenied:
                     self.state.fail_incoming(key, event.message_id)
                     self._request_reaction_cleanup(event.tenant, event.app, event.message_id)
@@ -192,7 +223,12 @@ class ChatService:
                 if self._cancel.get(key) is cancelled:
                     self._cancel.pop(key, None)
         evidence_projects = frozenset(item.project for item in evidence)
-        answer_projects = evidence_projects | frozenset(project for turn in history for project in turn.projects)
+        context_projects = frozenset() if team_context is None else frozenset(team_context.get("_project_dependencies", ()))
+        answer_projects = evidence_projects | context_projects | frozenset(project for turn in history for project in turn.projects)
+        if not answer_projects.issubset(projects):
+            self.state.fail_incoming(key, event.message_id)
+            self._request_reaction_cleanup(event.tenant, event.app, event.message_id)
+            return
         reply_id = str(uuid.uuid4())
         if self.state.queue_reply(key, event.message_id, reply_id, answer, answer_projects, generation=generation):
             self.state.append(key, Turn("assistant", "bot", answer, answer_projects), generation=generation)
@@ -234,6 +270,10 @@ class ChatService:
                 self._request_reaction_cleanup(reply.session.tenant, reply.session.app, reply.message_id)
                 continue
             if not reply.projects.issubset(current):
+                self.state.quarantine_reply(reply.reply_id)
+                self._request_reaction_cleanup(reply.session.tenant, reply.session.app, reply.message_id)
+                continue
+            if self.context_factory is not None and not has_policy_dependencies(reply.projects):
                 self.state.quarantine_reply(reply.reply_id)
                 self._request_reaction_cleanup(reply.session.tenant, reply.session.app, reply.message_id)
                 continue

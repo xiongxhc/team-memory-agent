@@ -128,6 +128,47 @@ model quality or successful message/file delivery; test those separately.
 Replies use Feishu rich text. Source footers show clickable project/date labels;
 the source URL is embedded in the link instead of displayed in full.
 
+## Directory context
+
+Every request includes a bounded directory built from current access grants and
+maintained roster/project metadata, together with the configured timezone and
+current day boundaries. The conversation history is retained. Basic person/project
+identification can use that directory directly; work, progress and status claims
+still require retrieved evidence.
+
+The optional `context` configuration declares an IANA timezone and explicit
+app-scoped user-to-roster mappings:
+
+```json
+"context": {
+  "timezone": "Asia/Dubai",
+  "user_people": {"ou_exampleuser123": "alex"}
+}
+```
+
+Older configurations default to UTC and no verified requester mapping. Map identities
+using the dedicated bot application's IDs; another application's open ID is not a
+substitute. Unknown requesters remain unknown rather than being guessed from a name.
+
+Person labels and aliases come from the roster. Only people represented in permitted
+detailed activity, plus the verified requester, are eligible for the directory.
+Count-only access does not enumerate contributors. Project labels, aliases and short
+descriptions use maintained project/area metadata, falling back to canonical IDs.
+Maintained GitLab/GitHub handles may serve as name aliases. Email addresses,
+credentials and opaque platform identifiers are not directory content.
+Names are data, not instructions, access grants, roles or ownership claims.
+Ambiguous retained aliases are marked so the model asks for clarification. The
+directory is capped at 8 KB and shrinks to fit the configured input allowance;
+query-mentioned entries are prioritized when it is truncated. Deployments with
+larger directories can set `model.max_input_tokens` to 24000. This is a conservative
+serialized-input allowance, not a promise to consume that many model tokens.
+
+Search can filter by person, project and time bounds. This supports questions about
+a teammate's activity or the requester's current local day without requiring their
+name or the word “today” to appear in a message. Returned detailed evidence identifies
+its author; counts remain aggregates. Directory scope participates in grant rechecks
+and history filtering even when no search is needed.
+
 ## Team knowledge retrieval
 
 Search ranks topic keywords and phrases instead of requiring the entire question
