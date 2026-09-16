@@ -127,6 +127,12 @@ model quality or successful message/file delivery; test those separately.
 
 Replies use Feishu rich text. Source footers show clickable project/date labels;
 the source URL is embedded in the link instead of displayed in full.
+Times use the configured local timezone and minute precision, for example
+`15 Sep 2026, 18:38 UAE`. Date-only records remain dates. For historical Feishu
+messages without a stored URL, retrieval uses the provider's message AppLink or
+the stored chat ID and message position to link to the original message. Missing
+or inconsistent link metadata remains unlinked rather than pointing to a guess.
+The position-link format follows the [official Lark CLI](https://github.com/larksuite/cli/blob/2ca601ce6ba8251a563947ff69ce63652211f569/shortcuts/im/convert_lib/content_convert.go#L287-L320).
 
 ## Directory context
 

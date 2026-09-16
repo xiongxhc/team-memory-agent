@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from .state import Evidence
 
@@ -289,6 +289,30 @@ def _url(refs: str | None) -> str | None:
     return value
 
 
+def _feishu_message_url(refs: str | None, metadata: str | None) -> str | None:
+    try:
+        reference, message = json.loads(refs), json.loads(metadata)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(reference, dict) or not isinstance(message, dict) or message.get("deleted"):
+        return None
+    chat_id = reference.get("chat_id")
+    if (not isinstance(chat_id, str) or not re.fullmatch(r"oc_[A-Za-z0-9]{1,128}", chat_id)
+            or chat_id != message.get("chat_id") or not reference.get("message_id")
+            or reference["message_id"] != message.get("message_id")):
+        return None
+    supplied = _url(metadata)
+    if supplied and urlparse(supplied).netloc in {"applink.feishu.cn", "applink.larksuite.com"}:
+        return supplied
+    position = message.get("position")
+    if not isinstance(position, (str, int)) or not re.fullmatch(r"[0-9]{1,20}", str(position)):
+        return None
+    # Matches the official Lark CLI's message_app_link fallback for ordinary chats.
+    return "https://applink.feishu.cn/client/chat/open?" + urlencode({
+        "openChatId": chat_id, "position": str(position),
+    })
+
+
 def _scope(project_policy: Mapping[str, str], allowed_projects: frozenset[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
     if not isinstance(project_policy, Mapping):
         raise ValueError("project policy must be a mapping")
@@ -357,6 +381,12 @@ def _detail_evidence(
     params.append(_MAX_CANDIDATES)
     rows = conn.execute(
         "SELECT id, project, person, ts, source, kind, summary, refs, "
+        "CASE WHEN source = 'feishu-channel' AND kind = 'message' AND json_valid(raw) THEN "
+        "SUBSTR(json_object('chat_id', json_extract(raw, '$.chat_id'), "
+        "'message_id', json_extract(raw, '$.message_id'), "
+        "'position', json_extract(raw, '$.message_position'), "
+        "'deleted', json_extract(raw, '$.deleted'), "
+        "'url', json_extract(raw, '$.message_app_link')), 1, 4096) END AS link_metadata, "
         f"SUBSTR(raw, 1, {_MAX_RAW_SEARCH_TEXT}) AS raw FROM events WHERE "
         + " AND ".join(clauses)
         + f" ORDER BY ({relevance}) DESC, julianday(ts) DESC, id DESC LIMIT ?",
@@ -367,7 +397,8 @@ def _detail_evidence(
         full_text = _rich_event_text(row)
         evidence = Evidence(
             id=str(row["id"]), project=row["project"], timestamp=row["ts"],
-            text=_snippet(full_text, tokens, row["summary"]), url=_url(row["refs"]),
+            text=_snippet(full_text, tokens, row["summary"]),
+            url=_url(row["refs"]) or _feishu_message_url(row["refs"], row["link_metadata"]),
             person=row["person"],
         )
         score = _rank(

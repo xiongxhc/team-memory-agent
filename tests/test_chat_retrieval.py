@@ -69,6 +69,33 @@ def _query(text, **filters):
     return {"text": text, **filters}
 
 
+@pytest.mark.parametrize("override, source, expected", [
+    ({}, "feishu-channel", "https://applink.feishu.cn/client/chat/open?openChatId=oc_" + "a" * 32 + "&position=9537"),
+    ({"message_position": None}, "feishu-channel", None),
+    ({"message_position": "-1"}, "feishu-channel", None),
+    ({"message_position": "42&injected=1"}, "feishu-channel", None),
+    ({"message_id": "om_other"}, "feishu-channel", None),
+    ({"chat_id": "oc_other"}, "feishu-channel", None),
+    ({"deleted": True}, "feishu-channel", None),
+    ({}, "gitlab", None),
+    ({"message_app_link": "https://applink.feishu.cn/client/message/link/open?token=example"},
+     "feishu-channel", "https://applink.feishu.cn/client/message/link/open?token=example"),
+])
+def test_old_feishu_records_resolve_exact_message_links(tmp_path, override, source, expected):
+    path = _ledger(tmp_path)
+    refs = {"message_id": "om_" + "b" * 32, "chat_id": "oc_" + "a" * 32}
+    raw = {**refs, "message_position": "9537", "deleted": False, **override,
+           "body": {"content": "Long historical content " * 3000}}
+    conn = open_db(path)
+    insert_events(conn, [Event(person="alice", project="detail", ts="2026-09-15T14:38:31Z",
+        source=source, kind="message", summary="Migration reference", refs=json.dumps(refs),
+        raw=json.dumps(raw), hash="message-citation")])
+    conn.close()
+    found = search_evidence(path, {"detail": "detail"}, frozenset({"detail"}), _query("Migration reference"))
+    assert len(found) == 1
+    assert found[0].url == expected
+
+
 def test_search_filters_sql_results_to_authorized_detailed_project(tmp_path):
     """Moving the project condition after fetch would load another project's evidence."""
     path = _ledger(tmp_path)
