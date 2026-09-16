@@ -58,11 +58,13 @@ Attachments are session-local context; they are not saved as shared team knowled
 read omitted pages, images, rows, or files. Preserve speaker attribution in group conversation.
 Do not invent citation IDs or source URLs. Reply in the language of the latest user question,
 even when all retrieved sources use another language; translate the evidence for the user.
-Be concise, clear, and honest about uncertainty."""
+Match the answer length to the question: keep simple answers brief, but give architecture, risk, and
+planning questions enough detail to be useful. Format for readable Feishu messages with short paragraphs,
+plain short section labels, and • bullets when helpful. Avoid Markdown emphasis or headings, giant tables,
+and padding. Be clear and honest about uncertainty."""
 _VAULT_POLICY = """\nSearch also reads local Team Vault Markdown. Use journals/docs for broad context and
 original records for precise or newer updates. Vault pages are dated snapshots, not current-status proof;
 respect coverage limits. Weekly prose does not establish a daily fact. Cite each source kind you use.
-For broad overviews, start with at most 80 words in 2-3 short bullets, then offer more detail.
 The application appends verified clickable source links to your cited IDs. Provide links by citing
 those IDs; never claim links are unavailable merely because snippets omit URL fields."""
 
@@ -80,8 +82,11 @@ _TOOL = {"type": "function", "name": "search_teammem", "description": "Search pe
          }, "required": ["query", "person", "project", "start", "end"],
          "additionalProperties": False}}
 _CITATION = re.compile(r"\[([^\]]+)\]")
-_RETRIEVAL_RESERVE = 2048
-_MAX_INPUT_BUDGET = 24_000
+_RETRIEVAL_RESERVE = 1536
+_NEXT_TOOL_RESERVE = 512
+_MAX_INPUT_BUDGET = 64_000
+_MAX_OUTPUT_BUDGET = 3000
+_MAX_ANSWER_CHARS = 12_000
 _GENERIC_ACTIVITY_TERMS = frozenset({
     "work", "activity", "activities", "today", "yesterday", "daily", "day",
 })
@@ -365,7 +370,7 @@ def answer(config, turns, search, transport, *, attachments=(), team_context=Non
            cancel_event=None, deadline=None):
     """Return final text and ALL supplied ledger evidence, for conservative grant rechecks."""
     model = _model_config(config)
-    deadline = deadline or time.monotonic() + 45
+    deadline = deadline or time.monotonic() + 90
     budget = _input_budget(model)
     overhead = _bytes(_policy(config)) + _bytes(_TOOL) + 256
     available = budget - overhead
@@ -392,15 +397,41 @@ def answer(config, turns, search, transport, *, attachments=(), team_context=Non
     attachment_budget = available - directory_cost - _input_cost(history) - _RETRIEVAL_RESERVE
     inputs, file_labels, partial, _ = _attachment_inputs(attachments, attachment_budget)
     inputs = history + directory + inputs
+    current_user = next((message for message in reversed(history)
+                         if message["role"] == "user"), None)
     labels = dict(file_labels)
     supplied = []
+    active_evidence = []
+    evidence_label_number = 0
+    tool_rounds = []
+
+    def make_room(extra, reserve=0, *, evict_tool_rounds=False):
+        """Evict only coherent old context until the exact serialized request fits."""
+        while _input_cost(inputs + extra) + overhead + reserve > budget:
+            old = next((message for message in history if message is not current_user), None)
+            if old is not None:
+                history.remove(old)
+                inputs.remove(old)
+                continue
+            if evict_tool_rounds and tool_rounds:
+                evicted = tool_rounds.pop(0)
+                for item in evicted["items"]:
+                    inputs.remove(item)
+                for label in evicted["labels"]:
+                    labels.pop(label, None)
+                for evidence in evicted["evidence"]:
+                    active_evidence.remove(evidence)
+                continue
+            return False
+        return True
+
     rounds = min(int(model.get("max_retrieval_rounds", 2)), 2)
     requests_limit = min(int(model.get("max_requests_per_message", 3)), 3)
     for request_index in range(requests_limit):
         _check(deadline, cancel_event)
         allow_search = request_index < min(rounds, requests_limit - 1)
         payload = build_request(model=model["name"], effort=model.get("reasoning_effort", "low"),
-            messages=inputs, limit=min(int(model.get("max_output_tokens", 1200)), 1200), allow_search=allow_search,
+            messages=inputs, limit=min(int(model.get("max_output_tokens", 1200)), _MAX_OUTPUT_BUDGET), allow_search=allow_search,
             policy=_policy(config))
         if _input_cost(inputs) + overhead > budget:
             raise ModelError("The evidence exceeded the context limit. Please narrow your question.")
@@ -428,33 +459,55 @@ def answer(config, turns, search, transport, *, attachments=(), team_context=Non
                 raise ModelError("Team memory search took too long. Please narrow the topic or project and try again.") from exc
             except (TypeError, ValueError) as exc:
                 raise ModelError("The model produced an invalid search request.") from exc
-            # Preserve reasoning items (encrypted with store=false) along with the function call.
-            inputs.extend(output)
-            remaining = budget - overhead - _input_cost(inputs) - 256
+            # Preserve reasoning items (encrypted with store=false) and valid call/result pairs.
+            future_round = request_index + 1 < min(rounds, requests_limit - 1)
+            reserve = _NEXT_TOOL_RESERVE if future_round else 0
             snippets = []
+            round_labels = []
+            round_evidence = []
+            empty_result = {"type":"function_call_output","call_id":call["call_id"],
+                "output":json.dumps({"untrusted_evidence":[],
+                    "coverage":"bounded search; absence is not proof"}, ensure_ascii=False)}
+            if not make_room(output + [empty_result], reserve, evict_tool_rounds=True):
+                raise ModelError("The evidence exceeded the context limit. Please narrow your question.")
             for evidence in found:
                 if not isinstance(evidence, Evidence):
                     raise ModelError("Search returned invalid evidence.")
-                label = f"E{len(supplied)+1}"
+                if evidence in active_evidence:
+                    continue
+                label = f"E{evidence_label_number+1}"
                 snippet = {"citation":label,"project":evidence.project,"timestamp":evidence.timestamp,
                            "untrusted_text":evidence.text[:1600]}
                 if evidence.kind == 'vault':
                     snippet.update(source_kind='team_vault', title=evidence.title, coverage=evidence.coverage)
                 if evidence.person is not None:
                     snippet["person"] = evidence.person
-                size = _bytes(snippet)
-                if size > remaining:
+                candidate = {"type":"function_call_output","call_id":call["call_id"],
+                    "output":json.dumps({"untrusted_evidence":snippets + [snippet],
+                        "coverage":"bounded search; absence is not proof"}, ensure_ascii=False)}
+                if not make_room(output + [candidate], reserve):
                     continue
-                remaining -= size
                 snippets.append(snippet)
-                supplied.append(evidence)
+                evidence_label_number += 1
+                if evidence not in supplied:
+                    supplied.append(evidence)
+                active_evidence.append(evidence)
+                round_evidence.append(evidence)
+                round_labels.append(label)
                 labels[label] = evidence
-            inputs.append({"type":"function_call_output","call_id":call["call_id"],
-                           "output":json.dumps({"untrusted_evidence":snippets,"coverage":"bounded search; absence is not proof"}, ensure_ascii=False)})
+            result_item = {"type":"function_call_output","call_id":call["call_id"],
+                "output":json.dumps({"untrusted_evidence":snippets,
+                    "coverage":"bounded search; absence is not proof"}, ensure_ascii=False)}
+            if not make_room(output + [result_item], reserve, evict_tool_rounds=True):
+                raise ModelError("The evidence exceeded the context limit. Please narrow your question.")
+            round_items = output + [result_item]
+            inputs.extend(round_items)
+            tool_rounds.append({"items":round_items, "labels":round_labels,
+                                "evidence":round_evidence})
             continue
         text = "\n".join(part.get("text", "") for item in output if item.get("type") == "message"
                          for part in item.get("content", []) if part.get("type") == "output_text").strip()
-        if not text or len(text) > 10000:
+        if not text or len(text) > _MAX_ANSWER_CHARS:
             raise ModelError("The model did not return a usable answer.")
         cited = [label for reference in _CITATION.findall(text)
                  for label in re.findall(r"\b[EF]\d+\b", reference)]

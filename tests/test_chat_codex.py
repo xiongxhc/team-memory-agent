@@ -290,3 +290,19 @@ def test_login_status_requires_chatgpt_and_suppresses_details(tmp_path):
     cli = fake_cli(tmp_path, "print('Logged in using an API key: secret')\n")
     assert not check_login(cli)
     assert not check_login(tmp_path / "absent")
+
+
+def test_expanded_output_allowance_accepts_detailed_chinese_answer(tmp_path):
+    text = '架构说明与证据。' * 250
+    assert 4800 < len(text.encode()) < 12000
+    cli = fake_cli(tmp_path, success({'action':'answer','query':'','text':text}))
+    request = payload(); request['max_output_tokens'] = 3000
+    result = CodexTransport(cli)(request, deadline=time.monotonic()+5)
+    assert result['output'][0]['content'][0]['text'] == text
+
+
+def test_expanded_output_allowance_still_rejects_oversized_utf8_answer(tmp_path):
+    cli = fake_cli(tmp_path, success({'action':'answer','query':'','text':'字'*4001}))
+    request = payload(); request['max_output_tokens'] = 3000
+    with pytest.raises(ModelError, match='invalid or oversized answer'):
+        CodexTransport(cli)(request, deadline=time.monotonic()+5)

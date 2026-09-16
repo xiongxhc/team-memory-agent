@@ -153,17 +153,17 @@ def test_accepts_codex_cli_provider_without_changing_model_limits(tmp_path):
     assert config.model["provider"] == "codex_cli"
 
 
-def test_accepts_24000_input_tokens_but_rejects_more(tmp_path):
+def test_accepts_64000_input_allowance_but_rejects_more(tmp_path):
     config = load_chat_config(_write(
         tmp_path,
-        lambda doc: doc["model"].update(max_input_tokens=24_000),
+        lambda doc: doc["model"].update(max_input_tokens=64_000),
     ))
-    assert config.model["max_input_tokens"] == 24_000
+    assert config.model["max_input_tokens"] == 64_000
 
     with pytest.raises(ChatConfigError):
         load_chat_config(_write(
             tmp_path,
-            lambda doc: doc["model"].update(max_input_tokens=24_001),
+            lambda doc: doc["model"].update(max_input_tokens=64_001),
         ))
 
 
@@ -218,3 +218,10 @@ def test_vault_requires_room_for_original_evidence(tmp_path):
         doc['retrieval']['max_snippets'] = 1
     with pytest.raises(ChatConfigError, match='at least two snippets'):
         load_chat_config(_write(tmp_path, change))
+
+
+def test_accepts_expanded_output_allowance_but_rejects_more(tmp_path):
+    config = load_chat_config(_write(tmp_path, lambda doc: doc['model'].update(max_output_tokens=3000)))
+    assert config.model['max_output_tokens'] == 3000
+    with pytest.raises(ChatConfigError):
+        load_chat_config(_write(tmp_path, lambda doc: doc['model'].update(max_output_tokens=3001)))

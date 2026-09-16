@@ -2,7 +2,7 @@
 
 The CLI has no documented hard output-token option. We request the configured
 token budget and separately cap final UTF-8 text at four bytes per requested
-token (at most 4800 bytes). This is a response-size bound, not token counting.
+token (at most 12000 bytes). This is a response-size bound, not token counting.
 Wall time and process output are bounded independently; provider reasoning-token
 consumption is not capped by this adapter.
 """
@@ -255,7 +255,7 @@ class CodexTransport:
         limit = payload.get("max_output_tokens", 1200)
         if (not isinstance(model, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]{1,100}", model)
             or effort not in {"minimal", "low", "medium", "high", "xhigh", "max"}
-            or type(limit) is not int or not 1 <= limit <= 1200):
+            or type(limit) is not int or not 1 <= limit <= 3000):
             raise ModelError("Invalid Codex model settings.")
         answer_byte_limit = 4 * limit
         allow_search = payload.get("tool_choice") == "auto"
