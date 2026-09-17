@@ -59,11 +59,22 @@ name, which is resolved through the authorized team directory during retrieval.
 Only the configured bot's own mention is removed as routing syntax. Mentions
 with missing names remain visible as placeholders rather than disappearing.
 
-Both sender and group must appear in the access configuration. Grants use the
-**new bot application's open IDs**, not another collector's IDs. The effective
-project scope is the intersection of sender and group grants. Explicit `[]` allows
-casual conversation with no project evidence. Removing an entry revokes access.
-Project attribution in collector configuration does not grant chat access.
+Sender and group grants use the **new bot application's open IDs**, not another
+collector's IDs. By default, both must be explicitly listed. An operator may set
+`"*": ["project-a", "project-b"]` in `access.users` to enable all tenant members,
+and in `access.groups` to enable all groups where this bot receives mentions.
+Both are opt-in; the tenant/app boundary and exact-bot mention requirement remain.
+Exact-ID entries override the wildcard, including `[]` for casual conversation
+without project evidence. Effective group scope remains the intersection of user
+and group grants. Project lists remain explicit: `*` is an audience key, not a
+project selector. Hidden and count-only projection rules still apply.
+
+With a wildcard present, removing an exact entry falls back to it; remove the
+wildcard to revoke otherwise unlisted audiences. Reconciliation preserves active
+wildcard sessions and purges sessions when their audience grant is removed.
+Wildcards do not confer group administrator privileges. DMs stay per-user;
+group/thread conversations remain separate. Collector membership never grants
+chat access by itself.
 
 While an accepted request is being processed, the bot can show a temporary
 `Typing` reaction on the original message. It does not send a separate thinking

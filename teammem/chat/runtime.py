@@ -113,7 +113,7 @@ def check_readiness(path, *, verify_bot=None):
     checks.append(('configuration', True, 'valid'))
     checks.append(('service enabled', config.enabled, 'enabled' if config.enabled else 'disabled'))
     checks.append(('trusted identity', bool(config.feishu['tenant_key'] and config.feishu['expected_bot_open_id']), 'requires configured tenant and bot open ID'))
-    checks.append(('user grants', bool(config.access['users']), 'requires explicit new-app user IDs'))
+    checks.append(('user grants', bool(config.access['users']), 'requires explicit user grants or a configured tenant-wide wildcard'))
     required = {'im:message.p2p_msg:readonly', 'im:message.group_at_msg:readonly', 'im:message:send_as_bot', 'im:message:readonly'}
     if config.attachments['enabled']:
         required.add('im:message:readonly')

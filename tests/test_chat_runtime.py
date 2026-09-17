@@ -367,3 +367,28 @@ def test_readiness_does_not_claim_declared_reaction_permission_is_verified(tmp_p
 
     detail = next(detail for name, _, detail in status.checks if name == 'processing reaction')
     assert detail == 'scope declared; permission not verified'
+
+
+def test_open_access_composition_accepts_new_member_dm_and_mentioned_group(tmp_path):
+    path = configured(tmp_path)
+    config = json.loads(path.read_text())
+    config['access'].update(users={'*': []}, groups={'*': []})
+    path.write_text(json.dumps(config))
+    client = Client()
+    transport = Transport(completed('Hello member'), completed('Hello group'))
+    async def run():
+        service, store, _ = build_service(path, client=client, transport=transport)
+        for mid, chat, kind, mentions in (
+            ('dm-new', 'dm-new', 'p2p', frozenset()),
+            ('group-new', 'group-new', 'group', frozenset({'ou_bot00000000'})),
+        ):
+            event = NormalizedEvent('tenant', 'cli_exampleapp123', mid, chat,
+                'new-member', kind, '', '', mentions, 'Hi', 'text', ())
+            await service.handle(event)
+        assert len(client.sent) == 2
+        assert {reply[0] for reply in client.sent} == {'dm-new', 'group-new'}
+        assert await service.reconcile_access() == []
+        assert len(service.state.session_keys()) == 2
+        await service.wait_for_reactions()
+        store.close(); service.state.close()
+    asyncio.run(run())

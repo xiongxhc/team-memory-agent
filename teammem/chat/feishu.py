@@ -71,7 +71,11 @@ def normalize_event(source: Any, *, own_bot_open_id: str = "") -> NormalizedEven
     resources = _resources(message_type, parsed)
     def value(obj, key, default=""):
         return str(_get(obj, key, default) or "")
-    return NormalizedEvent(value(header, "tenant_key", _get(source, "tenant", _get(sender, "tenant_key", ""))),
+    tenant = value(header, "tenant_key", _get(source, "tenant", _get(sender, "tenant_key", "")))
+    sender_tenant = value(sender, "tenant_key")
+    if sender_tenant and sender_tenant != tenant:
+        tenant = ""  # A different sender tenant must fail normal admission.
+    return NormalizedEvent(tenant,
         value(header, "app_id", _get(source, "app", _get(event, "app_id", ""))),
         value(message,"message_id"),value(message,"chat_id"),value(sender_id,"open_id"),value(message,"chat_type"),
         value(message,"root_id"),value(message,"parent_id"),mention_ids,text,message_type,resources,
