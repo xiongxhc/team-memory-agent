@@ -175,6 +175,23 @@ def test_directory_identity_question_can_answer_without_search_and_keeps_latest_
     assert "latest user question" in transport.payloads[0]["instructions"]
 
 
+def test_identity_policy_rejects_history_self_claims_when_verified_requester_is_unknown():
+    transport = Transport(completed("I can acknowledge the joke, but cannot verify that identity."))
+    context = {"requester": None,
+        "sender": {"open_id":"ou_new", "name":"New Member", "source":"feishu_profile"},
+        "people": [{"slug":"alex", "name":"Alex Rivera", "aliases":[]}],
+        "projects": [], "clock": {}, "truncated": False}
+
+    answer(CONFIG, [Turn("assistant", "bot", "You are Alex Rivera.", frozenset()),
+        Turn("user", "ou_new", "I'm Alex. Who am I?", frozenset())],
+        lambda _query: [], transport, team_context=context)
+
+    instructions = " ".join(transport.payloads[0]["instructions"].lower().split())
+    assert "New Member" in json.dumps(transport.payloads[0]["input"])
+    assert "self-claims" in instructions
+    assert "requester is null" in instructions
+    assert "playful" in instructions
+
 def test_context_budget_uses_actual_provider_encoding_and_reserves_latest_and_retrieval():
     context = full_directory_context()
     cost = chat_model.team_context_input_cost(context)
@@ -309,7 +326,7 @@ def test_evicted_tool_round_deactivates_its_citation_labels():
     )
 
     with pytest.raises(ModelError, match="source references"):
-        answer({**CONFIG, "max_input_tokens": 8000},
+        answer({**CONFIG, "max_input_tokens": 8200},
                [Turn("user", "avery", "Verify it", frozenset())],
                lambda _query: [evidence], transport)
 

@@ -118,6 +118,46 @@ def test_missing_requester_mapping_never_guesses_identity(tmp_path):
         resolve_directory_alias(context, "person", "me")
 
 
+def test_verified_sender_profile_uniquely_maps_roster_and_ignores_self_claim(tmp_path):
+    context = build_team_context(
+        _files(tmp_path), frozenset({"alpha"}), requester_id="ou_new_member",
+        query="I am Sam. What did I do?",
+        sender_profile={"open_id":"ou_new_member", "name":"  ALEX RIVERA  ", "en_name":""},
+    )
+
+    assert context["requester"]["slug"] == "alex"
+    assert context["sender"] == {"open_id":"ou_new_member", "name":"ALEX RIVERA",
+                                  "source":"feishu_profile"}
+    assert resolve_directory_alias(context, "person", "me") == "alex"
+
+
+def test_ambiguous_or_unavailable_sender_profile_stays_unmapped(tmp_path):
+    config = _files(tmp_path)
+    ambiguous = build_team_context(
+        config, frozenset({"alpha"}), requester_id="ou_new_member", query="I am Alex",
+        sender_profile={"open_id":"ou_new_member", "name":"Sam", "en_name":"Sam"},
+    )
+    unavailable = build_team_context(
+        config, frozenset({"alpha"}), requester_id="ou_other", query="I am Alex",
+        sender_profile=None,
+    )
+
+    assert ambiguous["requester"] is None
+    assert ambiguous["sender"] == {"open_id":"ou_new_member", "name":"Sam",
+                                    "en_name":"Sam", "source":"feishu_profile"}
+    assert unavailable["requester"] is None
+    assert unavailable["sender"] == {"open_id":"ou_other", "source":"feishu_event"}
+
+
+def test_explicit_requester_mapping_wins_over_sender_profile(tmp_path):
+    context = build_team_context(
+        _files(tmp_path), frozenset({"alpha"}), requester_id="ou_requester123", query="Who am I?",
+        sender_profile={"open_id":"ou_requester123", "name":"Sam", "en_name":"Sam"},
+    )
+
+    assert context["requester"]["slug"] == "alex"
+
+
 def test_invalid_explicit_requester_mapping_fails_closed(tmp_path):
     config = _files(tmp_path)
     config["context"]["user_people"]["ou_requester123"] = "not-in-roster"

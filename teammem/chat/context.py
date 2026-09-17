@@ -97,7 +97,8 @@ def bind_policy_dependencies(
 
 def public_team_context(context: Mapping[str, Any]) -> dict[str, Any]:
     """Remove authorization bookkeeping before the directory reaches a model."""
-    fields = ("requester", "people", "projects", "clock", "ambiguous_aliases", "truncated", "notice")
+    fields = ("requester", "sender", "people", "projects", "clock",
+              "ambiguous_aliases", "truncated", "notice")
     return {key: context[key] for key in fields if key in context}
 
 
@@ -155,6 +156,7 @@ def build_team_context(
     *,
     requester_id: str,
     query: str,
+    sender_profile: Mapping[str, Any] | None = None,
     now: datetime | None = None,
     max_bytes: int = 8000,
     measure_bytes: Callable[[Mapping[str, Any]], int] | None = None,
@@ -185,6 +187,33 @@ def build_team_context(
     members = roster.get("members") or {}
     if not isinstance(members, Mapping) or (requester_slug is not None and requester_slug not in members):
         raise ModelError("The requester identity could not be verified.")
+    if not isinstance(requester_id, str) or not requester_id or len(requester_id) > 200:
+        raise ModelError("The requester identity could not be verified.")
+    sender = {"open_id": requester_id, "source": "feishu_event"}
+    profile_names = []
+    if isinstance(sender_profile, Mapping) and sender_profile.get("open_id") == requester_id:
+        for field in ("name", "en_name"):
+            value = sender_profile.get(field)
+            if isinstance(value, str) and value.strip():
+                bounded = value.strip()[:200]
+                sender[field] = bounded
+                profile_names.append(bounded)
+        sender["source"] = "feishu_profile"
+    if requester_slug is None and profile_names:
+        matches = set()
+        for slug, definition in members.items():
+            if not isinstance(slug, str) or not isinstance(definition, Mapping):
+                continue
+            roster_names = []
+            name = definition.get("name")
+            if isinstance(name, str) and name.strip():
+                roster_names.append(name)
+            roster_names.extend(_strings(definition.get("feishu_names")))
+            if any(_normalize(profile) == _normalize(roster_name)
+                   for profile in profile_names for roster_name in roster_names):
+                matches.add(slug)
+        if len(matches) == 1:
+            requester_slug = next(iter(matches))
     try:
         policy = project_policy_from_source_config(projects_source)
     except (TypeError, ValueError, AttributeError) as exc:
@@ -263,6 +292,7 @@ def build_team_context(
     ambiguity = {"people": ambiguous(people), "projects": ambiguous(projects)}
     result: dict[str, Any] = {
         "requester": requester,
+        "sender": sender,
         "people": [] if requester is None else [requester],
         "projects": [],
         "clock": _clock(str(context_config["timezone"]), now),
@@ -276,6 +306,25 @@ def build_team_context(
     measure = _json_size if measure_bytes is None else measure_bytes
     if not callable(measure):
         raise ValueError("measure_bytes must be callable")
+    while measure(public_team_context(result)) > max_bytes:
+        if "en_name" in sender:
+            sender.pop("en_name")
+        elif "name" in sender:
+            sender.pop("name")
+        else:
+            break
+    aliases_compacted = False
+    while (measure(public_team_context(result)) > max_bytes and requester is not None
+           and requester["aliases"]):
+        requester["aliases"].pop()
+        aliases_compacted = True
+    if aliases_compacted:
+        result["truncated"] = True
+        result["notice"] = _NOTICE
+    if measure(public_team_context(result)) > max_bytes and requester is not None:
+        result["people"] = []
+        result["truncated"] = True
+        result["notice"] = _NOTICE
     if measure(public_team_context(result)) > max_bytes:
         raise ModelError("The authorized directory scope is too large to load safely.")
 

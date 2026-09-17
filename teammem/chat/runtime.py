@@ -388,8 +388,19 @@ def build_service(config_path, *, client=None, transport=None, parser=None):
         budget = min(8000, team_context_input_budget(
             config, sender=requester_id, text=query,
         ))
+        context_config = config.get('context', {}) if isinstance(config, Mapping) else config.context
+        mappings = context_config.get('user_people') if isinstance(context_config, Mapping) else None
+        sender_profile = None
+        if not isinstance(mappings, Mapping) or requester_id not in mappings:
+            profile_getter = getattr(client, 'get_sender_profile', None)
+            if callable(profile_getter):
+                try:
+                    sender_profile = profile_getter(requester_id)
+                except Exception:
+                    sender_profile = None
         return build_team_context(
             config, authorization, requester_id=requester_id, query=query,
+            sender_profile=sender_profile,
             max_bytes=budget, measure_bytes=team_context_input_cost,
             require_policy_dependencies=True,
         )

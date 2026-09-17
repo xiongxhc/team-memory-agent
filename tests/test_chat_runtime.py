@@ -145,6 +145,46 @@ def test_build_service_wires_scoped_directory_and_structured_alias_search(tmp_pa
     store.close(); service.state.close()
 
 
+def test_runtime_fetches_profile_only_for_unmapped_requester(tmp_path):
+    path = directory_configured(tmp_path)
+    document = json.loads(path.read_text())
+    document['context']['user_people'] = {'ou_requester123':'alex'}
+    path.write_text(json.dumps(document))
+
+    class ProfileClient(Client):
+        def __init__(self):
+            super().__init__(); self.profile_calls = []
+        def get_sender_profile(self, requester_id):
+            self.profile_calls.append(requester_id)
+            return {'open_id':requester_id, 'name':'Alex Rivera', 'en_name':'Alex Rivera'}
+
+    client = ProfileClient()
+    service, store, _ = build_service(path, client=client, transport=Transport())
+    authorization = frozenset()
+
+    mapped = service.context_factory(config=service.config, authorization=authorization,
+        requester_id='ou_requester123', query='I am Sam')
+    discovered = service.context_factory(config=service.config, authorization=authorization,
+        requester_id='ou_new_member', query='I am Sam')
+
+    assert mapped['requester']['slug'] == 'alex'
+    assert discovered['requester']['slug'] == 'alex'
+    assert client.profile_calls == ['ou_new_member']
+    store.close(); service.state.close()
+
+
+def test_runtime_client_without_profile_method_keeps_unmapped_requester_unknown(tmp_path):
+    path = directory_configured(tmp_path)
+    service, store, _ = build_service(path, client=Client(), transport=Transport())
+
+    context = service.context_factory(config=service.config, authorization=frozenset(),
+        requester_id='ou_new_member', query='I am Alex Rivera')
+
+    assert context['requester'] is None
+    assert context['sender'] == {'open_id':'ou_new_member', 'source':'feishu_event'}
+    store.close(); service.state.close()
+
+
 def test_local_vault_search_keeps_original_records_and_canonical_filters(tmp_path):
     path = directory_configured(tmp_path)
     config = json.loads(path.read_text())
