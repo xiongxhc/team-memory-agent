@@ -168,3 +168,49 @@ def test_conflicting_sender_tenant_cannot_inherit_event_tenant():
                   'message': {'message_id': 'm', 'chat_id': 'g', 'chat_type': 'group',
                               'message_type': 'text', 'content': '{"text":"Hi"}'}}})
     assert event.tenant == ''
+
+
+def test_sender_profile_uses_exact_open_id_and_caches_verified_result(monkeypatch):
+    from teammem.chat.feishu import FeishuClient
+    client = FeishuClient('app', 'secret')
+    calls = []
+    def request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {'data': {'user': {'open_id': 'ou_sender', 'name': 'Sam Lee',
+                                  'en_name': 'Sam', 'email': 'excluded@example.test'}}}
+    monkeypatch.setattr(client, '_json', request)
+    first = client.get_sender_profile('ou_sender')
+    assert first == {'open_id': 'ou_sender', 'name': 'Sam Lee', 'en_name': 'Sam'}
+    first['name'] = 'Changed by caller'
+    assert client.get_sender_profile('ou_sender')['name'] == 'Sam Lee'
+    assert len(calls) == 1
+    assert calls[0][1] == '/contact/v3/users/ou_sender'
+    assert calls[0][2]['params'] == {'user_id_type': 'open_id'}
+
+
+def test_sender_profile_rejects_mismatched_ids_and_permission_failure(monkeypatch):
+    from teammem.chat.feishu import FeishuClient, FeishuError
+    client = FeishuClient('app', 'secret')
+    monkeypatch.setattr(client, '_json', lambda *a, **kw: {'data': {'user': {
+        'open_id': 'someone-else', 'name': 'Another Person'}}})
+    assert client.get_sender_profile('ou_sender') is None
+    def denied(*args, **kwargs):
+        raise FeishuError('permission denied')
+    monkeypatch.setattr(client, '_json', denied)
+    assert client.get_sender_profile('ou_new_sender') is None
+
+
+def test_sender_profile_retries_after_permission_failure_cache_expires(monkeypatch):
+    from teammem.chat import feishu
+    client = feishu.FeishuClient('app', 'secret')
+    clock = [100.0]
+    monkeypatch.setattr(feishu.time, 'monotonic', lambda: clock[0])
+    def denied(*args, **kwargs):
+        raise feishu.FeishuError('not enabled yet')
+    monkeypatch.setattr(client, '_json', denied)
+    assert client.get_sender_profile('ou_sender') is None
+    monkeypatch.setattr(client, '_json', lambda *a, **kw: {'data': {'user': {
+        'open_id': 'ou_sender', 'name': 'Sam Lee'}}})
+    assert client.get_sender_profile('ou_sender') is None
+    clock[0] += 16
+    assert client.get_sender_profile('ou_sender')['name'] == 'Sam Lee'

@@ -59,6 +59,19 @@ name, which is resolved through the authorized team directory during retrieval.
 Only the configured bot's own mention is removed as routing syntax. Mentions
 with missing names remain visible as placeholders rather than disappearing.
 
+Sender identity comes from the authenticated message sender's app-scoped open ID.
+Explicit `context.user_people` bindings take precedence. For other members, the
+bot may read that exact account's Feishu profile using
+`contact:contact.base:readonly`, then resolve a unique roster name/Feishu alias.
+Profile display names are account metadata, not authorization, roles, or evidence
+of project activity. A missing or ambiguous roster match stays unresolved.
+Self-introductions, mentions, and earlier assistant guesses never verify or change
+the sender's identity. Missing profile permission leaves identity unresolved while
+ordinary chat continues. Successful profile lookups cache for 60 seconds;
+unavailable lookups retry after 15 seconds, so enabling the permission needs no
+service restart. Old collector open IDs must not be reused across applications.
+
+
 Sender and group grants use the **new bot application's open IDs**, not another
 collector's IDs. By default, both must be explicitly listed. An operator may set
 `"*": ["project-a", "project-b"]` in `access.users` to enable all tenant members,

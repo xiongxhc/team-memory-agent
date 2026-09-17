@@ -129,6 +129,8 @@ class FeishuClient:
         self.http.trust_env = False
         self._token, self._expires = "", 0
         self._token_lock = threading.Lock()
+        self._profile_lock = threading.Lock()
+        self._profiles = {}
 
     def _auth(self, *, deadline=None):
         wait = max(0, deadline-time.monotonic()) if deadline is not None else -1
@@ -173,6 +175,32 @@ class FeishuClient:
         if bot.get("open_id") != expected_bot_open_id or bot.get("activate_status") != 2:
             raise FeishuError("The bot identity does not match the configured app.")
         return True
+
+    def get_sender_profile(self, open_id):
+        """Read the authenticated sender's display identity; never learn it from text."""
+        if not isinstance(open_id, str) or not re.fullmatch(r"ou_[A-Za-z0-9_]+", open_id):
+            return None
+        with self._profile_lock:
+            cached = self._profiles.get(open_id)
+            if cached is not None and cached[0] > time.monotonic():
+                return dict(cached[1]) if cached[1] is not None else None
+        profile = None
+        try:
+            body = self._json("GET", "/contact/v3/users/" + quote(open_id, safe=""),
+                params={"user_id_type": "open_id"}, deadline=time.monotonic() + 3)
+            user = body.get("data", {}).get("user", {})
+            if isinstance(user, dict) and user.get("open_id") == open_id:
+                names = {key: user[key].strip() for key in ("name", "en_name")
+                         if isinstance(user.get(key), str) and 0 < len(user[key].strip()) <= 200}
+                if names:
+                    profile = {"open_id": open_id, **names}
+        except (FeishuError, AttributeError):
+            pass  # Missing profile permission must not block ordinary conversation.
+        with self._profile_lock:
+            if len(self._profiles) >= 256:
+                self._profiles.pop(next(iter(self._profiles)))
+            self._profiles[open_id] = (time.monotonic() + (60 if profile else 15), profile)
+        return dict(profile) if profile is not None else None
 
     def get_message(self, message_id, chat_id):
         body = self._json("GET", "/im/v1/messages/"+quote(message_id, safe=""))

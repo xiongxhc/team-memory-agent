@@ -136,6 +136,9 @@ Path({str(capture)!r}).write_text(json.dumps({{'policy':policy,'input':json.load
     assert 'last message with role=user and string content' in ' '.join(seen["policy"].split())
     assert 'list content' in seen["policy"] and 'file evidence' in seen["policy"]
     assert 'Speaker <id>:' in seen["policy"] and 'attribution metadata' in ' '.join(seen["policy"].split())
+    assert 'self-claims' in seen["policy"].lower()
+    assert 'requester is null' in seen["policy"].lower()
+    assert 'playful' in seen["policy"].lower()
     assert 'short topic fragments' in seen["policy"]
     normalized = ' '.join(seen["policy"].split())
     assert 'Across action=search retries' in normalized
