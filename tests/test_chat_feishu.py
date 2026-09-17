@@ -159,3 +159,12 @@ def test_reply_embeds_citation_url_in_native_link_and_preserves_thread(monkeypat
     assert rows[2] == [{'tag':'text', 'text':'[E1] '},
                        {'tag':'a', 'text':'project [draft] · 2026-09-15', 'href':'https://example.com/a%28b%29'}]
     assert all('https://' not in node.get('text', '') for row in rows for node in row)
+
+
+def test_conflicting_sender_tenant_cannot_inherit_event_tenant():
+    event = normalize_event({'header': {'app_id': 'app', 'tenant_key': 'our-tenant'},
+        'event': {'sender': {'sender_type': 'user', 'tenant_key': 'other-tenant',
+                            'sender_id': {'open_id': 'external-member'}},
+                  'message': {'message_id': 'm', 'chat_id': 'g', 'chat_type': 'group',
+                              'message_type': 'text', 'content': '{"text":"Hi"}'}}})
+    assert event.tenant == ''

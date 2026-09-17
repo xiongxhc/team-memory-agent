@@ -56,6 +56,50 @@ def test_enabled_user_with_empty_grants_can_chat_without_evidence():
     assert authorize(config, SessionKey("t", "app", "dm", "alice"), "alice") == frozenset()
 
 
+def test_wildcard_grants_authorize_new_dm_and_intersect_new_group():
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app"}, "access": {
+        "default": "deny", "users": {"*": ["alpha", "beta"]},
+        "groups": {"*": ["beta", "gamma"]}, "group_admins": {},
+    }}
+
+    assert authorize(config, SessionKey("tenant", "app", "dm", "new-user"),
+                     "new-user") == frozenset({"alpha", "beta"})
+    assert authorize(config, SessionKey("tenant", "app", "group", "new-group"),
+                     "new-user") == frozenset({"beta"})
+
+
+def test_exact_empty_or_restrictive_grant_overrides_wildcard():
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app"}, "access": {
+        "default": "deny", "users": {"*": ["alpha", "beta"], "alice": []},
+        "groups": {"*": ["alpha", "beta"], "private": ["beta"]}, "group_admins": {},
+    }}
+
+    assert authorize(config, SessionKey("tenant", "app", "dm", "alice"),
+                     "alice") == frozenset()
+    assert authorize(config, SessionKey("tenant", "app", "group", "private"),
+                     "bob") == frozenset({"beta"})
+
+
+@pytest.mark.parametrize("tenant,app", [("other", "app"), ("tenant", "other")])
+def test_wildcard_grant_requires_configured_tenant_and_app(tenant, app):
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app"}, "access": {
+        "default": "deny", "users": {"*": ["alpha"]},
+        "groups": {"*": ["alpha"]}, "group_admins": {},
+    }}
+
+    with pytest.raises(AccessDenied):
+        authorize(config, SessionKey(tenant, app, "dm", "new-user"), "new-user")
+
+
+@pytest.mark.parametrize("feishu", [{}, {"tenant_key": "tenant"}, {"app_id": "app"}])
+def test_wildcard_grant_denies_missing_feishu_identity(feishu):
+    config = {"feishu": feishu, "access": {"default": "deny",
+        "users": {"*": ["alpha"]}, "groups": {"*": ["alpha"]}, "group_admins": {}}}
+
+    with pytest.raises(AccessDenied):
+        authorize(config, SessionKey("tenant", "app", "dm", "new-user"), "new-user")
+
+
 def test_direct_message_toggle_denies_dm_without_revoking_the_identity():
     config = {"feishu": {"direct_messages": False}, "access": {"default": "deny", "users": {
         "alice": [],

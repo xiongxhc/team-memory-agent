@@ -5,7 +5,7 @@ import threading
 from teammem.chat.context import policy_dependency
 from teammem.chat.feishu import normalize_event, session_key
 from teammem.chat.service import ChatService
-from teammem.chat.state import ChatState, Evidence, Turn
+from teammem.chat.state import ChatState, Evidence, SessionKey, Turn
 
 
 def _event(**changes):
@@ -175,6 +175,72 @@ def test_group_without_exact_bot_mention_never_calls_model(tmp_path):
     event = _event(message={"message_id": "m1", "chat_id": "chat", "chat_type": "group", "message_type": "text", "content": '{"text":"hello"}'})
 
     asyncio.run(service.handle(event))
+
+    assert called == []
+
+
+def test_wildcard_access_accepts_new_dm_group_and_thread_but_keeps_sessions_isolated(tmp_path):
+    histories = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app",
+        "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny",
+        "users": {"*": ["alpha", "beta"]}, "groups": {"*": ["beta"]},
+        "group_admins": {}}}
+    def model(_config, history, *_args, **_kwargs):
+        histories.append([turn.text for turn in history])
+        return "answer", []
+    service = ChatService(ChatState(tmp_path / "chat.db"), config, model,
+                          lambda *args, **kwargs: "sent")
+    mention = [{"id": {"open_id": "ou_bot"}}]
+
+    asyncio.run(service.handle(_event(sender={"sender_id": {"open_id": "new-user"}},
+        message={"message_id":"dm", "chat_id":"dm-new", "chat_type":"p2p",
+                 "message_type":"text", "content":'{"text":"dm question"}'})))
+    asyncio.run(service.handle(_event(sender={"sender_id": {"open_id": "new-user"}},
+        message={"message_id":"group", "chat_id":"new-group", "chat_type":"group",
+                 "message_type":"text", "content":'{"text":"group question"}'}, mentions=mention)))
+    asyncio.run(service.handle(_event(sender={"sender_id": {"open_id": "new-user"}},
+        message={"message_id":"thread", "chat_id":"new-group", "chat_type":"group",
+                 "root_id":"root", "message_type":"text", "content":'{"text":"thread question"}'},
+        mentions=mention)))
+
+    assert histories == [["dm question"], ["group question"], ["thread question"]]
+
+
+def test_wildcard_group_still_requires_own_bot_mention_and_exact_group_admin(tmp_path):
+    called, invalidated = [], []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app",
+        "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny",
+        "users": {"*": []}, "groups": {"*": []},
+        "group_admins": {"*": ["new-user"]}}}
+    service = ChatService(ChatState(tmp_path / "chat.db"), config,
+        lambda *args, **kwargs: called.append(1) or ("answer", []),
+        lambda *args, **kwargs: "sent", invalidate_session=lambda key: invalidated.append(key))
+    group = {"message_id":"group", "chat_id":"new-group", "chat_type":"group",
+             "message_type":"text", "content":'{"text":"hello"}'}
+    sender = {"sender_id": {"open_id": "new-user"}}
+
+    asyncio.run(service.handle(_event(sender=sender, message=group)))
+    asyncio.run(service.handle(_event(sender=sender, message={**group, "message_id":"wrong-bot"},
+        mentions=[{"id":{"open_id":"another-bot"}}])))
+    asyncio.run(service.handle(_event(sender=sender,
+        message={**group, "message_id":"forget", "content":'{"text":"/forget"}'},
+        mentions=[{"id":{"open_id":"ou_bot"}}])))
+
+    assert called == [] and invalidated == []
+
+
+def test_wildcard_access_ignores_wrong_tenant_or_app(tmp_path):
+    called = []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app",
+        "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny",
+        "users": {"*": []}, "groups": {"*": []}, "group_admins": {}}}
+    service = ChatService(ChatState(tmp_path / "chat.db"), config,
+                          lambda *a, **k: called.append(1), lambda *a, **k: "sent")
+
+    asyncio.run(service.handle(_event(tenant="other", sender={"sender_id": {"open_id": "new"}})))
+    asyncio.run(service.handle(_event(app="other", sender={"sender_id": {"open_id": "new"}},
+        message={"message_id":"other-app", "chat_id":"dm", "chat_type":"p2p",
+                 "message_type":"text", "content":'{"text":"hello"}'})))
 
     assert called == []
 
@@ -443,6 +509,26 @@ def test_reconcile_access_forgets_revoked_dm_and_removed_group_sessions(tmp_path
     assert state.history(thread, frozenset()) == []
     assert set(invalidated) == {dm_alice, group, thread}
     assert invalidated.count(dm_alice) == 2  # repairs attachments after an interrupted first purge
+
+
+def test_reconcile_access_retains_wildcard_sessions_then_purges_on_wildcard_removal(tmp_path):
+    current = {"config": {"feishu": {"tenant_key": "tenant", "app_id": "app",
+        "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny",
+        "users": {"*": []}, "groups": {"*": []}, "group_admins": {}}}}
+    state = ChatState(tmp_path / "chat.db")
+    dm = SessionKey("tenant", "app", "dm", "new-user")
+    group = SessionKey("tenant", "app", "group", "new-group")
+    thread = SessionKey("tenant", "app", "thread", "new-group", "root")
+    for key in (dm, group, thread):
+        state.append(key, Turn("user", "new-user", key.kind, frozenset()))
+    service = ChatService(state, current["config"], lambda *a, **k: ("x", []),
+                          lambda *a, **k: "sent", config_loader=lambda: current["config"])
+
+    assert asyncio.run(service.reconcile_access()) == []
+    current["config"]["access"]["users"].pop("*")
+    assert asyncio.run(service.reconcile_access()) == [dm]
+    current["config"]["access"]["groups"].pop("*")
+    assert set(asyncio.run(service.reconcile_access())) == {group, thread}
 
 
 def test_fresh_config_loader_honors_direct_message_disable(tmp_path):

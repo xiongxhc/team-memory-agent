@@ -26,19 +26,29 @@ def _projects(projects: Any) -> frozenset[str] | None:
     return frozenset(projects)
 
 
-def _enabled_user(users: Any, sender: str) -> frozenset[str]:
-    if not isinstance(users, Mapping):
-        raise AccessDenied("unknown chat identity")
-    if sender not in users:
-        raise AccessDenied("unknown chat identity")
-    projects = _projects(users[sender])
+def _enabled_grant(entries: Any, identity: str, unknown: str) -> tuple[frozenset[str], bool]:
+    if not isinstance(entries, Mapping):
+        raise AccessDenied(unknown)
+    wildcard = identity == "*" or identity not in entries
+    if wildcard and "*" not in entries:
+        raise AccessDenied(unknown)
+    projects = _projects(entries["*" if wildcard else identity])
     if projects is None:
         raise AccessDenied("invalid chat grant")
-    return projects
+    return projects, wildcard
+
+
+def _require_wildcard_identity(config: Any, key: SessionKey) -> None:
+    feishu = _field(config, "feishu", {})
+    tenant = _field(feishu, "tenant_key")
+    app = _field(feishu, "app_id")
+    if (not isinstance(tenant, str) or not tenant or not isinstance(app, str) or not app
+            or key.tenant != tenant or key.app != app):
+        raise AccessDenied("chat access denied")
 
 
 def authorize(config: Mapping[str, Any] | Any, key: SessionKey, sender: str) -> frozenset[str]:
-    """Return the evidence scope for an explicitly listed user and chat.
+    """Return the evidence scope for an exact or tenant-bound wildcard grant.
 
     User keys are the new bot application's scoped IDs.  Group answers are only
     permitted when both the user and that group have a grant, so a private DM
@@ -48,9 +58,11 @@ def authorize(config: Mapping[str, Any] | Any, key: SessionKey, sender: str) -> 
     if _field(access, "default") != "deny" or not isinstance(sender, str) or not sender:
         raise AccessDenied("chat access denied")
     users = _field(access, "users")
-    user_projects = _enabled_user(users, sender)
+    user_projects, wildcard_user = _enabled_grant(users, sender, "unknown chat identity")
 
     if key.kind == "dm":
+        if wildcard_user:
+            _require_wildcard_identity(config, key)
         if _field(_field(config, "feishu", {}), "direct_messages", True) is not True:
             raise AccessDenied("direct messages are disabled")
         if key.owner != sender:
@@ -60,13 +72,9 @@ def authorize(config: Mapping[str, Any] | Any, key: SessionKey, sender: str) -> 
         raise AccessDenied("unknown chat session")
 
     groups = _field(access, "groups")
-    if not isinstance(groups, Mapping):
-        raise AccessDenied("unknown group")
-    if key.owner not in groups:
-        raise AccessDenied("unknown group")
-    group_projects = _projects(groups[key.owner])
-    if group_projects is None:
-        raise AccessDenied("invalid group grant")
+    group_projects, wildcard_group = _enabled_grant(groups, key.owner, "unknown group")
+    if wildcard_user or wildcard_group:
+        _require_wildcard_identity(config, key)
     return user_projects & group_projects
 
 

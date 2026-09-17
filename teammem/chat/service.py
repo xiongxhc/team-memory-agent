@@ -360,19 +360,30 @@ class ChatService:
             self._reaction_tasks.difference_update(tasks)
 
     async def reconcile_access(self) -> list[object]:
-        """Forget sessions whose explicit identity or group grant was fully removed."""
+        """Forget sessions whose exact or wildcard identity/group grant was removed."""
         config = self._current_config()
         access = config["access"] if isinstance(config, Mapping) else getattr(config, "access")
         users = access.get("users") if isinstance(access, Mapping) else getattr(access, "users", None)
         groups = access.get("groups") if isinstance(access, Mapping) else getattr(access, "groups", None)
         feishu = config["feishu"] if isinstance(config, Mapping) else getattr(config, "feishu")
         direct_messages = feishu.get("direct_messages", True) if isinstance(feishu, Mapping) else getattr(feishu, "direct_messages", True)
+        tenant = feishu.get("tenant_key") if isinstance(feishu, Mapping) else getattr(feishu, "tenant_key", None)
+        app = feishu.get("app_id") if isinstance(feishu, Mapping) else getattr(feishu, "app_id", None)
         purged = []
         for key in self.state.session_keys():
+            wildcard_identity = (isinstance(tenant, str) and bool(tenant)
+                                 and isinstance(app, str) and bool(app)
+                                 and key.tenant == tenant and key.app == app)
+            user_grant = isinstance(users, Mapping) and (
+                key.owner in users or ("*" in users and wildcard_identity)
+            )
+            group_grant = isinstance(groups, Mapping) and (
+                key.owner in groups or ("*" in groups and wildcard_identity)
+            )
             revoked = (
-                key.kind == "dm" and (not isinstance(users, Mapping) or key.owner not in users)
+                key.kind == "dm" and not user_grant
             ) or (
-                key.kind in {"group", "thread"} and (not isinstance(groups, Mapping) or key.owner not in groups)
+                key.kind in {"group", "thread"} and not group_grant
             )
             if not revoked:
                 if key.kind == "dm" and direct_messages is not True:
