@@ -1,7 +1,8 @@
-# The two wire contracts a producer implements against, carried in the source
+# The three wire contracts a producer implements against, carried in the source
 # archive so a release can be read without the git repository. Shipping one
-# without the other would be worse than shipping neither: a reader could not
+# without the others would be worse than shipping neither: a reader could not
 # tell whether the missing contract is unspecified or merely unshipped.
 # The wheel stays code only — nothing here is installed into site-packages.
 include schemas/teammem-bundle-v1.md
 include docs/schemas/teammem-meeting-v1.md
+include docs/schemas/teammem-meeting-v2.md

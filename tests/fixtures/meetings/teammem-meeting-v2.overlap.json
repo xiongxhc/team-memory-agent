@@ -1,0 +1,122 @@
+{
+  "schema": "teammem-meeting/v2",
+  "occurrence_id": "vc:7f21/overlap@2026-09-02T09:15:00Z",
+  "revision": 2,
+  "provider": "feishu",
+  "provider_meeting_id": "vc:7f21/overlap",
+  "title": "Overlapping Observation Proof",
+  "started_at": "2026-09-02T09:15:00Z",
+  "ended_at": "2026-09-02T09:22:00Z",
+  "organizer": null,
+  "organizer_source": null,
+  "organizer_unresolved_reason": "instant_meeting",
+  "transcript_complete": true,
+  "summary": "Live and final observations are retained with their exact intervals and provenance.",
+  "participants": [
+    {
+      "person_id": "ou_ada",
+      "display_name": "Ada Chen",
+      "attendance": [
+        {"joined_at": "2026-09-02T09:15:00Z", "left_at": "2026-09-02T09:22:00Z"}
+      ]
+    }
+  ],
+  "transcript": [
+    {
+      "segment_id": "obs-live",
+      "started_at": "2026-09-02T09:15:10Z",
+      "ended_at": "2026-09-02T09:15:40Z",
+      "text": "Live wording retained.",
+      "speaker": {"kind": "anonymous", "cluster_id": "live-1"},
+      "attribution_confidence": 0.61,
+      "provenance": {"stage": "live_stream", "model": "live-stt-1"}
+    },
+    {
+      "segment_id": "obs-final",
+      "started_at": "2026-09-02T09:15:10.001000Z",
+      "ended_at": "2026-09-02T09:15:39Z",
+      "text": "Final wording retained.",
+      "speaker": {"kind": "anonymous", "cluster_id": "final-1"},
+      "attribution_confidence": 0.97,
+      "provenance": {"stage": "final_batch", "model": "final-stt-2"}
+    },
+    {
+      "segment_id": "obs-partial",
+      "started_at": "2026-09-02T09:15:30Z",
+      "ended_at": "2026-09-02T09:15:50Z",
+      "text": "A partially overlapping observation is retained.",
+      "speaker": {"kind": "ambiguous"},
+      "attribution_confidence": 0.35,
+      "provenance": {"stage": "live_stream", "model": "live-stt-1"}
+    },
+    {
+      "segment_id": "obs-zero",
+      "started_at": "2026-09-02T09:15:50Z",
+      "ended_at": "2026-09-02T09:15:50Z",
+      "text": "A zero-duration observation remains legal.",
+      "speaker": {"kind": "ambiguous"},
+      "attribution_confidence": 0.2,
+      "provenance": {"stage": "live_stream", "model": "live-stt-1"}
+    },
+    {
+      "segment_id": "obs-touch",
+      "started_at": "2026-09-02T09:15:50Z",
+      "ended_at": "2026-09-02T09:15:55Z",
+      "text": "A touching observation remains legal.",
+      "speaker": {"kind": "anonymous", "cluster_id": "touch-1"},
+      "attribution_confidence": 0.48,
+      "provenance": {"stage": "final_batch", "model": "final-stt-2"}
+    },
+    {
+      "segment_id": "fraction-a",
+      "started_at": "2026-09-02T09:16:00.1Z",
+      "ended_at": "2026-09-02T09:16:00.20Z",
+      "text": "Equivalent fractional spelling A.",
+      "speaker": {"kind": "anonymous", "cluster_id": "fraction-a"},
+      "attribution_confidence": 0.51,
+      "provenance": {"stage": "live_stream", "model": "live-stt-1"}
+    },
+    {
+      "segment_id": "fraction-b",
+      "started_at": "2026-09-02T09:16:00.100000Z",
+      "ended_at": "2026-09-02T09:16:00.200000Z",
+      "text": "Equivalent fractional spelling B.",
+      "speaker": {"kind": "anonymous", "cluster_id": "fraction-b"},
+      "attribution_confidence": 0.83,
+      "provenance": {"stage": "final_batch", "model": "final-stt-2"}
+    }
+  ],
+  "projects": [
+    {"name": "project-overlap", "evidence_segment_ids": ["obs-live", "obs-final"]}
+  ],
+  "decisions": [
+    {"text": "Retain each observation without grouping or retiming.", "evidence_segment_ids": ["obs-live", "obs-final", "obs-partial"]}
+  ],
+  "action_items": [],
+  "discussion_points": [
+    {"text": "Equivalent UTC fractions are ordered by instant and then ID.", "evidence_segment_ids": ["fraction-a", "fraction-b"]}
+  ],
+  "person_summaries": [],
+  "recording_gaps": [],
+  "processing_warnings": [
+    {"code": "overlapping_observations_retained", "detail": "Synthetic live and final observations overlap; every exact observation was retained."}
+  ],
+  "provenance": {
+    "runtime_profile": "online",
+    "stt_provider": "openai",
+    "stt_model": "stt-batch-preview",
+    "text_provider": "openai",
+    "text_model": "text-structured-preview",
+    "agent_version": "meeting-agent/0.1.0",
+    "processed_at": "2026-09-02T09:30:00Z"
+  },
+  "audio": {
+    "filename": "audio.enc",
+    "format": "opus",
+    "encryption": "age-x25519",
+    "duration_seconds": 420.0,
+    "bytes": 512,
+    "sha256": "sha256:110009dcee21620b166f3abfecb5eff7a873be729d1c2d53822e7acc5f34eb9b",
+    "expires_at": "2026-09-16T09:22:00Z"
+  }
+}

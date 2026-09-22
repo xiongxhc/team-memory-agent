@@ -1,9 +1,9 @@
 """The canonical meeting note and its backlinks.
 
-Every meeting in this file is imported through `meeting_store.import_meeting_revision`
-from the frozen `teammem-meeting/v1` fixtures, so what is rendered is what the
-store actually holds. The vault must carry the summary note and its backlinks and
-never the transcript or the audio.
+Meetings are imported through `meeting_store.import_meeting_revision` from
+supported contract fixtures, so what is rendered is what the store actually
+holds. The vault must carry the summary note and its backlinks and never the
+transcript or the audio.
 """
 
 import copy
@@ -35,6 +35,7 @@ from tests.test_meeting_bundles import write_meeting_bundle
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
 FIXTURES = Path(__file__).parent / "fixtures" / "meetings"
 COMPLETE = FIXTURES / "teammem-meeting-v1.complete.json"
+V2_OVERLAP = FIXTURES / "teammem-meeting-v2.overlap.json"
 
 TODAY = date(2026, 9, 3)
 IMPORTED_AT = "2026-09-02T16:00:00Z"
@@ -529,6 +530,27 @@ def test_no_transcript_text_and_no_audio_reaches_the_vault(tmp_path):
         assert payload["audio"]["sha256"] not in text, path
         assert AUDIO_ROOT not in text, path
         assert "audio" not in text.casefold(), path
+
+
+def test_v2_overlap_keeps_transcript_warning_detail_and_audio_out_of_vault(tmp_path):
+    payload = json.loads(V2_OVERLAP.read_text(encoding="utf-8"))
+    vault = _render(tmp_path, _validated_seeded(tmp_path, payload))
+    contents = {path: path.read_text() for path in _vault_files(vault)}
+
+    assert contents
+    for path, text in contents.items():
+        for segment in payload["transcript"]:
+            assert segment["text"] not in text, (path, segment["segment_id"])
+        assert payload["processing_warnings"][0]["detail"] not in text, path
+        assert payload["audio"]["filename"] not in text, path
+        assert payload["audio"]["sha256"] not in text, path
+        assert AUDIO_ROOT not in text, path
+    note = next(
+        text for path, text in contents.items()
+        if path.parent.name == "Week 2026-08-31-04" and path.name != "README.md"
+    )
+    assert "- Duration: 7 minutes" in note
+    assert "- overlapping_observations_retained" in note
 
 
 # --- projection management --------------------------------------------------

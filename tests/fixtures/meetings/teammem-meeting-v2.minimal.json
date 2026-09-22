@@ -1,0 +1,60 @@
+{
+  "schema": "teammem-meeting/v2",
+  "occurrence_id": "vc:7f21/instant@2026-09-02T09:15:00Z",
+  "revision": 1,
+  "provider": "feishu",
+  "provider_meeting_id": "vc:7f21/instant",
+  "title": "Instant Sync",
+  "started_at": "2026-09-02T09:15:00Z",
+  "ended_at": "2026-09-02T09:22:00Z",
+  "organizer": null,
+  "organizer_source": null,
+  "organizer_unresolved_reason": "instant_meeting",
+  "transcript_complete": true,
+  "summary": "A short instant meeting with one retained final observation.",
+  "participants": [
+    {
+      "person_id": "ou_ada",
+      "display_name": "Ada Chen",
+      "attendance": [
+        {"joined_at": "2026-09-02T09:15:00Z", "left_at": "2026-09-02T09:22:00Z"}
+      ]
+    }
+  ],
+  "transcript": [
+    {
+      "segment_id": "final-001",
+      "started_at": "2026-09-02T09:15:10Z",
+      "ended_at": "2026-09-02T09:15:40Z",
+      "text": "Nothing to decide today, I only wanted to confirm the schedule.",
+      "speaker": {"kind": "person", "person_id": "ou_ada", "display_name": "Ada Chen", "reconciled": true},
+      "attribution_confidence": 0.9,
+      "provenance": {"stage": "final_batch", "model": "batch-diarize-1"}
+    }
+  ],
+  "projects": [],
+  "decisions": [],
+  "action_items": [],
+  "discussion_points": [],
+  "person_summaries": [],
+  "recording_gaps": [],
+  "processing_warnings": [],
+  "provenance": {
+    "runtime_profile": "online",
+    "stt_provider": "openai",
+    "stt_model": "stt-batch-preview",
+    "text_provider": "openai",
+    "text_model": "text-structured-preview",
+    "agent_version": "meeting-agent/0.1.0",
+    "processed_at": "2026-09-02T09:30:00Z"
+  },
+  "audio": {
+    "filename": "audio.enc",
+    "format": "opus",
+    "encryption": "age-x25519",
+    "duration_seconds": 420.0,
+    "bytes": 512,
+    "sha256": "sha256:110009dcee21620b166f3abfecb5eff7a873be729d1c2d53822e7acc5f34eb9b",
+    "expires_at": "2026-09-16T09:22:00Z"
+  }
+}

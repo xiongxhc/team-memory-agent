@@ -36,7 +36,8 @@ member reviews it, and nothing is transmitted until that member explicitly runs
 |---|---|---|
 | `teammem` | Hub operator | Collect, import, query, and render |
 | `teammem-memberkit` | Individual member | Draft, review, and push local evidence |
-| `teammem-bundle/v1` | Both packages | Frozen JSON protocol |
+| `teammem-bundle/v1` | Both packages | Frozen member-bundle JSON protocol |
+| `teammem-meeting/v1`, `teammem-meeting/v2` | Meeting producer and hub | Versioned meeting artifact protocols |
 
 MemberKit is a standalone command-line package, not a skill. Members install only
 `teammem-memberkit`; they do not clone this repository or install the hub.

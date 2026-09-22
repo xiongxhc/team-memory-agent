@@ -1,4 +1,4 @@
-"""Strict validation for the frozen teammem-meeting/v1 bundle protocol.
+"""Strict validation for supported teammem-meeting bundle versions.
 
 Meeting bundles are a separate wire format from `teammem-bundle/v1`. Nothing in
 this module relaxes, reuses, or subclasses member-bundle assumptions: meetings
@@ -6,7 +6,8 @@ arrive as a directory (payload plus encrypted audio plus manifest plus a READY
 marker), carry a revision, and are validated field by field before anything is
 imported.
 
-The schema document is `docs/schemas/teammem-meeting-v1.md`.
+Schema documents are `docs/schemas/teammem-meeting-v1.md` and
+`docs/schemas/teammem-meeting-v2.md`.
 """
 
 import hashlib
@@ -19,6 +20,7 @@ from pathlib import Path
 
 
 MEETING_SCHEMA = "teammem-meeting/v1"
+MEETING_SCHEMA_V2 = "teammem-meeting/v2"
 MANIFEST_SCHEMA = "teammem-meeting-manifest/v1"
 
 MEETING_FILENAME = "meeting.json"
@@ -307,13 +309,14 @@ def _validate_participants(data: dict, ended: datetime) -> dict[str, str]:
 
 
 def _validate_transcript(
-    data: dict, people: dict[str, str], started: datetime, ended: datetime
+    data: dict, people: dict[str, str], started: datetime, ended: datetime, *, schema: str
 ) -> tuple[set[str], set[str]]:
     segments = _list(data, "transcript", MAX_SEGMENTS, "")
     segment_ids: set[str] = set()
     spoke: set[str] = set()
     previous_start = None
     previous_end = None
+    previous_order = None
     for index, segment in enumerate(segments):
         label = f"transcript segment {index} "
         _object(segment, _SEGMENT_KEYS, f"transcript segment {index}")
@@ -326,10 +329,16 @@ def _validate_transcript(
             raise _error(f"{label}ended_at precedes started_at")
         if segment_start < started or segment_end > ended:
             raise _error(f"{label}timing is outside the meeting window")
-        if previous_start is not None and segment_start < previous_start:
-            raise _error(f"{label}breaks transcript start order")
-        if previous_end is not None and segment_start < previous_end:
-            raise _error(f"{label}overlaps the previous segment")
+        if schema == MEETING_SCHEMA_V2:
+            order = (segment_start, segment_end, segment_id)
+            if previous_order is not None and order <= previous_order:
+                raise _error(f"{label}breaks transcript (start, end, segment_id) order")
+            previous_order = order
+        else:
+            if previous_start is not None and segment_start < previous_start:
+                raise _error(f"{label}breaks transcript start order")
+            if previous_end is not None and segment_start < previous_end:
+                raise _error(f"{label}overlaps the previous segment")
         _text(segment, "text", MAX_SEGMENT_TEXT, label)
         confidence = segment["attribution_confidence"]
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
@@ -499,8 +508,9 @@ def _validate_payload(data) -> None:
         raise _error("top-level meeting.json must be an object")
     if set(data) != _TOP_KEYS:
         raise _error("meeting.json has invalid top-level fields")
-    if data["schema"] != MEETING_SCHEMA:
-        raise _error(f"invalid schema: expected {MEETING_SCHEMA}")
+    schema = data["schema"]
+    if schema not in (MEETING_SCHEMA, MEETING_SCHEMA_V2):
+        raise _error(f"invalid schema: expected {MEETING_SCHEMA} or {MEETING_SCHEMA_V2}")
 
     revision = data["revision"]
     if isinstance(revision, bool) or not isinstance(revision, int):
@@ -526,7 +536,7 @@ def _validate_payload(data) -> None:
     _text(data, "summary", MAX_SUMMARY)
 
     people = _validate_participants(data, ended)
-    segment_ids, spoke = _validate_transcript(data, people, started, ended)
+    segment_ids, spoke = _validate_transcript(data, people, started, ended, schema=schema)
     _validate_synthesis(data, people, segment_ids, spoke)
     _validate_gaps_and_warnings(data, started, ended)
     _validate_provenance(data)

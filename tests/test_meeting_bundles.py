@@ -20,6 +20,8 @@ from teammem.meeting_bundles import (
 FIXTURES = Path(__file__).parent / "fixtures" / "meetings"
 COMPLETE = FIXTURES / "teammem-meeting-v1.complete.json"
 MINIMAL = FIXTURES / "teammem-meeting-v1.minimal.json"
+V2_MINIMAL = FIXTURES / "teammem-meeting-v2.minimal.json"
+V2_OVERLAP = FIXTURES / "teammem-meeting-v2.overlap.json"
 
 
 def _fixture(path: Path) -> dict:
@@ -169,6 +171,61 @@ def test_minimal_bundle_has_null_organizer_with_instant_meeting_reason(tmp_path)
     assert bundle.payload["organizer_source"] is None
     assert bundle.payload["organizer_unresolved_reason"] == "instant_meeting"
     assert bundle.revision == 1
+
+
+def test_v2_bundle_loads_overlapping_observations_without_losing_facts(tmp_path):
+    payload = _fixture(MINIMAL)
+    payload["schema"] = "teammem-meeting/v2"
+    payload["transcript"] = [
+        {
+            "segment_id": "obs-live",
+            "started_at": "2026-09-02T09:15:00Z",
+            "ended_at": "2026-09-02T09:15:00.020000Z",
+            "text": "Live wording retained.",
+            "speaker": {"kind": "anonymous", "cluster_id": "live-1"},
+            "attribution_confidence": 0.61,
+            "provenance": {"stage": "live_stream", "model": "live-stt-1"},
+        },
+        {
+            "segment_id": "obs-final",
+            "started_at": "2026-09-02T09:15:00.001000Z",
+            "ended_at": "2026-09-02T09:15:00.019000Z",
+            "text": "Final wording retained.",
+            "speaker": {"kind": "anonymous", "cluster_id": "final-1"},
+            "attribution_confidence": 0.97,
+            "provenance": {"stage": "final_batch", "model": "final-stt-2"},
+        },
+    ]
+
+    bundle = _load(tmp_path, payload)
+
+    assert bundle.payload["transcript"] == payload["transcript"]
+    assert bundle.payload["transcript"][0]["text"] == "Live wording retained."
+    assert bundle.payload["transcript"][1]["text"] == "Final wording retained."
+
+
+def test_shared_v2_fixtures_load_with_literal_canonical_hashes(tmp_path):
+    expected = {
+        V2_MINIMAL: "sha256:e243b84f155324483fabb4d88bf07af2beab6639c0c2555fecfe082a6126a7cc",
+        V2_OVERLAP: "sha256:4efa7b78605d8c0a60a5515adda74181071079ab2bdebbfec69662a334cda9fa",
+    }
+    for index, (path, expected_hash) in enumerate(expected.items()):
+        payload = _fixture(path)
+        bundle = _load(tmp_path / str(index), payload)
+        assert payload["schema"] == "teammem-meeting/v2"
+        assert bundle.artifact_hash == expected_hash
+
+
+def test_canonical_hash_includes_schema_and_original_transcript_order():
+    v1 = _fixture(MINIMAL)
+    v2 = copy.deepcopy(v1)
+    v2["schema"] = "teammem-meeting/v2"
+    reordered = _fixture(V2_OVERLAP)
+    original_hash = canonical_artifact_hash(reordered)
+    reordered["transcript"].reverse()
+
+    assert canonical_artifact_hash(v1) != canonical_artifact_hash(v2)
+    assert canonical_artifact_hash(reordered) != original_hash
 
 
 def test_complete_fixture_shape_is_the_cross_repository_contract():
@@ -439,7 +496,7 @@ def test_audio_filename_must_be_audio_enc(tmp_path):
 
 def test_unknown_major_schema_is_rejected(tmp_path):
     payload = _fixture(MINIMAL)
-    payload["schema"] = "teammem-meeting/v2"
+    payload["schema"] = "teammem-meeting/v3"
     assert "teammem-meeting/v1" in _reject(tmp_path, payload)
 
 
@@ -576,6 +633,141 @@ def test_transcript_segments_must_not_overlap(tmp_path):
     payload = _fixture(COMPLETE)
     payload["transcript"][1]["started_at"] = "2026-09-02T14:00:20Z"   # inside s001
     assert "overlap" in _reject(tmp_path, payload)
+
+
+def test_v1_same_overlap_stays_rejected_after_v2_support(tmp_path):
+    payload = _fixture(MINIMAL)
+    first = payload["transcript"][0]
+    first["started_at"] = "2026-09-02T09:15:10Z"
+    first["ended_at"] = "2026-09-02T09:15:40Z"
+    second = copy.deepcopy(first)
+    second["segment_id"] = "s002"
+    second["started_at"] = "2026-09-02T09:15:20Z"
+    second["ended_at"] = "2026-09-02T09:15:30Z"
+    payload["transcript"] = [first, second]
+
+    assert "overlap" in _reject(tmp_path, payload)
+
+
+def test_v2_equal_time_ids_use_python_ordinal_order(tmp_path):
+    payload = _fixture(MINIMAL)
+    payload["schema"] = "teammem-meeting/v2"
+    first = payload["transcript"][0]
+    first["segment_id"] = "A"
+    first["started_at"] = "2026-09-02T09:15:10Z"
+    first["ended_at"] = "2026-09-02T09:15:20Z"
+    second = copy.deepcopy(first)
+    second["segment_id"] = "a"
+    payload["transcript"] = [first, second]
+
+    assert [s["segment_id"] for s in _load(tmp_path, payload).payload["transcript"]] == [
+        "A", "a"
+    ]
+    payload["transcript"].reverse()
+    assert "order" in _reject(tmp_path / "reversed", payload)
+
+
+def test_v2_preserves_the_shared_ascii_segment_id_grammar(tmp_path):
+    payload = _fixture(MINIMAL)
+    payload["schema"] = "teammem-meeting/v2"
+    payload["transcript"][0]["segment_id"] = "\ue000"
+
+    assert "segment_id" in _reject(tmp_path, payload)
+
+
+def test_v2_equal_instants_use_parsed_fraction_and_then_id(tmp_path):
+    payload = _fixture(MINIMAL)
+    payload["schema"] = "teammem-meeting/v2"
+    first = payload["transcript"][0]
+    first["segment_id"] = "a"
+    first["started_at"] = "2026-09-02T09:15:10.1Z"
+    first["ended_at"] = "2026-09-02T09:15:20.10Z"
+    second = copy.deepcopy(first)
+    second["segment_id"] = "b"
+    second["started_at"] = "2026-09-02T09:15:10.100000Z"
+    second["ended_at"] = "2026-09-02T09:15:20.100000Z"
+    payload["transcript"] = [first, second]
+
+    assert [s["segment_id"] for s in _load(tmp_path, payload).payload["transcript"]] == ["a", "b"]
+    payload["transcript"].reverse()
+    assert "order" in _reject(tmp_path / "reversed", payload)
+
+
+@pytest.mark.parametrize("end", [
+    "2026-09-02T09:15:20Z", "2026-09-02T09:15:30Z",
+])
+def test_v2_equal_start_requires_end_order_before_id(tmp_path, end):
+    payload = _fixture(MINIMAL)
+    payload["schema"] = "teammem-meeting/v2"
+    first = payload["transcript"][0]
+    first["segment_id"] = "z"
+    first["started_at"] = "2026-09-02T09:15:10Z"
+    first["ended_at"] = "2026-09-02T09:15:10Z"
+    second = copy.deepcopy(first)
+    second["segment_id"] = "a"
+    second["ended_at"] = end
+    payload["transcript"] = [first, second]
+
+    assert [s["segment_id"] for s in _load(tmp_path, payload).payload["transcript"]] == ["z", "a"]
+    payload["transcript"].reverse()
+    assert "order" in _reject(tmp_path / "reversed", payload)
+
+
+def test_v2_rejects_earlier_start_even_when_intervals_overlap(tmp_path):
+    payload = _fixture(MINIMAL)
+    payload["schema"] = "teammem-meeting/v2"
+    first = payload["transcript"][0]
+    first["segment_id"] = "a"
+    first["started_at"] = "2026-09-02T09:15:20Z"
+    first["ended_at"] = "2026-09-02T09:15:40Z"
+    second = copy.deepcopy(first)
+    second["segment_id"] = "b"
+    second["started_at"] = "2026-09-02T09:15:10Z"
+    payload["transcript"] = [first, second]
+
+    assert "order" in _reject(tmp_path, payload)
+
+
+@pytest.mark.parametrize(("mutation", "message"), [
+    ("duplicate_id", "duplicate"),
+    ("reversed_interval", "ended_at"),
+    ("before_window", "window"),
+    ("after_window", "window"),
+    ("bad_speaker", "speaker"),
+    ("bad_evidence", "unknown segment"),
+    ("bad_provenance", "stage"),
+    ("extra_segment_key", "invalid fields"),
+    ("extra_top_key", "top-level"),
+])
+def test_v2_keeps_shared_rejections(tmp_path, mutation, message):
+    payload = _fixture(MINIMAL)
+    payload["schema"] = "teammem-meeting/v2"
+    first = payload["transcript"][0]
+    if mutation == "duplicate_id":
+        payload["transcript"].append(copy.deepcopy(first))
+    elif mutation == "reversed_interval":
+        first["ended_at"] = "2026-09-02T09:15:09Z"
+    elif mutation == "before_window":
+        first["started_at"] = "2026-09-02T09:14:59Z"
+    elif mutation == "after_window":
+        first["ended_at"] = "2026-09-02T09:22:01Z"
+    elif mutation == "bad_speaker":
+        first["speaker"] = {
+            "kind": "person",
+            "person_id": "ou_ghost",
+            "display_name": "Ghost",
+            "reconciled": True,
+        }
+    elif mutation == "bad_evidence":
+        payload["decisions"] = [{"text": "Unsupported claim.", "evidence_segment_ids": ["ghost"]}]
+    elif mutation == "bad_provenance":
+        first["provenance"]["stage"] = "guess"
+    elif mutation == "extra_segment_key":
+        first["private_note"] = "not a wire field"
+    elif mutation == "extra_top_key":
+        payload["private_note"] = "not a wire field"
+
+    assert message in _reject(tmp_path, payload)
 
 
 def test_segment_end_before_start_is_rejected(tmp_path):

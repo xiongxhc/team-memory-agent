@@ -1,8 +1,8 @@
 """Meeting storage: migration, revisioned import, and the read API.
 
-Every meeting row in this file comes from the frozen `teammem-meeting/v1`
-fixtures through `load_meeting_bundle`, never from a hand-written dict, so the
-schema is proven against the contract Task 1 froze rather than against prose.
+Contract tests load versioned meeting fixtures through `load_meeting_bundle`
+before import, so compatibility is proven at the real ingress rather than only
+against hand-written store dictionaries.
 """
 
 import json
@@ -38,6 +38,7 @@ from tests.test_meeting_bundles import write_meeting_bundle
 FIXTURES = Path(__file__).parent / "fixtures" / "meetings"
 COMPLETE = FIXTURES / "teammem-meeting-v1.complete.json"
 MINIMAL = FIXTURES / "teammem-meeting-v1.minimal.json"
+V2_OVERLAP = FIXTURES / "teammem-meeting-v2.overlap.json"
 
 IMPORTED_AT = "2026-09-02T16:00:00Z"
 
@@ -316,6 +317,146 @@ def test_get_meeting_keeps_anonymous_and_ambiguous_speakers_distinct(tmp_path):
     assert speakers["s008"] == {"kind": "anonymous", "cluster_id": "spk_3"}
     assert speakers["s009"] == {"kind": "ambiguous"}
     assert speakers["s001"]["person_id"] == "ou_ada" and speakers["s001"]["reconciled"] is True
+
+
+def test_v2_overlap_round_trips_every_observation_and_evidence_after_reopen(tmp_path):
+    path = tmp_path / "l.db"
+    conn = open_db(path)
+    bundle = _bundle(tmp_path, _payload(V2_OVERLAP))
+    _import(conn, bundle)
+    conn.close()
+
+    conn = open_db(path)
+    meeting = get_meeting(conn, "vc:7f21/overlap@2026-09-02T09:15:00Z")
+    assert meeting["transcript"] == [
+        {
+            "segment_id": "obs-live",
+            "started_at": "2026-09-02T09:15:10Z",
+            "ended_at": "2026-09-02T09:15:40Z",
+            "text": "Live wording retained.",
+            "speaker": {"kind": "anonymous", "cluster_id": "live-1"},
+            "attribution_confidence": 0.61,
+            "provenance": {"stage": "live_stream", "model": "live-stt-1"},
+        },
+        {
+            "segment_id": "obs-final",
+            "started_at": "2026-09-02T09:15:10.001000Z",
+            "ended_at": "2026-09-02T09:15:39Z",
+            "text": "Final wording retained.",
+            "speaker": {"kind": "anonymous", "cluster_id": "final-1"},
+            "attribution_confidence": 0.97,
+            "provenance": {"stage": "final_batch", "model": "final-stt-2"},
+        },
+        {
+            "segment_id": "obs-partial",
+            "started_at": "2026-09-02T09:15:30Z",
+            "ended_at": "2026-09-02T09:15:50Z",
+            "text": "A partially overlapping observation is retained.",
+            "speaker": {"kind": "ambiguous"},
+            "attribution_confidence": 0.35,
+            "provenance": {"stage": "live_stream", "model": "live-stt-1"},
+        },
+        {
+            "segment_id": "obs-zero",
+            "started_at": "2026-09-02T09:15:50Z",
+            "ended_at": "2026-09-02T09:15:50Z",
+            "text": "A zero-duration observation remains legal.",
+            "speaker": {"kind": "ambiguous"},
+            "attribution_confidence": 0.2,
+            "provenance": {"stage": "live_stream", "model": "live-stt-1"},
+        },
+        {
+            "segment_id": "obs-touch",
+            "started_at": "2026-09-02T09:15:50Z",
+            "ended_at": "2026-09-02T09:15:55Z",
+            "text": "A touching observation remains legal.",
+            "speaker": {"kind": "anonymous", "cluster_id": "touch-1"},
+            "attribution_confidence": 0.48,
+            "provenance": {"stage": "final_batch", "model": "final-stt-2"},
+        },
+        {
+            "segment_id": "fraction-a",
+            "started_at": "2026-09-02T09:16:00.1Z",
+            "ended_at": "2026-09-02T09:16:00.20Z",
+            "text": "Equivalent fractional spelling A.",
+            "speaker": {"kind": "anonymous", "cluster_id": "fraction-a"},
+            "attribution_confidence": 0.51,
+            "provenance": {"stage": "live_stream", "model": "live-stt-1"},
+        },
+        {
+            "segment_id": "fraction-b",
+            "started_at": "2026-09-02T09:16:00.100000Z",
+            "ended_at": "2026-09-02T09:16:00.200000Z",
+            "text": "Equivalent fractional spelling B.",
+            "speaker": {"kind": "anonymous", "cluster_id": "fraction-b"},
+            "attribution_confidence": 0.83,
+            "provenance": {"stage": "final_batch", "model": "final-stt-2"},
+        },
+    ]
+    assert meeting["projects"] == [{
+        "name": "project-overlap", "evidence_segment_ids": ["obs-live", "obs-final"]
+    }]
+    assert meeting["decisions"] == [{
+        "text": "Retain each observation without grouping or retiming.",
+        "evidence_segment_ids": ["obs-live", "obs-final", "obs-partial"],
+    }]
+    assert meeting["discussion_points"] == [{
+        "text": "Equivalent UTC fractions are ordered by instant and then ID.",
+        "evidence_segment_ids": ["fraction-a", "fraction-b"],
+    }]
+    raw_json, stored_hash = conn.execute(
+        "SELECT raw_json, artifact_hash FROM meeting_artifacts "
+        "WHERE occurrence_id = ? AND revision = 2",
+        ("vc:7f21/overlap@2026-09-02T09:15:00Z",),
+    ).fetchone()
+    assert json.loads(raw_json)["schema"] == "teammem-meeting/v2"
+    assert stored_hash == "sha256:4efa7b78605d8c0a60a5515adda74181071079ab2bdebbfec69662a334cda9fa"
+    assert canonical_artifact_hash(json.loads(raw_json)) == stored_hash
+
+
+def test_same_revision_v1_to_v2_schema_change_conflicts(tmp_path):
+    conn = open_db(tmp_path / "l.db")
+    v1 = _bundle(tmp_path, _payload(MINIMAL), name="v1")
+    changed_schema = _payload(MINIMAL)
+    changed_schema["schema"] = "teammem-meeting/v2"
+    v2 = _bundle(tmp_path, changed_schema, name="v2")
+    _import(conn, v1)
+
+    with pytest.raises(MeetingRevisionConflict):
+        _import(conn, v2)
+
+    raw_json = conn.execute(
+        "SELECT raw_json FROM meeting_artifacts WHERE occurrence_id = ? AND revision = 1",
+        (v1.occurrence_id,),
+    ).fetchone()[0]
+    assert json.loads(raw_json)["schema"] == "teammem-meeting/v1"
+    assert conn.execute("SELECT COUNT(*) FROM meeting_artifacts").fetchone()[0] == 1
+
+
+def test_higher_v2_revision_becomes_current_and_preserves_v1_raw_history(tmp_path):
+    path = tmp_path / "l.db"
+    conn = open_db(path)
+    v1 = _bundle(tmp_path, _payload(MINIMAL), name="v1")
+    _import(conn, v1)
+    payload = _payload(MINIMAL)
+    payload["schema"] = "teammem-meeting/v2"
+    payload["revision"] = 2
+    v2 = _bundle(tmp_path, payload, name="v2")
+    _import(conn, v2, imported_at="2026-09-03T08:00:00Z")
+    conn.close()
+
+    conn = open_db(path)
+    assert get_meeting(conn, v1.occurrence_id)["revision"] == 2
+    assert get_meeting(conn, v1.occurrence_id, revision=1)["transcript"][0]["segment_id"] == "s001"
+    schemas = [
+        (revision, json.loads(raw_json)["schema"])
+        for revision, raw_json in conn.execute(
+            "SELECT revision, raw_json FROM meeting_artifacts "
+            "WHERE occurrence_id = ? ORDER BY revision",
+            (v1.occurrence_id,),
+        )
+    ]
+    assert schemas == [(1, "teammem-meeting/v1"), (2, "teammem-meeting/v2")]
 
 
 def test_minimal_fixture_stores_a_null_organizer_with_its_reason(tmp_path):
