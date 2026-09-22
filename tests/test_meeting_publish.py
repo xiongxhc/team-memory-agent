@@ -167,6 +167,7 @@ def test_publication_writes_a_receipt_naming_the_commit_the_remote_holds(bench):
     "Agenda final]",
     "Agenda \\ path",
     "Agenda [draft] \\ path",
+    "Sprint [3] Review",
 ])
 def test_title_metacharacters_publish_to_a_real_bare_remote(tmp_path, title):
     payload = _payload()

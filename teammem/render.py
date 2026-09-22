@@ -782,6 +782,14 @@ def _md_links(text: str) -> list[str]:
     carry balanced parentheses to any depth, an expression can only count to a
     fixed one, and a destination cut short at the wrong parenthesis reads as a
     link to a file that does not exist.
+
+    A label may carry brackets to any depth too, as long as they pair up, so
+    the closing bracket is the one that balances the opener and not the first
+    one after it. A label is producer free text: counting instead of stopping
+    at the first `]` is what keeps a link the vault really renders from being
+    walked past and shipped unverified. An opener nothing closes is no link,
+    and the scan starts over one character along so a link inside it still
+    counts.
     """
     def escaped(index: int) -> bool:
         backslashes = 0
@@ -795,11 +803,16 @@ def _md_links(text: str) -> list[str]:
         if escaped(opened):
             cursor = opened + 1
             continue
-        closed = text.find("]", opened + 1)
-        while closed >= 0 and escaped(closed):
-            closed = text.find("]", closed + 1)
+        closed, depth, index = -1, 1, opened + 1
+        while index < len(text) and depth:
+            if text[index] in "[]" and not escaped(index):
+                depth += 1 if text[index] == "[" else -1
+                if not depth:
+                    closed = index
+            index += 1
         if closed < 0:
-            break
+            cursor = opened + 1
+            continue
         if text[closed + 1:closed + 2] != "(":
             cursor = opened + 1
             continue

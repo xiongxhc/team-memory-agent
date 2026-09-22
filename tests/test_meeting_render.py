@@ -443,6 +443,7 @@ def test_person_and_week_indexes_link_the_note(tmp_path):
     ("Agenda final]", r"Agenda final\]"),
     ("Agenda \\ path", r"Agenda \\ path"),
     ("Agenda [draft] \\ path", r"Agenda \[draft\] \\ path"),
+    ("Sprint [3] Review", r"Sprint \[3\] Review"),
 ])
 def test_title_metacharacters_keep_every_note_link_valid_and_deterministic(
         tmp_path, title, label):
@@ -1247,3 +1248,29 @@ def test_a_processing_warning_reaches_the_note_as_a_code_and_nothing_else(tmp_pa
     note = _note(_render(tmp_path, _seeded(tmp_path, payload)))
     assert "- overlapping_speech_ambiguous\n" in note
     assert "leaked" not in note
+
+
+def test_a_bracket_in_a_link_label_never_hides_the_link_from_the_check(tmp_path):
+    """A label is producer free text, and free text reaches the note verbatim.
+
+    A link the scanner walks past is a link the check cannot verify, so the
+    note would be committed and pushed carrying a link out of the vault.
+    """
+    payload = _payload()
+    payload["summary"] = ("Agreed the plan. See [the [v2] spec]"
+                          "(../../../outside-the-vault.md) for detail.")
+    conn = _validated_seeded(tmp_path, payload)
+    vault = _render(tmp_path, conn)
+
+    found = _findings(conn, vault)
+    assert [f["invariant"] for f in found] == [LINK_RESOLVES]
+    assert "outside-the-vault.md" in found[0]["detail"]
+    assert found[0]["occurrence_id"] == payload["occurrence_id"]
+
+
+def test_link_labels_carry_balanced_brackets_and_an_odd_one_starts_over():
+    assert render_module._md_links("[the [v2] spec](x.md)") == ["x.md"]
+    assert render_module._md_links("[a [b [c] d] e](deep.md)") == ["deep.md"]
+    # an opener nothing closes does not swallow the link that follows it
+    assert render_module._md_links("[stray [b](c.md)") == ["c.md"]
+    assert render_module._md_links("[a] (b.md) [c](d.md)") == ["d.md"]
