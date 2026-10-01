@@ -312,8 +312,11 @@ deterministic rendering continues from ledger evidence and any cached summaries.
 
 `TEAMMEM_LLM_PROVIDER` selects the synthesis backend and defaults to `claude`.
 Claude preserves the existing Anthropic-API-first, Claude-CLI-fallback behavior
-and uses `TEAMMEM_LLM_DAILY_MODEL` / `TEAMMEM_LLM_REPORT_MODEL`. Selecting
-`codex` uses the operator's existing Codex login and pins both workloads to
+and requires explicit operator-selected `TEAMMEM_LLM_DAILY_MODEL` /
+`TEAMMEM_LLM_REPORT_MODEL` identifiers for the corresponding workload when that
+backend is available. There are no Claude model defaults; missing or old
+placeholder values fail synthesis setup without blocking collection or rendering.
+Selecting `codex` uses the operator's existing Codex login and pins both workloads to
 `gpt-5.6-sol`; daily calls use medium reasoning and weekly reports use high
 reasoning. Codex runs ephemerally with model-driven tools disabled, a read-only
 sandbox, a credential-scrubbed environment, and a structured text envelope.
@@ -437,6 +440,14 @@ before deleting the virtual environment or checkout.
 LLM-backed synthesis is optional. Without a configured backend, journal and
 weekly-report synthesis are skipped while the ledger, importer, queries, and
 deterministic renderer continue to work.
+
+For shared Markdown publication, follow the complete
+[private vault setup](docs/deployment.md#publish-the-rendered-vault-to-a-private-git-remote)
+before setting `TEAMMEM_PUSH=1`. It covers credentials under the schedule account,
+remote history, branch/upstream, and the verified first push. The public engine
+needs no private overlay; operators own their identities, secrets, private
+repositories, networking, monitoring, and recovery services. These boundaries
+are described in the [deployment guide](docs/deployment.md#public-engine-and-operator-responsibilities).
 
 ## Principles
 

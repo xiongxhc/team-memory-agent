@@ -144,8 +144,12 @@ teammem render --verify
 
 The ledger and the `weekly_commit_counts` snapshot are local operator data.
 Restrict access to the database, MemberKit inbox/archive/quarantine, snapshots,
-and rendered vault according to the team's retention and access policy. Do not
-commit any of them.
+and rendered vault according to the team's retention and access policy. Never
+commit credentials, databases, snapshots, or raw import data to the public engine
+repository. The rendered vault may intentionally be committed and published to
+a **separate private repository** after reviewing its contents and access list;
+follow the [publication setup](deployment.md#publish-the-rendered-vault-to-a-private-git-remote)
+before enabling `TEAMMEM_PUSH`. Vault history does not replace a ledger backup.
 
 ## MemberKit import boundary
 

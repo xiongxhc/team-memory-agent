@@ -387,13 +387,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "journal":
         ids = IdentityMaps.load(cfg.config_dir)
         today = date.fromisoformat(args.today) if args.today else date.today()
-        llm = (
-            None
-            if args.dry_run
-            else resolve_llm_backend(
-                cfg, cfg.llm_daily_model, max_tokens=1024
+        try:
+            llm = (
+                None
+                if args.dry_run
+                else resolve_llm_backend(
+                    cfg, cfg.llm_daily_model, max_tokens=1024
+                )
             )
-        )
+        except ValueError as failure:
+            print(f"error: {failure}", file=sys.stderr)
+            return 2
         return run_journal(
             cfg,
             ids,
@@ -407,13 +411,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "report":
         ids = IdentityMaps.load(cfg.config_dir)
         base = date.fromisoformat(args.week_of) if args.week_of else date.today()
-        llm = (
-            None
-            if args.dry_run
-            else resolve_llm_backend(
-                cfg, cfg.llm_report_model, max_tokens=8192
+        try:
+            llm = (
+                None
+                if args.dry_run
+                else resolve_llm_backend(
+                    cfg, cfg.llm_report_model, max_tokens=8192
+                )
             )
-        )
+        except ValueError as failure:
+            print(f"error: {failure}", file=sys.stderr)
+            return 2
         return run_report(
             cfg,
             ids,
