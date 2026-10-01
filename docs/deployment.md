@@ -123,15 +123,31 @@ Process environment values override file values for one run.
 | `TEAMMEM_INBOX`, `TEAMMEM_ARCHIVE`, `TEAMMEM_QUARANTINE` | Optional as one complete set | Import an already-exported MemberKit inbox and retain accepted/rejected files |
 | `TEAMMEM_SNAPSHOTS` | Optional | Daily SQLite backup directory; newest 14 are retained |
 | `TEAMMEM_OBSIDIAN_PROJECTS` | Optional | Source directory for project-document synchronization |
-| `TEAMMEM_PUSH` | Optional | Best-effort Git push of the rendered vault when true |
+| `TEAMMEM_PUSH` | Optional, after publication setup below | Best-effort Git push of the rendered vault when true; default off |
 | `TEAMMEM_LLM_PROVIDER` | Optional | Synthesis backend: `claude` (default) or `codex` |
 | `ANTHROPIC_API_KEY` | Optional | With the Claude provider, use the Anthropic API instead of the Claude CLI fallback |
-| `TEAMMEM_LLM_DAILY_MODEL`, `TEAMMEM_LLM_REPORT_MODEL` | Optional | Claude synthesis model names; ignored by the Codex provider |
+| `TEAMMEM_LLM_DAILY_MODEL`, `TEAMMEM_LLM_REPORT_MODEL` | Required for the corresponding Claude synthesis workload | Explicit model identifiers supported by your API account or Claude CLI; no defaults; ignored by the Codex provider |
 | `TEAMMEM_CODEX_BIN` | Optional | Codex executable; default `codex` |
 | `TEAMMEM_LLM_CONCURRENCY` | Optional | Concurrent journal LLM calls; default `2`, valid integers `1..8` |
 
 Without an LLM backend, synthesis stages are skipped and deterministic rendering
-still succeeds.
+still succeeds. For Claude, choose model identifiers supported by your own
+Anthropic account or authenticated Claude CLI and set both model keys in the
+protected `hub.env`. Daily journals use `TEAMMEM_LLM_DAILY_MODEL`; weekly reports
+use `TEAMMEM_LLM_REPORT_MODEL`. A standalone command requires only its workload's
+model. TeamMem does not choose a current provider model for you or verify account
+entitlement until a real synthesis request.
+
+The Anthropic API key takes precedence over automatic detection of `claude` on
+`PATH`. With either backend available, missing, whitespace-only, or the old
+`daily-summary-model` / `weekly-summary-model` placeholder values produce an
+actionable configuration error before a provider call. This includes hosts
+where an installed Claude CLI was discovered automatically. `journal` and
+`report` exit `2` for that setup error; a full daily run records failed synthesis
+while continuing deterministic stages. Inspect the stage results, not only the
+daily exit code. Configuration loading, collection, capture-only, rendering,
+and synthesis dry runs do not require models. Claude CLI authentication must be
+available to the OS account running the schedule, just like Git authentication.
 
 The Codex provider requires a prior interactive `codex login` for the same OS
 account that owns the schedule. It pins `gpt-5.6-sol`, uses medium reasoning for
@@ -140,6 +156,163 @@ ephemerally with tools disabled, a read-only sandbox, a credential-scrubbed
 environment, and structured text output. Begin with
 `TEAMMEM_LLM_CONCURRENCY=1`; concurrent processes use isolated temporary output
 paths but still share one account's authentication and limits.
+
+## Publish the rendered vault to a private Git remote
+
+This is optional distribution of regenerated Markdown, separate from installing
+the public engine. Create a **private** repository on your chosen Git host and
+grant the scheduled OS account read/write access to that repository only. Use
+the host's repository-creation UI, verify its visibility and readers, and copy
+its credential-free SSH clone URL. For a new repository, leave README, license,
+and template initialization disabled so the remote starts empty. If it already
+has commits, follow the existing-remote path below.
+
+Run these steps as the same OS account and with the same Git executable used by
+the hub schedule. Remove/pause the schedule during setup. Keep `TEAMMEM_PUSH=0`
+in the protected environment file until the first push is verified. Do not put
+the vault inside the public engine checkout, the inbox transport checkout, or
+the ledger/backup directory. The renderer owns its managed Markdown paths and
+`git add -A` stages the entire vault; keep secrets and raw inputs outside it.
+
+### Authentication and remote selection
+
+Configure a dedicated SSH identity for the service account in its protected
+SSH configuration, grant that identity write access on the Git host, and verify
+the host key through the host's trusted published fingerprints. Authenticate
+once under operator observation. Scheduled runs must not depend on an
+interactive password prompt or a terminal's temporary SSH agent. Use the
+platform's unattended credential mechanism appropriate to that account; do not
+remove credential protection merely to make a test pass.
+
+The following POSIX-shell examples use SSH. Replace the example path, remote and
+branch with your choices. `TEAMMEM_VAULT` here is also a shell variable for Git
+commands: separately write its exact absolute value into `hub.env`, whose values
+are not shell-expanded.
+
+```bash
+export TEAMMEM_VAULT=/absolute/path/to/private-rendered-vault
+VAULT_REMOTE=git@forge.example:team/team-memory-vault.git
+VAULT_BRANCH=main
+env -u SSH_AUTH_SOCK GIT_TERMINAL_PROMPT=0 \
+  GIT_SSH_COMMAND='ssh -o BatchMode=yes' git ls-remote "$VAULT_REMOTE"
+```
+
+A successful empty result means an empty remote; authentication errors are not
+an empty repository. If using HTTPS instead, configure a protected credential
+helper usable noninteractively by the schedule account and run the same checks
+with its credential-free HTTPS URL. Never embed a token in a remote URL, command,
+Git config, or checked-in file. A read-only connector API token does not imply
+permission to push a Git repository.
+
+### New, empty remote
+
+Start with an absent destination directory; preserve any existing local vault
+elsewhere and inspect it before choosing how to migrate its history. Do not
+clone over it. After confirming the remote has no refs:
+
+```bash
+env -u SSH_AUTH_SOCK GIT_TERMINAL_PROMPT=0 \
+  GIT_SSH_COMMAND='ssh -o BatchMode=yes' git clone "$VAULT_REMOTE" "$TEAMMEM_VAULT"
+git -C "$TEAMMEM_VAULT" switch --orphan "$VAULT_BRANCH"
+```
+
+### Remote with existing commits
+
+Use a fresh, absent local destination, choose an existing remote branch, and
+preserve its history. Do not initialize an unrelated local repository or force
+push over the remote:
+
+```bash
+env -u SSH_AUTH_SOCK GIT_TERMINAL_PROMPT=0 \
+  GIT_SSH_COMMAND='ssh -o BatchMode=yes' \
+  git clone --branch "$VAULT_BRANCH" --single-branch "$VAULT_REMOTE" "$TEAMMEM_VAULT"
+git -C "$TEAMMEM_VAULT" status --short
+```
+
+Review the remote's contents before rendering: managed Markdown paths will be
+regenerated. Use a dedicated vault repository, not an engine or general document
+repository. For an existing local vault with its own commits, inspect its origin,
+branch and history first; reconcile divergence explicitly or retain that
+checkout and migrate via a fresh clone. These instructions never reset, delete,
+merge unrelated histories, or force-push operator data.
+
+### First publication and scheduled write access
+
+For either path, configure the vault-local Git author name and email chosen by
+the operator (`git config user.name` and `git config user.email`), since cloning
+a repository does not establish commit identity. Configure unattended SSH and
+verify the selected origin before creating the first rendered commit:
+
+```bash
+git -C "$TEAMMEM_VAULT" config core.sshCommand 'ssh -o BatchMode=yes'
+git -C "$TEAMMEM_VAULT" remote -v
+TEAMMEM_PUSH=0 teammem run-daily
+teammem render --verify
+git -C "$TEAMMEM_VAULT" status --short
+git -C "$TEAMMEM_VAULT" log -1 --oneline
+```
+
+Stop if configuration/stages fail, verification fails, the working tree is
+unexpectedly dirty, or the generated tree contains data outside the intended
+reader boundary. Review the generated content and commit before publication.
+Then verify a noninteractive push and set the upstream used by future plain
+`git push` calls:
+
+```bash
+env -u SSH_AUTH_SOCK GIT_TERMINAL_PROMPT=0 \
+  git -C "$TEAMMEM_VAULT" push --dry-run origin "HEAD:refs/heads/$VAULT_BRANCH"
+env -u SSH_AUTH_SOCK GIT_TERMINAL_PROMPT=0 \
+  git -C "$TEAMMEM_VAULT" push --set-upstream origin "$VAULT_BRANCH"
+git -C "$TEAMMEM_VAULT" rev-parse HEAD
+env -u SSH_AUTH_SOCK GIT_TERMINAL_PROMPT=0 \
+  git -C "$TEAMMEM_VAULT" ls-remote --exit-code origin "refs/heads/$VAULT_BRANCH"
+git -C "$TEAMMEM_VAULT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}'
+```
+
+The local commit must equal the remote branch's returned hash and the upstream
+must be `origin/<selected-branch>`. The real first push verifies write access;
+a dry run alone cannot prove all server hooks will accept publication. Stop on
+rejection and inspect permissions or concurrent remote history; never add
+`--force`. There is no automatic pull or merge in TeamMem's publication stage.
+Keep this a single-writer output repository, or coordinate external edits before
+running the hub.
+
+On Linux, repeat the read and dry-run write probes from the user service manager
+with the actual absolute vault path, before enabling publication. For example:
+
+```bash
+systemd-run --user --wait --pipe --collect \
+  /usr/bin/env -u SSH_AUTH_SOCK GIT_TERMINAL_PROMPT=0 \
+  git -C "$TEAMMEM_VAULT" ls-remote --exit-code origin "refs/heads/$VAULT_BRANCH"
+systemd-run --user --wait --pipe --collect \
+  /usr/bin/env -u SSH_AUTH_SOCK GIT_TERMINAL_PROMPT=0 \
+  git -C "$TEAMMEM_VAULT" push --dry-run origin "HEAD:refs/heads/$VAULT_BRANCH"
+```
+
+Use the equivalent account/session checks for launchd or Task Scheduler; Windows
+uses the logged-in account described below, not a separate service account.
+Do not assume a successful test in an administrator's shell proves scheduler
+access. Only after these checks set `TEAMMEM_PUSH=1` in the protected `hub.env`,
+install/resume the schedule, and inspect its first publication stage and remote
+hash. Full-run pushes are best-effort, so a zero overall exit status is not proof
+of publication; read the `push` stage result. `run-daily --capture-only` never
+commits or pushes the vault.
+
+Vault Git history is **not a ledger backup**. Set `TEAMMEM_SNAPSHOTS` outside the
+vault for consistent SQLite snapshots and arrange separately protected off-host
+backup and restore checks. The ledger and aggregate tables are authoritative;
+the Markdown projection alone cannot restore them. Never publish credentials,
+ledger files, snapshots, or raw import archives to the rendered-vault remote.
+
+## Public engine and operator responsibilities
+
+This repository supplies the generic hub engine, configuration templates,
+rendering/publication primitives, and portable setup/scheduling instructions.
+No private overlay is required to install or use it. Each operator owns their
+people/project mappings, consent and access choices, credentials, private
+repositories, backups, network/VPN access, monitoring, and any automatic service
+or code-recovery deployment. TeamMem does not bundle an automatic recovery agent
+or provision those operator-specific services.
 
 ## Provider setup and visibility
 

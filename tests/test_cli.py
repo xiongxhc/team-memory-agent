@@ -331,6 +331,8 @@ def _journal_db(tmp_path, monkeypatch):
         kind="commit", project="project-alpha", summary="fix: JWT race", hash="h1")])
     monkeypatch.setenv("TEAMMEM_DB", str(db))
     monkeypatch.setenv("TEAMMEM_CONFIG_DIR", str(CONFIG_DIR))
+    monkeypatch.setenv("TEAMMEM_LLM_DAILY_MODEL", "operator-daily")
+    monkeypatch.setenv("TEAMMEM_LLM_REPORT_MODEL", "operator-weekly")
     return db
 
 
@@ -373,7 +375,7 @@ def test_journal_dry_run_lists_pairs_no_writes(tmp_path, monkeypatch, capsys):
 def test_journal_live_generates_then_hits_cache(tmp_path, monkeypatch, capsys):
     db = _journal_db(tmp_path, monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.delenv("TEAMMEM_LLM_DAILY_MODEL", raising=False)
+    monkeypatch.setenv("TEAMMEM_LLM_DAILY_MODEL", "operator-daily")
     calls = []
 
     def fake_http_llm(model, api_key, max_tokens):
@@ -385,7 +387,7 @@ def test_journal_live_generates_then_hits_cache(tmp_path, monkeypatch, capsys):
     import teammem.services as services_mod
     monkeypatch.setattr(services_mod, "http_llm", fake_http_llm)
     assert main(["journal", "--today", "2026-07-16"]) == 0
-    assert "1 generated" in capsys.readouterr().out and calls == ["daily-summary-model"]
+    assert "1 generated" in capsys.readouterr().out and calls == ["operator-daily"]
     assert main(["journal", "--today", "2026-07-16"]) == 0   # rerun: all cached
     assert "0 generated" in capsys.readouterr().out and len(calls) == 1
 
@@ -400,7 +402,7 @@ def test_report_without_dailies_warns_and_exits_zero(tmp_path, monkeypatch, caps
 def test_report_generates_from_cached_dailies(tmp_path, monkeypatch, capsys):
     db = _journal_db(tmp_path, monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.delenv("TEAMMEM_LLM_REPORT_MODEL", raising=False)
+    monkeypatch.setenv("TEAMMEM_LLM_REPORT_MODEL", "operator-weekly")
     from teammem.store import open_db
     conn = open_db(db)
     conn.execute("INSERT INTO summaries (kind, key, input_hash, text, model, created_ts)"
@@ -418,7 +420,7 @@ def test_report_generates_from_cached_dailies(tmp_path, monkeypatch, capsys):
     import teammem.services as services_mod
     monkeypatch.setattr(services_mod, "http_llm", fake_http_llm)
     assert main(["report", "--week-of", "2026-07-14"]) == 0
-    assert calls == ["weekly-summary-model"]
+    assert calls == ["operator-weekly"]
     assert "report: generated" in capsys.readouterr().out
     row = open_db(db).execute(
         "SELECT text FROM summaries WHERE kind='weekly-team' AND key='team|2026-07-13'").fetchone()

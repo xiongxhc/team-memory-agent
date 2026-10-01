@@ -144,11 +144,20 @@ def resolve_llm_backend(cfg: Config, model: str, max_tokens: int):
             reasoning_effort=reasoning_effort,
             codex_bin=cfg.codex_bin,
         )
+    if not cfg.anthropic_api_key and not shutil.which("claude"):
+        return None
+    if not model.strip() or model.strip() in (
+        "daily-summary-model", "weekly-summary-model"
+    ):
+        raise ValueError(
+            "Claude synthesis requires explicit supported model identifiers: "
+            "set TEAMMEM_LLM_DAILY_MODEL and TEAMMEM_LLM_REPORT_MODEL "
+            "in the protected environment file; blank values and old "
+            "placeholder names are not usable models"
+        )
     if cfg.anthropic_api_key:
         return http_llm(model, cfg.anthropic_api_key, max_tokens=max_tokens)
-    if shutil.which("claude"):
-        return claude_cli_llm(model)
-    return None
+    return claude_cli_llm(model)
 
 
 def run_collect(

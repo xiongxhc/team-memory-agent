@@ -164,8 +164,8 @@ class Config:
     anthropic_api_key: str = ""    # ANTHROPIC_API_KEY — synthesis only, never committed
     llm_provider: str = "claude"
     codex_bin: str = "codex"
-    llm_daily_model: str = "daily-summary-model"
-    llm_report_model: str = "weekly-summary-model"
+    llm_daily_model: str = ""
+    llm_report_model: str = ""
     llm_concurrency: int = 2
     env_file: Path = field(default_factory=default_env_file)
     github_token: str = ""       # GitHub fine-grained token — never committed
@@ -181,6 +181,8 @@ class Config:
             raise ValueError(
                 "TEAMMEM_LLM_PROVIDER must be one of: claude, codex"
             )
+        self.llm_daily_model = self.llm_daily_model.strip()
+        self.llm_report_model = self.llm_report_model.strip()
         if self.llm_provider == "codex":
             self.llm_daily_model = CODEX_MODEL
             self.llm_report_model = CODEX_MODEL
