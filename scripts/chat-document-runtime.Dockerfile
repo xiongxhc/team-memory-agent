@@ -6,7 +6,7 @@
 FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bubblewrap=0.12.0-1~deb13u1 \
-    libreoffice-impress=4:25.2.3-2+deb13u6 \
+    libreoffice-impress=4:25.2.3-2+deb13u7 \
     tesseract-ocr=5.5.0-1+b1 \
     tesseract-ocr-eng=1:4.1.0-2 \
     tesseract-ocr-chi-sim=1:4.1.0-2 \

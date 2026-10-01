@@ -45,3 +45,12 @@ are changed by this work.
   branch commands were exercised against a disposable local bare repository.
 - Provider model entitlement and remote credentials remain operator checks; no
   live provider or publication operation was performed.
+
+## CI build follow-up
+
+Fresh CI reproduced an existing parser-image dependency conflict: the explicit
+LibreOffice `deb13u6` pin conflicted with the repository's `deb13u7` dependency
+candidates. The cached local image had not exercised dependency resolution.
+Updated only the LibreOffice pin to `deb13u7`; an uncached build of the exact
+Dockerfile test target succeeded, followed by all 60 parser tests. The base-image
+digest and other explicit pins remain unchanged. No running runtime was updated.
