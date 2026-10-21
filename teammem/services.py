@@ -1,5 +1,6 @@
 """Callable hub services shared by the CLI and the daily workflow."""
 
+import errno
 import json
 import os
 import shutil
@@ -1036,9 +1037,16 @@ def execute_process_meetings(
     with ExitStack() as stack:
         try:
             stack.enter_context(acquire_run_lock(meeting_run_lock_target(cfg), wait_seconds=0))
-        except (OSError, RunLockedError):
+        except RunLockedError:
             return MeetingRunResult(imported=MeetingImportResult(), refused=(MeetingFailure(
                 "", "lock", "another meeting run is active; retry required"),))
+        except OSError as error:
+            # Not contention: the lock file beside the ledger cannot be opened.
+            # The errno name says why without naming a configured path.
+            code = errno.errorcode.get(error.errno, "unknown") if error.errno else "unknown"
+            return MeetingRunResult(imported=MeetingImportResult(), refused=(MeetingFailure(
+                "", "lock", f"meeting-run lock unavailable ({code}); "
+                "check the ledger directory is writable; retry required"),))
         return _execute_process_meetings(cfg, ids, now=now, conn=conn, dry_run=False,
                                          weeks=weeks, channel_names=channel_names)
 

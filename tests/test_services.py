@@ -1633,3 +1633,17 @@ def test_a_recorded_refusal_raises_an_operator_alert_until_a_revision_publishes(
     bench.drop({**_payload(), "revision": payload["revision"] + 1})
     assert bench.run() == 0
     assert not alert_file.exists()
+
+
+def test_an_unusable_meeting_lock_is_not_reported_as_another_run(bench, monkeypatch, capsys):
+    import errno as errno_module
+
+    def broken(*args, **kwargs):
+        raise PermissionError(errno_module.EACCES, "denied")
+
+    monkeypatch.setattr(services_module, "acquire_run_lock", broken)
+    bench.drop(_payload())
+    assert bench.run() == 1
+    err = capsys.readouterr().err
+    assert "meeting-run lock unavailable" in err
+    assert "another meeting run is active" not in err
