@@ -29,7 +29,8 @@ from .meeting_bundles import occurrence_path_segment
 from .meeting_importer import (MeetingImportResult, import_meeting_inbox,
                                sync_source_cleanup_alerts)
 from .meeting_publish import (PublishRefused, _write_receipt, publish_meeting,
-                              revision_receipt_path)
+                              refusal_bytes, revision_receipt_path,
+                              revision_refusal_path)
 from .meeting_retention import RetentionResult, expire_meeting_audio
 from .meeting_store import list_meetings
 from .queries import report_context, week_label, week_monday
@@ -799,6 +800,7 @@ class MeetingRunResult:
     receipts: tuple[dict, ...] = ()
     refused: tuple[MeetingFailure, ...] = ()
     pending: tuple[str, ...] = ()      # dry run: what a real run would publish
+    held: tuple[tuple[str, int, str], ...] = ()   # (occurrence, revision, reason) refused for good
 
     @property
     def published(self) -> tuple[str, ...]:
@@ -818,6 +820,26 @@ def meeting_receipt_path(cfg: Config, occurrence_id: str) -> Path:
 def meeting_revision_receipt_path(cfg: Config, occurrence_id: str, revision: int) -> Path:
     """One revision's own receipt, never replaced by a newer revision's."""
     return revision_receipt_path(meeting_receipt_path(cfg, occurrence_id), revision)
+
+
+def meeting_refusal_path(cfg: Config, occurrence_id: str, revision: int) -> Path:
+    """One revision's terminal refusal record, beside its receipt."""
+    return revision_refusal_path(meeting_receipt_path(cfg, occurrence_id), revision)
+
+
+def _recorded_refusal(cfg: Config, meeting: dict) -> str | None:
+    """The reason code when this exact revision was refused for good."""
+    path = meeting_refusal_path(cfg, meeting["occurrence_id"], meeting["current_revision"])
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (isinstance(record, dict) and record.get("status") == "refused"
+            and record.get("revision") == meeting["current_revision"]
+            and record.get("artifact_hash") == meeting["artifact_hash"]
+            and isinstance(record.get("reason_code"), str)):
+        return record["reason_code"]
+    return None
 
 
 def _backfill_revision_receipt(cfg: Config, meeting: dict) -> None:
@@ -1018,15 +1040,19 @@ def _execute_process_meetings(
         with (nullcontext() if dry_run else acquire_publication_lock(cfg.vault_dir)):
             # Refresh after acquiring: another publisher may have issued receipts
             # while this process imported or waited for the shared vault.
-            unpublished = []
+            unpublished, held = [], []
             for meeting in list_meetings(conn):
-                if not _receipt_is_current(
+                if _receipt_is_current(
                         meeting_receipt_path(cfg, meeting["occurrence_id"]), meeting):
+                    if not dry_run:
+                        _backfill_revision_receipt(cfg, meeting)
+                elif (reason := _recorded_refusal(cfg, meeting)) is not None:
+                    held.append((meeting["occurrence_id"], meeting["current_revision"], reason))
+                else:
                     unpublished.append(meeting["occurrence_id"])
-                elif not dry_run:
-                    _backfill_revision_receipt(cfg, meeting)
             if dry_run:
-                return MeetingRunResult(imported=imported, pending=tuple(unpublished))
+                return MeetingRunResult(imported=imported, pending=tuple(unpublished),
+                                        held=tuple(held))
             for occurrence_id in unpublished:
                 head = _vault_head(cfg.vault_dir)
                 snapshot = _managed_snapshot(cfg.vault_dir)
@@ -1045,10 +1071,25 @@ def _execute_process_meetings(
                         _restore_managed(cfg.vault_dir, snapshot)
                     refused.append(MeetingFailure(
                         occurrence_id, refusal.stage, redact_secrets(refusal, cfg)))
+                    if refusal.terminal is not None:
+                        _record_refusal(cfg, occurrence_id, refusal, refused)
     except RunLockedError as error:
         refused.append(MeetingFailure("", "lock", str(error)))
     return MeetingRunResult(
-        imported=imported, receipts=tuple(receipts), refused=tuple(refused))
+        imported=imported, receipts=tuple(receipts), refused=tuple(refused),
+        held=tuple(held))
+
+
+def _record_refusal(cfg: Config, occurrence_id: str, refusal: PublishRefused,
+                    refused: list[MeetingFailure]) -> None:
+    """Write the terminal refusal record the producer can act on. Until it is
+    durable the occurrence stays retryable, so a failed write costs one retry."""
+    try:
+        _write_receipt(meeting_refusal_path(cfg, occurrence_id, refusal.revision),
+                       refusal_bytes(occurrence_id, refusal))
+    except OSError:
+        refused.append(MeetingFailure(
+            occurrence_id, "refusal", "the refusal record could not be written; retry required"))
 
 
 def run_process_meetings(
@@ -1110,6 +1151,9 @@ def run_process_meetings(
         print(f"{prefix}would publish {occurrence_id}")
     for receipt in result.receipts:
         print(f"published {receipt['occurrence_id']} -> {receipt['markdown_url']}")
+    for occurrence_id, revision, reason in result.held:
+        print(f"{prefix}held {occurrence_id} revision {revision}: refused ({reason}); "
+              "only a new revision can publish", file=sys.stderr)
     for failure in result.refused:
         print(
             f"REFUSED {failure.occurrence_id} at {failure.stage}: {failure.detail}",

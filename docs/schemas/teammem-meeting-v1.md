@@ -352,5 +352,21 @@ current revision is still incomplete inside the pre-expiry window.
 - TeamMem never receives the recording key and never decrypts audio.
 - Team Vault never receives the full transcript or any audio. The transcript
   lives in the bundle and in TeamMem's database only.
+- Synthesis fields (`title`, `summary`, decisions, action items, discussion
+  points, per-person summaries) must not quote stored transcript text verbatim:
+  any transcript segment of 24 or more characters, from any stored revision of
+  any meeting, found in a rendered note withholds that note. When the note
+  itself carries one, TeamMem refuses that revision for good and writes
+  `<receipts>/<occurrence-segment>/<revision>.refused.json`:
+
+  ```json
+  {"artifact_hash":"sha256:...","invariants":["meeting.leakage.forbidden-content"],
+   "occurrence_id":"...","reason_code":"transcript_text_in_note","revision":1,
+   "schema":"teammem-meeting-refusal/v1","status":"refused"}
+  ```
+
+  The record carries no text and no path. It is never retried; paraphrase the
+  quoted line and submit a higher revision. Deleting the record makes the next
+  run try the same revision again.
 - Rejection reasons are machine-readable and name fields, IDs, and paths —
   never transcript text and never credentials.

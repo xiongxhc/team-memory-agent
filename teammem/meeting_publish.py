@@ -31,6 +31,8 @@ from .vaultgit import (PushNotVerified, VerifiedTreeMismatch, commit_all, commit
                        head_commit, push_verified, remote_reaches)
 
 RECEIPT_SCHEMA = "teammem-meeting-receipt/v1"
+REFUSAL_SCHEMA = "teammem-meeting-refusal/v1"
+LEAKAGE_INVARIANT = "meeting.leakage.forbidden-content"
 WEB_BASE_ENV = "TEAMMEM_VAULT_WEB_BASE"
 
 
@@ -38,11 +40,18 @@ class PublishRefused(RuntimeError):
     """Publication stopped, so no receipt exists. `stage` says where it stopped:
     `lock`, `config`, `ledger`, `render`, `verify`, `commit`, `push` or `receipt`."""
 
-    def __init__(self, stage: str, reason: str, invariants: tuple[str, ...] = ()):
+    def __init__(self, stage: str, reason: str, invariants: tuple[str, ...] = (),
+                 *, terminal: str | None = None, revision: int | None = None,
+                 artifact_hash: str | None = None):
         super().__init__(f"{stage}: {reason}")
         self.stage = stage
         self.reason = reason
         self.invariants = invariants
+        # A reason code when no retry of this exact revision can ever succeed,
+        # with the revision and hash it applies to; None when retryable.
+        self.terminal = terminal
+        self.revision = revision
+        self.artifact_hash = artifact_hash
 
 
 def validate_web_base(value: str | None) -> str:
@@ -104,6 +113,25 @@ def _refuse_on_findings(findings: list[dict]) -> None:
             f"the vault fails {len(findings)} meeting invariant check(s): "
             + "; ".join(f"{f['invariant']} on {f['path']}" for f in findings),
             tuple(sorted({f["invariant"] for f in findings})))
+
+
+def refusal_bytes(occurrence_id: str, refusal: PublishRefused) -> bytes:
+    """The terminal refusal record: identity, reason code and invariant names
+    only, never a path, a title or any meeting text."""
+    return receipt_bytes({
+        "schema": REFUSAL_SCHEMA,
+        "occurrence_id": occurrence_id,
+        "revision": refusal.revision,
+        "artifact_hash": refusal.artifact_hash,
+        "status": "refused",
+        "reason_code": refusal.terminal,
+        "invariants": sorted(refusal.invariants),
+    })
+
+
+def revision_refusal_path(receipt_path: Path, revision: int) -> Path:
+    """`<receipts>/<segment>/<revision>.refused.json`."""
+    return receipt_path.with_suffix("") / f"{revision}.refused.json"
 
 
 def revision_receipt_path(receipt_path: Path, revision: int) -> Path:
@@ -179,7 +207,19 @@ def _publish_meeting(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Pat
                                     channel_names=channel_names)
     except Exception as error:
         raise PublishRefused("render", f"the vault render failed: {error}") from error
-    _refuse_on_findings(out["withheld_findings"].get(occurrence_id, []))
+    own = out["withheld_findings"].get(occurrence_id, [])
+    if any(f["invariant"] == LEAKAGE_INVARIANT and f["path"] == rel for f in own):
+        # The note itself would carry stored transcript text. The ledger keeps
+        # every revision, so no re-render of this revision can ever pass: the
+        # refusal is final for it, and only a new revision can publish.
+        try:
+            _refuse_on_findings(own)
+        except PublishRefused as refusal:
+            raise PublishRefused(
+                refusal.stage, refusal.reason, refusal.invariants,
+                terminal="transcript_text_in_note", revision=meeting["revision"],
+                artifact_hash=meeting["artifact_hash"]) from None
+    _refuse_on_findings(own)
     if occurrence_id in out["withheld"]:
         # A name this meeting carries collides with a page the vault already
         # owns, so the render left it out. Nothing to publish, and the other

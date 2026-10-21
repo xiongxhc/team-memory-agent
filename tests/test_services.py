@@ -1508,3 +1508,74 @@ def test_a_receipt_published_before_per_revision_receipts_is_backfilled_without_
     assert bench.run() == 0
     assert calls == []
     assert revision_file.read_bytes() == bench.receipt(occurrence_id).read_bytes()
+
+
+def _quoting_payload(**fields):
+    """A synthesis that quotes one long transcript line verbatim in a decision."""
+    payload = _payload(**fields)
+    payload["decisions"][0]["text"] = payload["transcript"][9]["text"]
+    return payload
+
+
+def test_a_note_quoting_the_transcript_is_refused_once_with_a_refusal_record(
+    bench, monkeypatch, capsys
+):
+    """The leak check stays: a verbatim transcript line never reaches the vault.
+    But the refusal is terminal for that exact revision, so the producer gets a
+    machine-readable record and the minutely timer stops re-rendering it."""
+    from teammem.services import meeting_refusal_path
+
+    payload = _quoting_payload()
+    bench.drop(payload)
+    occurrence_id = payload["occurrence_id"]
+
+    assert bench.run() == 1
+    assert not bench.receipt(occurrence_id).exists()
+    refusal_file = meeting_refusal_path(bench.cfg, occurrence_id, payload["revision"])
+    refusal = json.loads(refusal_file.read_text())
+    stored = get_meeting(open_db(bench.cfg.db_path), occurrence_id)
+    assert refusal == {
+        "schema": "teammem-meeting-refusal/v1",
+        "occurrence_id": occurrence_id,
+        "revision": payload["revision"],
+        "artifact_hash": stored["artifact_hash"],
+        "status": "refused",
+        "reason_code": "transcript_text_in_note",
+        "invariants": ["meeting.leakage.forbidden-content"],
+    }
+    assert payload["transcript"][9]["text"] not in refusal_file.read_text()
+    vault_text = "".join(p.read_text(errors="ignore") for p in bench.vault.rglob("*.md"))
+    assert payload["transcript"][9]["text"] not in vault_text
+    capsys.readouterr()
+
+    calls = []
+    real_publish = services_module.publish_meeting
+    monkeypatch.setattr(services_module, "publish_meeting",
+                        lambda *a, **kw: calls.append(kw["occurrence_id"])
+                        or real_publish(*a, **kw))
+    assert bench.run() == 0                       # nothing new to do or report as failure
+    assert calls == []
+    assert "held" in capsys.readouterr().err
+
+    corrected = {**_payload(), "revision": payload["revision"] + 1}
+    bench.drop(corrected)
+    assert bench.run() == 0
+    assert calls == [occurrence_id]
+    receipt = json.loads(bench.receipt(occurrence_id).read_text())
+    assert receipt["revision"] == corrected["revision"]
+    assert refusal_file.exists()                  # the history of revision 1 stays
+
+
+def test_a_transient_refusal_writes_no_refusal_record_and_stays_retryable(bench):
+    payload = _payload()
+    bench.drop(payload)
+    blocked = bench.receipt(payload["occurrence_id"])
+    blocked.parent.mkdir(mode=0o700)
+    blocked.mkdir()
+
+    assert bench.run() == 1
+    from teammem.services import meeting_refusal_path
+    assert not meeting_refusal_path(bench.cfg, payload["occurrence_id"],
+                                    payload["revision"]).exists()
+    blocked.rmdir()
+    assert bench.run() == 0
