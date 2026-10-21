@@ -466,13 +466,16 @@ withheld meeting stays in the ledger and is filed again as soon as a corrected
 revision lands. If a check fails on vault content no meeting owns, the run
 commits and pushes nothing and exits `1`.
 
-A note that would itself carry stored transcript text (for example a decision
-quoting a transcript line verbatim) can never pass for that revision, so
+A note that would itself carry its own meeting's stored transcript text (for
+example a decision quoting a transcript line verbatim) can never pass for that
+revision, so
 `process-meetings` refuses it once, exits `1`, and writes a terminal
 `teammem-meeting-refusal/v1` record at
 `<receipts>/<occurrence-segment>/<revision>.refused.json` with a reason code and
 invariant names only. Later runs skip that revision and print `held` on stderr
-without failing; a higher revision publishes normally. See
+without failing; a higher revision publishes normally. A note that only matches
+another meeting's transcript is withheld and retried every run with
+`cross_meeting_transcript_text`, never held for good. See
 `docs/schemas/teammem-meeting-v1.md`.
 
 #### Audio retention

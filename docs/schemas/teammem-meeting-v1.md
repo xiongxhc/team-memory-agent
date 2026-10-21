@@ -366,7 +366,8 @@ current revision is still incomplete inside the pre-expiry window.
   points, per-person summaries) must not quote stored transcript text verbatim:
   any transcript segment of 24 or more characters, from any stored revision of
   any meeting, found in a rendered note withholds that note. When the note
-  itself carries one, TeamMem refuses that revision for good and writes
+  itself carries one of its own meeting's stored transcript lines, TeamMem
+  refuses that revision for good and writes
   `<receipts>/<occurrence-segment>/<revision>.refused.json`:
 
   ```json
@@ -376,7 +377,9 @@ current revision is still incomplete inside the pre-expiry window.
   ```
 
   The record carries no text and no path. It is never retried; paraphrase the
-  quoted line and submit a higher revision. Deleting the record makes the next
+  quoted line and submit a higher revision. Text that only matches another
+  meeting's transcript (a one-turn "Thank you." elsewhere, say) is withheld with
+  the retryable reason `cross_meeting_transcript_text` and writes no record. Deleting the record makes the next
   run try the same revision again.
 - Rejection reasons are machine-readable and name fields, IDs, and paths —
   never transcript text and never credentials.

@@ -24,7 +24,7 @@ from .meeting_store import get_meeting
 # `_meeting_facts` is `render.py`'s ledger-only view of one meeting, the same
 # one the semantic checks hold the vault against. The receipt names the path the
 # ledger says the note belongs at, not a path a renderer handed back.
-from .render import _meeting_facts, render_vault_verified
+from .render import _meeting_facts, note_leaks_own_ledger, render_vault_verified
 from .run_lock import RunLockedError, acquire_publication_lock
 from .store import ledger_read_view
 from .vaultgit import (PushNotVerified, VerifiedTreeMismatch, commit_all, commit_contains,
@@ -208,10 +208,21 @@ def _publish_meeting(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Pat
     except Exception as error:
         raise PublishRefused("render", f"the vault render failed: {error}") from error
     own = out["withheld_findings"].get(occurrence_id, [])
-    if any(f["invariant"] == LEAKAGE_INVARIANT and f["path"] == rel for f in own):
-        # The note itself would carry stored transcript text. The ledger keeps
-        # every revision, so no re-render of this revision can ever pass: the
-        # refusal is final for it, and only a new revision can publish.
+    own_note_leak = any(f["invariant"] == LEAKAGE_INVARIANT and f["path"] == rel for f in own)
+    if own_note_leak and not note_leaks_own_ledger(conn, ids, occurrence_id, today):
+        try:
+            _refuse_on_findings(own)
+        except PublishRefused as refusal:
+            raise PublishRefused(
+                refusal.stage, "cross_meeting_transcript_text: the note matches another "
+                "meeting's stored transcript; withheld and retried; " + refusal.reason,
+                refusal.invariants) from None
+    if own_note_leak:
+        # The note itself would carry this meeting's own stored transcript text.
+        # The ledger keeps every revision, so no re-render of this revision can
+        # ever pass: the refusal is final for it, and only a new revision can
+        # publish. Text that only matches another meeting's transcript stays a
+        # retryable refusal: this producer quoted nothing of its own.
         try:
             _refuse_on_findings(own)
         except PublishRefused as refusal:

@@ -1579,3 +1579,27 @@ def test_a_transient_refusal_writes_no_refusal_record_and_stays_retryable(bench)
                                     payload["revision"]).exists()
     blocked.rmdir()
     assert bench.run() == 0
+
+
+def test_text_matching_another_meetings_transcript_is_withheld_but_never_held_for_good(
+    bench, capsys
+):
+    """A one-turn transcript elsewhere ("Thank you.") makes that phrase a probe.
+    A note using it is still withheld, but this meeting quoted nothing of its
+    own, so no permanent refusal is recorded and it stays retryable."""
+    from teammem.services import meeting_refusal_path
+    from tests.test_meeting_render import _renumber
+
+    other = _renumber(_short_transcript_payload("Thank you."), "vc:thanks")
+    bench.drop(other)
+    assert bench.run() == 0
+
+    payload = _payload()
+    payload["summary"] += " Thank you."
+    bench.drop(payload)
+    occurrence_id = payload["occurrence_id"]
+    for _ in range(2):                            # refused every run, never held
+        assert bench.run() == 1
+        assert not meeting_refusal_path(bench.cfg, occurrence_id, payload["revision"]).exists()
+        assert not bench.receipt(occurrence_id).exists()
+        assert "cross_meeting_transcript_text" in capsys.readouterr().err

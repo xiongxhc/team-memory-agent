@@ -267,6 +267,17 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         return out
 
 
+def _meeting_naming(ids: IdentityMaps) -> "meeting_render.VaultNaming":
+    return meeting_render.VaultNaming(
+        person=lambda person_id, provider_name: _meeting_person(ids, person_id,
+                                                                provider_name),
+        person_folder=_fname,
+        person_link=_person_link,
+        project_link=_project_link,
+        safe_filename=_project_fname,
+    )
+
+
 def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                   today: date, weeks: int, channel_names: dict | None,
                   withhold: frozenset) -> dict:
@@ -281,14 +292,7 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         m: _stored_effective_flags(summary)
         for m, summary in weekly_summaries.items()
     }
-    naming = meeting_render.VaultNaming(
-        person=lambda person_id, provider_name: _meeting_person(ids, person_id,
-                                                                provider_name),
-        person_folder=_fname,
-        person_link=_person_link,
-        project_link=_project_link,
-        safe_filename=_project_fname,
-    )
+    naming = _meeting_naming(ids)
     # Every current occurrence, no window: Meetings/ is wiped on every render,
     # so a window would delete already-published notes from the live vault.
     notes = meeting_render.collect_notes(conn, naming=naming, today=today,
@@ -1012,6 +1016,38 @@ def _forbidden_values(conn: sqlite3.Connection, occurrence_ids
             _probe_index(compact_values, probe_len), ordered_turns)
 
 
+def _leaked_kinds(text: str, probe_len: int, raw_index: _ProbeIndex,
+                  compact_index: _ProbeIndex, ordered_turns: list) -> set[str]:
+    """The kinds of forbidden ledger value `text` carries, per the probe sets."""
+    leaked = {
+        kind for kind, value in _probe_candidates(text, probe_len, raw_index)
+        if value in text
+    }
+    if any(compact_index):
+        compact, breaks = _compact_with_breaks(text)
+        leaked.update(
+            kind for kind, value in _probe_candidates(
+                compact, probe_len, compact_index
+            ) if _contains_compact_probe(compact, breaks, value)
+        )
+    if any(_ordered_turns_present(text, turns) for turns in ordered_turns):
+        leaked.add("transcript text")
+    return leaked
+
+
+def note_leaks_own_ledger(conn: sqlite3.Connection, ids: IdentityMaps,
+                          occurrence_id: str, today: date) -> bool:
+    """Does this occurrence's own note carry its own stored transcript or audio
+    facts, from any of its revisions? Text that only matches another meeting's
+    transcript is not this meeting's quote and returns False."""
+    note = next((n for n in meeting_render.collect_notes(
+        conn, naming=_meeting_naming(ids), today=today) if n.occurrence_id == occurrence_id),
+        None)
+    if note is None:
+        return False
+    return bool(_leaked_kinds(note.body, *_forbidden_values(conn, [occurrence_id])))
+
+
 def _probe_candidates(text: str, probe_len: int, index: _ProbeIndex) -> set[_Probe]:
     indexed, unindexed = index
     candidates = set(unindexed)
@@ -1319,19 +1355,7 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
             if not path.is_file() or ".git" in rel_parts:
                 continue
             text = path.read_text(encoding="utf-8", errors="ignore")
-            leaked = {
-                kind for kind, value in _probe_candidates(text, probe_len, raw_index)
-                if value in text
-            }
-            if any(compact_index):
-                compact, breaks = _compact_with_breaks(text)
-                leaked.update(
-                    kind for kind, value in _probe_candidates(
-                        compact, probe_len, compact_index
-                    ) if _contains_compact_probe(compact, breaks, value)
-                )
-            if any(_ordered_turns_present(text, turns) for turns in ordered_turns):
-                leaked.add("transcript text")
+            leaked = _leaked_kinds(text, probe_len, raw_index, compact_index, ordered_turns)
             for kind in sorted(leaked):
                 report("meeting.leakage.forbidden-content", "/".join(rel_parts),
                        f"{kind} from the ledger appears in this file")
