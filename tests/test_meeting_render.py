@@ -1288,3 +1288,106 @@ def test_meeting_only_front_matter_values_are_quoted_yaml(tmp_path):
     person = next(p for p in (vault / "Person").glob("*/README.md")
                   if "person_ids:" in p.read_text())
     assert person.read_text().split("\n")[1].startswith('person_ids: "')
+
+
+# --- meeting projects follow the project/area classification -----------------
+# The fixture meeting discusses project-atlas, project-borealis and
+# project-cygnus. Classifying them as an area, a hidden label and a count-only
+# project checks each projection a meeting backlink can land on.
+
+
+def _classified_ids(**overrides) -> IdentityMaps:
+    from teammem.identity import _read
+    projects = {
+        "projects": {"project-cygnus": {"projection": "count-only"}},
+        "areas": {"project-atlas": {}},
+        "hidden_projects": ["project-borealis"],
+    }
+    projects.update(overrides)
+    return IdentityMaps(_read(CONFIG_DIR, "roster"), projects)
+
+
+def _render_classified(tmp_path, conn, ids) -> Path:
+    vault = tmp_path / "vault"
+    render_vault(conn, ids, vault, TODAY)
+    return vault
+
+
+def test_meeting_projects_link_to_the_folder_their_classification_renders(tmp_path):
+    conn = _seeded(tmp_path)
+    vault = _render_classified(tmp_path, conn, _classified_ids())
+    discussed = _sections(_note(vault))["Projects discussed"]
+
+    assert "- [project-atlas](../../Areas/project-atlas/README.md)" in discussed
+    assert "- [project-cygnus](../../Projects/project-cygnus/README.md)" in discussed
+    assert "project-borealis" in discussed                    # named, never linked
+    assert "](../../Projects/project-borealis" not in discussed
+    assert "](../../Areas/project-borealis" not in discussed
+
+    tail = _tail()
+    area = (vault / "Areas" / "project-atlas" / "README.md").read_text()
+    assert area.startswith("---\narea: project-atlas\n")
+    assert "## Meetings" in area and tail in area
+    counts = (vault / "Projects" / "project-cygnus" / "README.md").read_text()
+    assert "No commit count collected for this week." in counts
+    assert "## Meetings" in counts and tail in counts
+    for root in ("Projects", "Areas"):
+        assert not (vault / root / "project-borealis").exists()
+    assert not (vault / "Projects" / "project-atlas").exists()
+
+    areas_index = (vault / "Areas" / "README.md").read_text()
+    projects_index = (vault / "Projects" / "README.md").read_text()
+    assert "## Discussed in meetings\n- [project-atlas](project-atlas/README.md)\n" in areas_index
+    assert "## Discussed in meetings\n- [project-cygnus](project-cygnus/README.md)\n" in projects_index
+    assert "project-borealis" not in areas_index + projects_index
+
+
+def test_classified_meeting_projects_satisfy_every_meeting_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    ids = _classified_ids()
+    vault = _render_classified(tmp_path, conn, ids)
+    assert verify_meeting_semantics(conn, ids, vault) == []
+    assert verify_vault(conn, ids, vault, TODAY) == {
+        "missing": [], "unexpected": [], "differing": []}
+    out = render_module.render_vault_verified(conn, ids, tmp_path / "verified", TODAY)
+    assert out["withheld"] == {} and out["findings"] == []
+
+
+def test_a_meeting_only_area_gets_an_area_page_and_no_project_page(tmp_path):
+    conn = _seeded(tmp_path)
+    conn.execute("UPDATE meeting_projects SET name = ? WHERE name = ?",
+                 ("coordination", "project-atlas"))
+    conn.commit()
+    ids = _classified_ids(areas={"coordination": {}})
+    vault = _render_classified(tmp_path, conn, ids)
+    page = (vault / "Areas" / "coordination" / "README.md").read_text()
+    assert _tail() in page
+    assert not (vault / "Projects" / "coordination").exists()
+    assert verify_meeting_semantics(conn, ids, vault) == []
+
+
+def test_a_missing_area_backlink_fails_the_project_backlink_invariant(tmp_path):
+    conn = _seeded(tmp_path)
+    ids = _classified_ids()
+    vault = _render_classified(tmp_path, conn, ids)
+    page = vault / "Areas" / "project-atlas" / "README.md"
+    text = page.read_text()
+    page.write_text(text[:text.index("\n## Meetings")] + "\n")
+
+    found = verify_meeting_semantics(conn, ids, vault)
+    assert {(f["invariant"], f["path"]) for f in found} == {
+        ("meeting.project.backlinks", "Areas/project-atlas/README.md")}
+
+
+def test_an_event_area_page_keeps_its_activity_and_gains_the_meeting(tmp_path):
+    conn = _seeded(tmp_path)
+    insert_events(conn, [Event(person="alex", ts="2026-09-02T09:00:00+04:00",
+                               source="slack", kind="message", summary="sync",
+                               hash="a-area", project="project-atlas")])
+    ids = _classified_ids()
+    vault = _render_classified(tmp_path, conn, ids)
+    page = (vault / "Areas" / "project-atlas" / "README.md").read_text()
+    assert "1 event · 1 contributor" in page
+    assert page.index("## Weeks") < page.index("## Meetings")
+    assert _tail() in page
+    assert verify_meeting_semantics(conn, ids, vault) == []

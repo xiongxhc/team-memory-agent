@@ -99,7 +99,7 @@ def test_closed_issue_upgrade_replaces_prior_assignee_row(tmp_path):
         "created_at": "2026-01-01T08:00:00Z",
         "updated_at": "2026-07-14T15:00:00Z",
         "closed_at": "2026-07-14T15:00:00Z",
-        "web_url": "https://gitlab.internal/team/project-alpha/-/issues/31",
+        "web_url": "https://gitlab.example/team/project-alpha/-/issues/31",
     }
     cfg = _cfg(tmp_path)
     conn = open_db(cfg.db_path)
@@ -126,7 +126,7 @@ def test_repo_upgrade_replaces_base_unmapped_creator_row(tmp_path):
         **PROJECT,
         "created_at": "2026-07-14T08:00:00Z",
         "creator_id": 5,
-        "web_url": "https://gitlab.internal/team/project-alpha",
+        "web_url": "https://gitlab.example/team/project-alpha",
     }
     cfg = _cfg(tmp_path)
     conn = open_db(cfg.db_path)
@@ -172,7 +172,7 @@ def test_open_issue_upgrade_repairs_base_updated_at_timestamp(tmp_path):
         "created_at": "2026-01-01T08:00:00Z",
         "updated_at": "2026-07-14T11:00:00Z",
         "closed_at": None,
-        "web_url": "https://gitlab.internal/team/project-alpha/-/issues/31",
+        "web_url": "https://gitlab.example/team/project-alpha/-/issues/31",
     }
     cfg = _cfg(tmp_path)
     conn = open_db(cfg.db_path)
@@ -205,7 +205,7 @@ def test_out_of_lookback_open_issue_does_not_backfill_fresh_ledger(tmp_path):
         "created_at": "2026-01-01T08:00:00Z",
         "updated_at": "2026-07-14T11:00:00Z",
         "closed_at": None,
-        "web_url": "https://gitlab.internal/team/project-alpha/-/issues/31",
+        "web_url": "https://gitlab.example/team/project-alpha/-/issues/31",
     }
     cfg = _cfg(tmp_path)
     conn = open_db(cfg.db_path)
@@ -228,7 +228,7 @@ def test_gitlab_reconciliation_rolls_back_replacement_on_insert_failure(tmp_path
         "created_at": "2026-01-01T08:00:00Z",
         "updated_at": "2026-07-14T15:00:00Z",
         "closed_at": "2026-07-14T15:00:00Z",
-        "web_url": "https://gitlab.internal/team/project-alpha/-/issues/31",
+        "web_url": "https://gitlab.example/team/project-alpha/-/issues/31",
     }
     cfg = _cfg(tmp_path)
     conn = open_db(cfg.db_path)

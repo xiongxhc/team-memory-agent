@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "feishu": {
+    "app_id": "cli_exampleapp123",
+    "expected_bot_open_id": null,
+    "tenant_key": null,
+    "transport": "long_connection",
+    "event": "im.message.receive_v1",
+    "direct_messages": true,
+    "group_mentions_only": true,
+    "required_scopes": [
+      "im:message.group_at_msg:readonly",
+      "im:message.p2p_msg:readonly",
+      "im:message:send_as_bot",
+      "im:message:readonly"
+    ]
+  },
+  "model": {
+    "provider": "openai_responses",
+    "name": "your-enabled-model",
+    "reasoning_effort": "low",
+    "max_output_tokens": 1200,
+    "max_input_tokens": 12000,
+    "max_requests_per_message": 3,
+    "max_retrieval_rounds": 2,
+    "store": false,
+    "automatic_escalation": false
+  },
+  "session": {
+    "direct_message_scope": "tenant_app_user",
+    "group_scope": "tenant_app_chat",
+    "thread_scope": "tenant_app_chat_root",
+    "max_context_turns": 20,
+    "idle_retention_days": 30,
+    "max_concurrent_model_calls": 2,
+    "automatic_team_memory_write": false
+  },
+  "retrieval": {
+    "mode": "read_only_ledger",
+    "max_snippets": 8,
+    "unclassified_evidence": "deny",
+    "count_only_projects": "aggregates_only",
+    "hidden_projects": "deny"
+  },
+  "attachments": {
+    "enabled": true,
+    "allowed_extensions": [
+      ".pdf",
+      ".pptx",
+      ".ppt",
+      ".html",
+      ".htm",
+      ".docx",
+      ".xlsx",
+      ".csv",
+      ".txt",
+      ".md",
+      ".png",
+      ".jpg",
+      ".jpeg"
+    ],
+    "max_file_bytes": 31457280,
+    "max_files_per_request": 5,
+    "max_request_bytes": 62914560,
+    "max_uncompressed_bytes_per_file": 268435456,
+    "max_uncompressed_bytes_per_request": 536870912,
+    "max_archive_entries_per_file": 10000,
+    "max_archive_expansion_ratio": 100,
+    "max_document_pages_or_slides": 200,
+    "max_visual_pages_per_request": 20,
+    "max_decoded_image_pixels": 20000000,
+    "max_extracted_characters_per_file": 2000000,
+    "parse_timeout_seconds": 60,
+    "raw_retention_hours": 24,
+    "extracted_retention": "session",
+    "group_intake": "explicit_message_reference",
+    "session_scope_only": true,
+    "automatic_team_memory_write": false,
+    "execute_active_content": false,
+    "fetch_external_resources": false,
+    "encrypted_files": "reject_with_explanation",
+    "unsupported_files": "reject_with_explanation",
+    "partial_coverage": "disclose"
+  },
+  "access": {
+    "default": "deny",
+    "users": {},
+    "groups": {},
+    "group_admins": {}
+  },
+  "paths": {
+    "credentials_env": "/var/lib/teammem/chat.env",
+    "chat_db": "/var/lib/teammem/chat.sqlite3",
+    "ledger_db": "/var/lib/teammem/ledger.sqlite3",
+    "source_config_dir": "/etc/teammem",
+    "attachment_dir": "/var/lib/teammem/attachments"
+  }
+}

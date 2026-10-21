@@ -1,8 +1,12 @@
 import json
+import subprocess
 from datetime import date
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from teammem import summarize as summarize_module
 from teammem.events import Event
 from teammem.store import (
     SummaryRecord,
@@ -58,6 +62,33 @@ def test_daily_journal_caches_and_regenerates_only_on_change(tmp_path):
     assert len(calls) == 2                                  # changed slice -> regenerate
 
 
+def test_daily_journal_regenerates_when_model_changes(tmp_path):
+    conn = _db(tmp_path)
+    common = dict(
+        conn=conn,
+        person="alex",
+        display_name="Alex",
+        day="2026-07-14",
+        project_slugs=["project-alpha"],
+    )
+
+    first = daily_person_journal(
+        **common,
+        llm=lambda _system, _user: "claude summary",
+        model="claude-haiku-4-5",
+        created_ts="t1",
+    )
+    second = daily_person_journal(
+        **common,
+        llm=lambda _system, _user: "codex summary",
+        model="gpt-5.6-sol",
+        created_ts="t2",
+    )
+
+    assert (first, second) == ("claude summary", "codex summary")
+    assert get_summary(conn, "daily-person", "alex|2026-07-14").model == "gpt-5.6-sol"
+
+
 def test_daily_journal_empty_day_returns_none_without_llm(tmp_path):
     conn, calls = _db(tmp_path), []
     out = daily_person_journal(conn=conn, person="alex", display_name="Alex",
@@ -111,7 +142,7 @@ def test_matching_legacy_daily_cache_migrates_without_llm_call(tmp_path):
         prepared.key,
         prepared.legacy_input_hash,
         "legacy journal",
-        "legacy-model",
+        "new-model",
         "legacy-created",
     ))
 
@@ -134,9 +165,40 @@ def test_matching_legacy_daily_cache_migrates_without_llm_call(tmp_path):
         prepared.key,
         prepared.input_hash,
         "legacy journal",
-        "legacy-model",
+        "new-model",
         "legacy-created",
     )
+
+
+def test_legacy_daily_cache_from_another_model_is_not_migrated(tmp_path):
+    conn, calls = _db(tmp_path), []
+    prepared = prepare_daily_journal(
+        conn, "alex", "Alex", "2026-07-14", ["project-alpha"]
+    )
+    assert prepared is not None
+    put_summary(conn, SummaryRecord(
+        "daily-person",
+        prepared.key,
+        prepared.legacy_input_hash,
+        "legacy Claude journal",
+        "claude-haiku-4-5",
+        "legacy-created",
+    ))
+
+    text = daily_person_journal(
+        conn=conn,
+        person="alex",
+        display_name="Alex",
+        day="2026-07-14",
+        project_slugs=["project-alpha"],
+        llm=_fake_llm(calls),
+        model="gpt-5.6-sol",
+        created_ts="new-created",
+    )
+
+    assert text == "Alex fixed the JWT refresh race in [[project-alpha]]."
+    assert len(calls) == 1
+    assert get_summary(conn, "daily-person", prepared.key).model == "gpt-5.6-sol"
 
 
 @pytest.mark.parametrize(
@@ -378,6 +440,35 @@ Rules:
     assert calls[0][0] == expected_system
     assert "Alex shipped X." in calls[0][1]
     assert REPORT_PROMPT_VERSION == "3"
+
+
+def test_weekly_report_regenerates_when_model_changes(tmp_path):
+    conn = open_db(tmp_path / "report-model.db")
+    common = dict(
+        conn=conn,
+        monday_iso="2026-07-13",
+        dailies=[DailySummaryInput(
+            "alex", "2026-07-14", "daily-hash", "Alex shipped X."
+        )],
+        context=_report_context(),
+    )
+
+    first = weekly_team_report(
+        **common,
+        llm=lambda _system, _user: "claude report",
+        model="claude-sonnet-5",
+        created_ts="t1",
+    )
+    second = weekly_team_report(
+        **common,
+        llm=lambda _system, _user: "codex report",
+        model="gpt-5.6-sol",
+        created_ts="t2",
+    )
+
+    assert first.text.endswith("claude report")
+    assert second.text.endswith("codex report")
+    assert second.model == "gpt-5.6-sol"
 
 
 def test_weekly_report_stores_prompt_identity_and_complete_provenance(tmp_path):
@@ -663,3 +754,112 @@ def test_claude_cli_failure_includes_bounded_excerpts_from_both_streams(monkeypa
     assert "stdout: selected model is unavailable for this subscription" in detail
     assert "\n" not in detail and "\t" not in detail
     assert len(detail) <= 300
+
+
+def test_codex_cli_llm_uses_confined_structured_exec_and_scrubs_credentials(
+    monkeypatch,
+):
+    seen = {}
+    monkeypatch.setenv("HOME", "/home/operator")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("CODEX_HOME", "/home/operator/.codex")
+    monkeypatch.setenv("TEAMMEM_GITLAB_TOKEN", "gitlab-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    monkeypatch.setenv("MY_PASSWORD", "password-secret")
+    monkeypatch.setenv("DATABASE_URL", "postgres://database-secret")
+    monkeypatch.setenv("SENTRY_DSN", "https://sentry-secret")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock")
+
+    def fake_run(command, **kwargs):
+        seen.update(command=command, kwargs=kwargs)
+        schema_path = Path(command[command.index("--output-schema") + 1])
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        assert json.loads(schema_path.read_text()) == {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        }
+        output_path.write_text('{"text":"- **project-alpha** — shipped"}')
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = summarize_module.codex_cli_llm(
+        "gpt-5.6-sol",
+        reasoning_effort="medium",
+        codex_bin="/opt/codex",
+    )("TRUSTED SYSTEM CONTRACT", "untrusted events")
+
+    assert result == "- **project-alpha** — shipped"
+    command = seen["command"]
+    assert command[:4] == ["/opt/codex", "exec", "--model", "gpt-5.6-sol"]
+    assert 'model_reasoning_effort="medium"' in command
+    assert "--ephemeral" in command
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert command[-1] == "-"
+    pairs = list(zip(command, command[1:]))
+    assert ("--disable", "shell_tool") in pairs
+    assert ("--disable", "multi_agent") in pairs
+    assert ("--config", "tools.view_image=false") in pairs
+    assert ("--config", 'web_search="disabled"') in pairs
+    developer_setting = next(
+        value for value in command if value.startswith("developer_instructions=")
+    )
+    assert "TRUSTED SYSTEM CONTRACT" in developer_setting
+    assert seen["kwargs"]["input"] == "untrusted events"
+    assert seen["kwargs"]["cwd"] == str(Path(
+        command[command.index("--output-last-message") + 1]
+    ).parent)
+    child_env = seen["kwargs"]["env"]
+    assert child_env["HOME"] == "/home/operator"
+    assert child_env["CODEX_HOME"] == "/home/operator/.codex"
+    for key in (
+        "TEAMMEM_GITLAB_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "MY_PASSWORD",
+        "DATABASE_URL",
+        "SENTRY_DSN",
+        "SSH_AUTH_SOCK",
+    ):
+        assert key not in child_env
+
+
+@pytest.mark.parametrize(
+    "payload", ["not-json", "{}", '{"text":""}', '{"text":3}']
+)
+def test_codex_cli_llm_rejects_malformed_or_empty_output(monkeypatch, payload):
+    def fake_run(command, **_kwargs):
+        Path(command[command.index("--output-last-message") + 1]).write_text(payload)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match="codex cli returned invalid output"):
+        summarize_module.codex_cli_llm("gpt-5.6-sol")("system", "user")
+
+
+def test_codex_cli_llm_reports_nonzero_and_timeout(monkeypatch):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=2,
+            stdout="account limit reached",
+            stderr="network warning",
+        ),
+    )
+    with pytest.raises(ValueError, match="network warning.*account limit reached"):
+        summarize_module.codex_cli_llm("gpt-5.6-sol")("system", "user")
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("codex", 600)
+        ),
+    )
+    with pytest.raises(ValueError, match="timed out after 600s"):
+        summarize_module.codex_cli_llm("gpt-5.6-sol")("system", "user")

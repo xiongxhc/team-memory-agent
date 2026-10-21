@@ -3,6 +3,7 @@ import json
 import pytest
 
 from teammem.bundles import BundleError, bundle_events, load_bundle
+from teammem.store import insert_events, open_db
 
 
 def _event(summary="Shipped café support"):
@@ -40,6 +41,33 @@ def test_valid_bundle_preserves_non_ascii_and_converts_event(tmp_path):
     assert events[0].person == "alex"
     assert events[0].source == "bundle:alex"
     assert "café" in events[0].raw
+
+
+def test_memberkit_event_preserves_project_when_inserted_into_ledger(tmp_path):
+    """Bundle conversion remains independent of project projection mode."""
+    inbox = tmp_path / "inbox"
+    path = _write(
+        inbox,
+        events=[
+            {
+                **_event("MemberKit evidence remains recordable"),
+                "project": "team-memory-agent",
+            }
+        ],
+    )
+
+    bundle = load_bundle(path, inbox)
+    events = bundle_events(bundle, "alex")
+    conn = open_db(tmp_path / "ledger.db")
+
+    assert insert_events(conn, events) == 1
+    assert conn.execute(
+        "SELECT source, summary, project FROM events"
+    ).fetchone() == (
+        "bundle:alex",
+        "MemberKit evidence remains recordable",
+        "team-memory-agent",
+    )
 
 
 def test_empty_event_list_is_valid(tmp_path):

@@ -18,8 +18,8 @@ from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 
-from .config import (MEETING_PATH_SETTINGS, Config, _physical_path, _path_within,
-                     validate_meeting_settings)
+from .config import (CODEX_MODEL, MEETING_PATH_SETTINGS, Config, _physical_path,
+                     _path_within, validate_meeting_settings)
 from .connectors.base import CollectionResult, Connector
 from .connectors.config import ConnectorSettings
 from .connectors.registry import get_connector
@@ -44,13 +44,21 @@ from .render import MANAGED, render_vault_verified, verify_vault
 from .render import _managed_files as managed_vault_files
 from .run_lock import RunLockedError, acquire_publication_lock, acquire_run_lock
 from .slices import active_person_days
-from .store import get_summary, insert_events, open_db, open_db_snapshot, reconcile_gitlab_events
+from .store import (
+    get_summary,
+    insert_events,
+    open_db,
+    open_db_snapshot,
+    reconcile_gitlab_events,
+    replace_weekly_commit_counts,
+)
 from .summarize import (
     DAILY_SYSTEM,
     LLM,
     DailySummaryInput,
     PreparedDailyJournal,
     claude_cli_llm,
+    codex_cli_llm,
     daily_cache_status,
     http_llm,
     prepare_daily_journal,
@@ -73,6 +81,8 @@ from .vaultgit import _upstream as vault_upstream
 class CollectionRun:
     fetched: int
     inserted: int
+    aggregate_rows: int
+    aggregate_changes: int
     channel_names: dict[str, str]
     warnings: tuple[str, ...]
 
@@ -147,13 +157,29 @@ def redact_secrets(detail: object, cfg: Config) -> str:
 
 def resolve_llm_backend(cfg: Config, model: str, max_tokens: int):
     """Resolve the optional synthesis backend without exposing credentials."""
+    if cfg.llm_provider == "codex":
+        if shutil.which(cfg.codex_bin) is None:
+            return None
+        reasoning_effort = "medium" if max_tokens <= 1024 else "high"
+        return codex_cli_llm(
+            CODEX_MODEL,
+            reasoning_effort=reasoning_effort,
+            codex_bin=cfg.codex_bin,
+        )
+    if not cfg.anthropic_api_key and not shutil.which("claude"):
+        return None
+    if not model.strip() or model.strip() in (
+        "daily-summary-model", "weekly-summary-model"
+    ):
+        raise ValueError(
+            "Claude synthesis requires explicit supported model identifiers: "
+            "set TEAMMEM_LLM_DAILY_MODEL and TEAMMEM_LLM_REPORT_MODEL "
+            "in the protected environment file; blank values and old "
+            "placeholder names are not usable models"
+        )
     if cfg.anthropic_api_key:
         return http_llm(model, cfg.anthropic_api_key, max_tokens=max_tokens)
-    import shutil
-
-    if shutil.which("claude"):
-        return claude_cli_llm(model)
-    return None
+    return claude_cli_llm(model)
 
 
 def run_collect(
@@ -199,6 +225,7 @@ def collect_connector(
     selected = connector or get_connector(name)
     result: CollectionResult = selected.collect(cfg, ids, settings, now)
     events = list(result.events)
+    commit_counts = tuple(result.commit_counts)
     if dry_run:
         if emit:
             for event in events:
@@ -206,8 +233,17 @@ def collect_connector(
                     f"DRY {event.ts}  {event.person:<28} {event.kind:<7} "
                     f"{event.project or '-':<18} {event.summary}"
                 )
-            print(f"dry-run: {len(events)} events, nothing written")
+            for count in commit_counts:
+                print(
+                    f"DRY {count.project} {count.week_start} "
+                    f"{count.person} {count.commit_count}"
+                )
+            print(
+                f"dry-run: {len(events)} events; "
+                f"{len(commit_counts)} aggregate rows, nothing written"
+            )
         inserted = 0
+        aggregate_changes = 0
     else:
         connection = conn or open_db(cfg.db_path)
         reclaim(connection, ids)
@@ -215,8 +251,17 @@ def collect_connector(
             inserted = reconcile_gitlab_events(connection, events, ids)
         else:
             inserted = insert_events(connection, events)
+        aggregate_changes = replace_weekly_commit_counts(
+            connection,
+            result.commit_count_scopes,
+            commit_counts,
+        )
         if emit:
-            print(f"ingested: {inserted} new / {len(events)} fetched -> {cfg.db_path}")
+            print(
+                f"ingested: {inserted} new / {len(events)} fetched; "
+                f"{len(commit_counts)} aggregate rows / "
+                f"{aggregate_changes} changed -> {cfg.db_path}"
+            )
             unmapped = sorted({
                 event.person
                 for event in events
@@ -235,6 +280,8 @@ def collect_connector(
     return CollectionRun(
         fetched=len(events),
         inserted=inserted,
+        aggregate_rows=len(commit_counts),
+        aggregate_changes=aggregate_changes,
         channel_names=dict(result.channel_names),
         warnings=tuple(result.warnings),
     )
@@ -494,7 +541,9 @@ def execute_journal(
         if prepared is None:
             continue
         prepared_journals.append(prepared)
-        status, _text = daily_cache_status(conn, prepared)
+        status, _text = daily_cache_status(
+            conn, prepared, cfg.llm_daily_model
+        )
         if status == "cached":
             cached += 1
         elif status == "migrated":
@@ -598,8 +647,8 @@ def run_journal(
         for person, pair_day in pairs:
             cached = connection.execute(
                 "SELECT input_hash FROM summaries "
-                "WHERE kind = 'daily-person' AND key = ?",
-                (f"{person}|{pair_day}",),
+                "WHERE kind = 'daily-person' AND key = ? AND model = ?",
+                (f"{person}|{pair_day}", cfg.llm_daily_model),
             ).fetchone()
             state = "hit" if cached else "miss"
             print(f"DRY journal {person:<28} {pair_day}  {state}")
@@ -612,8 +661,13 @@ def run_journal(
         cfg, cfg.llm_daily_model, max_tokens=1024
     )
     if backend is None:
+        setup = (
+            f"install {cfg.codex_bin} and run `codex login`"
+            if cfg.llm_provider == "codex"
+            else "set ANTHROPIC_API_KEY or install the claude CLI"
+        )
         print(
-            "no LLM backend: set ANTHROPIC_API_KEY or install the claude CLI",
+            f"no LLM backend: {setup}",
             file=sys.stderr,
         )
         return 2
@@ -709,7 +763,11 @@ def execute_report(
         )
         status = (
             "cached"
-            if existing is not None and existing.input_hash == record.input_hash
+            if (
+                existing is not None
+                and existing.input_hash == record.input_hash
+                and existing.model == cfg.llm_report_model
+            )
             else "generated"
         )
         detail = f"{len(dailies)} dailies"
@@ -745,8 +803,9 @@ def run_report(
         return 0
     if dry_run:
         cached = connection.execute(
-            "SELECT 1 FROM summaries WHERE kind='weekly-team' AND key=?",
-            (f"team|{monday.isoformat()}",),
+            "SELECT 1 FROM summaries "
+            "WHERE kind='weekly-team' AND key=? AND model=?",
+            (f"team|{monday.isoformat()}", cfg.llm_report_model),
         ).fetchone()
         print(
             f"DRY report {week_label(monday)}: {len(dailies)} dailies,"
@@ -757,8 +816,13 @@ def run_report(
         cfg, cfg.llm_report_model, max_tokens=8192
     )
     if backend is None:
+        setup = (
+            f"install {cfg.codex_bin} and run `codex login`"
+            if cfg.llm_provider == "codex"
+            else "set ANTHROPIC_API_KEY or install the claude CLI"
+        )
         print(
-            "no LLM backend: set ANTHROPIC_API_KEY or install the claude CLI",
+            f"no LLM backend: {setup}",
             file=sys.stderr,
         )
         return 2

@@ -14,7 +14,11 @@ from .connectors.config import load_connector_settings
 from .connectors.registry import connector_names, get_connector
 from .daily import run_daily
 from .identity import IdentityMaps
-from .reclaim import reclaim, reclaim_channel_projects
+from .reclaim import (
+    reclaim,
+    reclaim_channel_projects,
+    reclaim_repository_projects,
+)
 from .services import (
     collect_connector,
     resolve_llm_backend,
@@ -48,6 +52,12 @@ def _parser() -> argparse.ArgumentParser:
         help="private hub environment file (default: ~/.config/teammem/hub.env)",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_chat = sub.add_parser("chat", help="run the separate conversational service")
+    chat_sub = p_chat.add_subparsers(dest="chat_cmd", required=True)
+    for action in ("check", "serve"):
+        command = chat_sub.add_parser(action)
+        command.add_argument("--config", type=Path, required=True)
 
     p_connectors = sub.add_parser(
         "connectors", help="list or validate built-in connectors"
@@ -252,6 +262,10 @@ def main(argv: list[str] | None = None) -> int:
         if sys.platform != "darwin" and not sys.platform.startswith("linux"):
             parser.error("--watch requires Linux or macOS")
 
+    if args.cmd == "chat":
+        from .chat.runtime import chat_command
+        return chat_command(args.chat_cmd, args.config)
+
     if args.cmd == "schedule":
         try:
             backend = _schedule_backend()
@@ -347,6 +361,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "reclaim":
+        try:
+            settings = load_connector_settings(cfg.config_dir)
+        except OSError:
+            print("error: unable to load connector configuration", file=sys.stderr)
+            return 2
+        except ValueError as failure:
+            print(f"error: {failure}", file=sys.stderr)
+            return 2
         ids = IdentityMaps.load(cfg.config_dir)
         conn = open_db(cfg.db_path)
         results = reclaim(conn, ids, dry_run=args.dry_run)
@@ -365,6 +387,23 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"{prefix}reclaimed {sum(count for _, _, count in channels)} channel rows"
             f" across {len(channels)} channels"
+        )
+        repositories = reclaim_repository_projects(
+            conn,
+            ids,
+            dry_run=args.dry_run,
+            gitlab_url=cfg.gitlab_url,
+            reclaim_origins=settings["gitlab"].options["reclaim_origins"],
+        )
+        for repository, project, count in repositories:
+            print(
+                f"{prefix}reclaim repository {repository} -> {project} "
+                f"({count} rows)"
+            )
+        print(
+            f"{prefix}reclaimed "
+            f"{sum(count for _, _, count in repositories)} repository rows"
+            f" across {len(repositories)} repositories"
         )
         return 0
 
@@ -387,13 +426,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "journal":
         ids = IdentityMaps.load(cfg.config_dir)
         today = date.fromisoformat(args.today) if args.today else date.today()
-        llm = (
-            None
-            if args.dry_run
-            else resolve_llm_backend(
-                cfg, cfg.llm_daily_model, max_tokens=1024
+        try:
+            llm = (
+                None
+                if args.dry_run
+                else resolve_llm_backend(
+                    cfg, cfg.llm_daily_model, max_tokens=1024
+                )
             )
-        )
+        except ValueError as failure:
+            print(f"error: {failure}", file=sys.stderr)
+            return 2
         return run_journal(
             cfg,
             ids,
@@ -407,13 +450,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "report":
         ids = IdentityMaps.load(cfg.config_dir)
         base = date.fromisoformat(args.week_of) if args.week_of else date.today()
-        llm = (
-            None
-            if args.dry_run
-            else resolve_llm_backend(
-                cfg, cfg.llm_report_model, max_tokens=8192
+        try:
+            llm = (
+                None
+                if args.dry_run
+                else resolve_llm_backend(
+                    cfg, cfg.llm_report_model, max_tokens=8192
+                )
             )
-        )
+        except ValueError as failure:
+            print(f"error: {failure}", file=sys.stderr)
+            return 2
         return run_report(
             cfg,
             ids,

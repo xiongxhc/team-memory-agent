@@ -489,11 +489,12 @@ def person_page(backlinks: PersonBacklinks, today: date) -> str:
     ])
 
 
-def project_page(project: str, bullets: tuple[str, ...], today: date) -> str:
-    """The whole page for a project the ledger knows only from meetings."""
+def project_page(project: str, bullets: tuple[str, ...], today: date,
+                 key: str = "project") -> str:
+    """The whole page for a project or area the ledger knows only from meetings."""
     return "".join([
         "---\n",
-        f"project: {_yaml(project)}\n",
+        f"{key}: {_yaml(project)}\n",
         f"generated: {today.isoformat()}\n",
         "---\n",
         f"# {project}\n",

@@ -8,4 +8,9 @@ projects:
     feishu_channels: [oc_example_alpha]
     discord_channels: ["9876543210"]
   project-beta:
+    projection: count-only
     gitlab_repos: [team/project-beta-api, team/project-beta-web]
+areas:
+  coordination: {}
+hidden_projects:
+  - IdeaProjects

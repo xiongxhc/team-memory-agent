@@ -1,9 +1,13 @@
 """GitLab connector adapter with legacy event identities preserved."""
 
 import json
+import logging
 import re
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote
 
 from teammem.config import Config
 from teammem.events import Event, event_hash
@@ -14,14 +18,28 @@ from .config import ConnectorSettings
 
 
 _PER_PAGE = 100
+_RATE_LIMIT_RETRIES = 5
+_RATE_LIMIT_WAIT_BUDGET = 300
 # GitLab reserves this username namespace for group/project access-token bot
 # accounts; humans cannot register such names.
 _TOKEN_BOT_RE = re.compile(r"(group|project)_\d+_bot_")
-FetchJson = Callable[[str, dict], list]
+FetchJson = Callable[[str, dict], list | dict]
 
 
 def _parse_iso8601(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _retry_delay(header: str | None, attempt: int) -> float:
+    if header is not None:
+        value = header.strip()
+        if value.isascii() and value.isdigit():
+            return int(value)
+        try:
+            return max(0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return min(30 * 2 ** attempt, 120)
 
 
 class GitLabConnector:
@@ -44,10 +62,24 @@ class GitLabConnector:
         session = requests.Session()
         session.headers["PRIVATE-TOKEN"] = cfg.gitlab_token
 
-        def fetch(path: str, params: dict) -> list:
-            response = session.get(f"{cfg.gitlab_url}/api/v4{path}", params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
+        def fetch(path: str, params: dict) -> list | dict:
+            waited = 0.0
+            for attempt in range(_RATE_LIMIT_RETRIES + 1):
+                response = session.get(f"{cfg.gitlab_url}/api/v4{path}", params=params, timeout=30)
+                if response.status_code != 429 or attempt == _RATE_LIMIT_RETRIES:
+                    response.raise_for_status()
+                    return response.json()
+                delay = _retry_delay(response.headers.get("Retry-After"), attempt)
+                # Never retry before the server permits, or wait indefinitely.
+                if delay > _RATE_LIMIT_WAIT_BUDGET - waited:
+                    response.raise_for_status()
+                response.close()
+                logging.getLogger(__name__).warning(
+                    "GitLab rate limited; retry %s/%s in %s seconds",
+                    attempt + 1, _RATE_LIMIT_RETRIES, delay,
+                )
+                time.sleep(delay)
+                waited += delay
 
         return fetch
 
@@ -68,6 +100,8 @@ class GitLabConnector:
         out, page = [], 1
         while True:
             batch = fetch_json(path, {**params, "per_page": _PER_PAGE, "page": page})
+            if not isinstance(batch, list):
+                raise TypeError(f"paginated GitLab endpoint returned {type(batch).__name__}")
             out.extend(batch)
             if len(batch) < _PER_PAGE:
                 return out
@@ -143,12 +177,16 @@ class GitLabConnector:
                     hash=event_hash("comment", str(project_id), str(note["id"])),
                 ))
 
-        projects = self._paginate(fetch_json, f"/groups/{cfg.gitlab_group}/projects",
-                                  {
-                                      "include_subgroups": "true",
-                                      "with_shared": "false",
-        })
-        for p in projects:
+        processed_paths: set[str] = set()
+        processed_ids: set[object] = set()
+
+        def collect_project(p: dict) -> None:
+            path_with_namespace = p["path_with_namespace"]
+            path_key = path_with_namespace.casefold()
+            if path_key in processed_paths or p["id"] in processed_ids:
+                return
+            processed_paths.add(path_key)
+            processed_ids.add(p["id"])
             project = ids.project_for_repo(p["path_with_namespace"])
             created_at = p.get("created_at")
             if created_at and _parse_iso8601(created_at) >= since_time:
@@ -255,6 +293,45 @@ class GitLabConnector:
                         hash=event_hash("issue", str(p["id"]), str(issue["iid"]),
                                         "closed"),
                     ))
+
+        projects = self._paginate(fetch_json, f"/groups/{cfg.gitlab_group}/projects",
+                                  {
+                                      "include_subgroups": "true",
+                                      "with_shared": "false",
+        })
+        for p in projects:
+            collect_project(p)
+
+        for path_with_namespace in ids.resources("gitlab-repo"):
+            if path_with_namespace.casefold() in processed_paths:
+                continue
+            project_response = fetch_json(
+                f"/projects/{quote(path_with_namespace, safe='')}",
+                {},
+            )
+            if not isinstance(project_response, dict):
+                warnings.append(
+                    "mapped repository lookup returned no project for "
+                    f"{path_with_namespace}; collection deferred"
+                )
+                continue
+            returned_path = project_response.get("path_with_namespace")
+            if (
+                not isinstance(returned_path, str)
+                or returned_path.casefold() != path_with_namespace.casefold()
+            ):
+                returned_label = (
+                    returned_path
+                    if isinstance(returned_path, str) and returned_path
+                    else "(missing)"
+                )
+                warnings.append(
+                    "mapped repository lookup path mismatch for "
+                    f"{path_with_namespace}: returned {returned_label}; "
+                    "collection deferred"
+                )
+                continue
+            collect_project(project_response)
         return events, warnings
 
     @staticmethod

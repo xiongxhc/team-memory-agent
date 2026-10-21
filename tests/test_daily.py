@@ -13,7 +13,8 @@ from teammem.connectors.config import ConnectorSettings
 from teammem.daily import StepResult, run_daily
 from teammem.events import Event
 from teammem.identity import IdentityMaps
-from teammem.store import insert_events, open_db, stats
+from teammem.metrics import CommitCountScope, WeeklyCommitCount
+from teammem.store import insert_events, open_db, stats, weekly_commit_counts
 
 
 CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
@@ -243,6 +244,136 @@ def test_daily_exposes_connector_warnings_in_result(tmp_path, monkeypatch):
     assert step.status == "ok"
     assert step.warnings == ("MESSAGE_CONTENT may be disabled",)
     assert "MESSAGE_CONTENT may be disabled" in step.detail
+
+
+def test_daily_reports_numeric_aggregate_connector_telemetry(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    observed = []
+    counts = (
+        WeeklyCommitCount("project-alpha", "2026-07-13", "alex", 3),
+        WeeklyCommitCount("project-alpha", "2026-07-13", "sam", 1),
+    )
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
+
+    result = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings("github"),
+        NOW,
+        connectors={
+            "github": FixtureConnector(
+                "github",
+                CollectionResult(
+                    commit_counts=counts,
+                    commit_count_scopes=(
+                        CommitCountScope("project-alpha", "2026-07-13"),
+                    ),
+                ),
+            )
+        },
+        reporter=observed.append,
+    )
+
+    assert "2 aggregate rows / 2 changed" in result.step("github").detail
+    stage_end = next(
+        event for event in observed
+        if event.event == "stage-end" and event.stage == "github"
+    )
+    fields = dict(stage_end.fields)
+    assert fields["aggregate_rows"] == 2
+    assert fields["aggregate_changes"] == 2
+    assert type(fields["aggregate_rows"]) is int
+    assert type(fields["aggregate_changes"]) is int
+    assert weekly_commit_counts(
+        open_db(cfg.db_path), "project-alpha", "2026-07-13"
+    ) == list(counts)
+
+
+def test_daily_reclaims_repository_projects_before_render_with_numeric_telemetry(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path, TEAMMEM_GITLAB_URL="https://gitlab.example")
+    insert_events(open_db(cfg.db_path), [Event(
+        person="alex",
+        project="stale-project",
+        ts="2026-07-17T10:00:00+00:00",
+        source="gitlab",
+        kind="commit",
+        summary="fix project attribution",
+        refs=json.dumps({
+            "url": "https://gitlab.example/team/project-alpha/-/commit/abc"
+        }),
+        hash="repo-reclaim",
+    )])
+    observed = []
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
+
+    result = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        _settings(),
+        NOW,
+        connectors={},
+        reporter=observed.append,
+    )
+
+    assert result.step("reclaim").detail == (
+        "0 identity rows; 0 channel rows; 1 repository rows"
+    )
+    stage_end = next(
+        event for event in observed
+        if event.event == "stage-end" and event.stage == "reclaim"
+    )
+    fields = dict(stage_end.fields)
+    assert fields["repository_rows"] == 1
+    assert type(fields["repository_rows"]) is int
+    assert open_db(cfg.db_path).execute(
+        "SELECT project FROM events WHERE hash = 'repo-reclaim'"
+    ).fetchone()[0] == "project-alpha"
+    assert not (cfg.vault_dir / "Projects" / "stale-project").exists()
+
+
+def test_daily_passes_historical_gitlab_origins_when_connector_is_disabled(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path, TEAMMEM_GITLAB_URL="https://gitlab-current.example")
+    insert_events(open_db(cfg.db_path), [Event(
+        person="alex",
+        project="stale-project",
+        ts="2026-07-17T10:00:00+00:00",
+        source="gitlab",
+        kind="commit",
+        summary="historical attribution",
+        refs=json.dumps({
+            "url": (
+                "https://gitlab-history.example/"
+                "team/project-alpha/-/commit/abc"
+            )
+        }),
+        hash="historical-reclaim",
+    )])
+    settings = _settings()
+    settings["gitlab"] = ConnectorSettings(
+        "gitlab",
+        False,
+        {"reclaim_origins": ["https://gitlab-history.example"]},
+    )
+    monkeypatch.setattr("teammem.daily.resolve_llm_backend", lambda *args: None)
+
+    result = run_daily(
+        cfg,
+        IdentityMaps.load(CONFIG_DIR),
+        settings,
+        NOW,
+        connectors={},
+    )
+
+    assert result.step("reclaim").detail == (
+        "0 identity rows; 0 channel rows; 1 repository rows"
+    )
+    assert open_db(cfg.db_path).execute(
+        "SELECT project FROM events WHERE hash = 'historical-reclaim'"
+    ).fetchone()[0] == "project-alpha"
 
 
 def test_daily_redacts_secrets_from_connector_failures(tmp_path, monkeypatch):

@@ -274,6 +274,8 @@ variable with placeholder values.
 The complete provider table, current official permission links, and all runtime
 paths are in the
 [deployment guide](https://github.com/xiongxhc/team-memory-agent/blob/main/docs/deployment.md).
+Project and Area classification, count-only collection, and historical GitLab
+origin allowlisting are covered in the [operator guide](docs/operator-guide.md).
 
 ### 3. Check locally, then run once
 
@@ -309,6 +311,20 @@ Reports consolidate evidence into `Shipped`, `Needs attention`, and
 `Coordination-heavy / low artifact`; they do not use raw event count as an impact
 score. Without an LLM backend, journal and report synthesis are skipped while
 deterministic rendering continues from ledger evidence and any cached summaries.
+
+`TEAMMEM_LLM_PROVIDER` selects the synthesis backend and defaults to `claude`.
+Claude preserves the existing Anthropic-API-first, Claude-CLI-fallback behavior
+and requires explicit operator-selected `TEAMMEM_LLM_DAILY_MODEL` /
+`TEAMMEM_LLM_REPORT_MODEL` identifiers for the corresponding workload when that
+backend is available. There are no Claude model defaults; missing or old
+placeholder values fail synthesis setup without blocking collection or rendering.
+Selecting `codex` uses the operator's existing Codex login and pins both workloads to
+`gpt-5.6-sol`; daily calls use medium reasoning and weekly reports use high
+reasoning. Codex runs ephemerally with model-driven tools disabled, a read-only
+sandbox, a credential-scrubbed environment, and a structured text envelope.
+Cache hits require the configured model, so a provider switch never silently
+returns a summary produced by the other model. Start a Codex trial with
+`TEAMMEM_LLM_CONCURRENCY=1` and raise it only after observing account capacity.
 
 For an operator-managed intraday trigger, use the capture mode:
 
@@ -661,6 +677,14 @@ LLM-backed synthesis is optional. Without a configured backend, journal and
 weekly-report synthesis are skipped while the ledger, importer, queries, and
 deterministic renderer continue to work.
 
+For shared Markdown publication, follow the complete
+[private vault setup](docs/deployment.md#publish-the-rendered-vault-to-a-private-git-remote)
+before setting `TEAMMEM_PUSH=1`. It covers credentials under the schedule account,
+remote history, branch/upstream, and the verified first push. The public engine
+needs no private overlay; operators own their identities, secrets, private
+repositories, networking, monitoring, and recovery services. These boundaries
+are described in the [deployment guide](docs/deployment.md#public-engine-and-operator-responsibilities).
+
 ## Principles
 
 - The SQLite ledger is truth; Markdown output is disposable and regenerated.
@@ -702,3 +726,10 @@ TEAMMEM_PUBLIC_DENY_REGEX='<private-regex>' ./scripts/check-public.sh
 
 This project is licensed under Apache-2.0. The code owner authorized publication
 under that license on 2026-07-27.
+
+### Optional conversational bot
+
+A separate Feishu chat service supports ordinary conversation, project-scoped
+read-only team evidence, and session-local document/image questions. Install the
+optional chat extras and follow [the chat setup guide](docs/chat.md). Chat uses
+its own credentials and state; collector scheduling and reports are independent.

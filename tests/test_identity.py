@@ -111,3 +111,95 @@ def test_duplicate_feishu_id_across_members_raises():
     }}
     with pytest.raises(ValueError, match="ou_dup"):
         IdentityMaps(roster, {})
+
+
+def test_projection_classifies_projects_areas_hidden_and_unknown():
+    projects = {
+        "projects": {
+            "full": {"gitlab_repos": ["group/full"]},
+            "counts": {
+                "projection": "count-only",
+                "github_repos": ["owner/counts"],
+            },
+        },
+        "areas": {
+            "coordination": {"feishu_channels": ["oc_coordination"]},
+        },
+        "hidden_projects": ["IdeaProjects"],
+    }
+    ids = IdentityMaps({"members": {}}, projects)
+
+    assert ids.projection("full") == "full"
+    assert ids.projection("counts") == "count-only"
+    assert ids.projection("coordination") == "area"
+    assert ids.projection("IdeaProjects") == "hidden"
+    assert ids.projection("unknown") == "unclassified"
+    assert ids.project_for_channel("oc_coordination") == "coordination"
+    assert ids.resources("feishu-channel") == {"oc_coordination": "coordination"}
+
+
+def test_explicit_registry_slugs_are_sorted_without_hidden_or_unclassified():
+    ids = IdentityMaps(
+        {"members": {}},
+        {
+            "projects": {
+                "z-counts": {"projection": "count-only"},
+                "alpha": {},
+            },
+            "areas": {"z-operations": {}, "coordination": {}},
+            "hidden_projects": ["IdeaProjects"],
+        },
+    )
+
+    assert ids.project_slugs() == ["alpha", "z-counts"]
+    assert ids.area_slugs() == ["coordination", "z-operations"]
+    assert "IdeaProjects" not in ids.project_slugs()
+    assert "legacy-unclassified" not in ids.project_slugs()
+    assert "IdeaProjects" not in ids.area_slugs()
+    assert "legacy-unclassified" not in ids.area_slugs()
+
+
+@pytest.mark.parametrize("projection", ["area", "hidden", "invalid", ""])
+def test_invalid_project_projection_is_rejected(projection):
+    with pytest.raises(ValueError, match="projection"):
+        IdentityMaps(
+            {"members": {}},
+            {"projects": {"project": {"projection": projection}}},
+        )
+
+
+@pytest.mark.parametrize(
+    "projects",
+    [
+        {"projects": {"shared": {}}, "areas": {"shared": {}}},
+        {"projects": {"shared": {}}, "hidden_projects": ["shared"]},
+        {"areas": {"shared": {}}, "hidden_projects": ["shared"]},
+    ],
+)
+def test_slug_cannot_be_declared_in_multiple_categories(projects):
+    with pytest.raises(ValueError, match="slug collision"):
+        IdentityMaps({"members": {}}, projects)
+
+
+@pytest.mark.parametrize(
+    "hidden_projects",
+    ["IdeaProjects", None, {"IdeaProjects": True}, [1], [""], ["   "]],
+)
+def test_hidden_projects_must_be_a_list_of_non_empty_strings(hidden_projects):
+    with pytest.raises(
+        ValueError,
+        match="hidden_projects must be a list of non-empty strings",
+    ):
+        IdentityMaps(
+            {"members": {}},
+            {"hidden_projects": hidden_projects},
+        )
+
+
+def test_resource_cannot_be_claimed_by_project_and_area():
+    projects = {
+        "projects": {"project": {"feishu_channels": ["oc_shared"]}},
+        "areas": {"area": {"feishu_channels": ["oc_shared"]}},
+    }
+    with pytest.raises(ValueError, match="resource collision"):
+        IdentityMaps({"members": {}}, projects)

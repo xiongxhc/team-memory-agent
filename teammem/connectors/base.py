@@ -7,6 +7,7 @@ from typing import Protocol
 from teammem.config import Config
 from teammem.events import Event
 from teammem.identity import IdentityMaps
+from teammem.metrics import CommitCountScope, WeeklyCommitCount
 
 from .config import ConnectorSettings
 
@@ -16,6 +17,8 @@ class CollectionResult:
     events: tuple[Event, ...] = ()
     channel_names: dict[str, str] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    commit_counts: tuple[WeeklyCommitCount, ...] = ()
+    commit_count_scopes: tuple[CommitCountScope, ...] = ()
 
 
 class Connector(Protocol):

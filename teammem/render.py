@@ -1,8 +1,8 @@
 """Regenerate the team vault from the ledger.
 The vault is a projection:
-managed dirs (Person/, Projects/, Work Journal/, Meetings/, README.md) are
-deleted and rewritten on every render; anything else in the vault is never
-touched.
+managed dirs (Person/, Projects/, Areas/, Work Journal/, Meetings/,
+README.md) are deleted and rewritten on every render; anything else in the
+vault is never touched.
 Deterministic for a fixed (ledger, today): no wall-clock, no randomness.
 Links are relative markdown links (GitLab web UI renders [[wikilinks]] as
 empty repo-wiki pages; Obsidian handles relative links fine)."""
@@ -24,13 +24,19 @@ from .meeting_bundles import short_occurrence_id
 from .meeting_store import get_meeting, list_meeting_revisions, list_meetings
 from .queries import (by_key, events_between, flags, ref_url,
                       week_label, week_monday, week_range)
-from .store import get_summary, ledger_read_view
+from .store import get_summary, ledger_read_view, weekly_commit_counts
 
-MANAGED = ("Person", "Projects", "Work Journal", "Meetings", "README.md")
+MANAGED = ("Person", "Projects", "Areas", "Work Journal", "Meetings", "README.md")
 MAX_WORK_LINES = 12   # work bullets per person per week (project and person week files)
 WORK_KINDS = ("commit", "pr", "mr", "issue", "repo", "comment", "journal-highlight")
 _FLAG_KEYS = frozenset({"gaps", "unmapped", "unmapped_channels", "concentration"})
 _INVALID_FLAGS_MESSAGE = "invalid weekly report effective flags provenance"
+_NO_COMMIT_COUNTS = "No commit count collected for this week."
+_WEEKLY_REPORT_SECTIONS = (
+    "Shipped",
+    "Needs attention",
+    "Coordination-heavy / low artifact",
+)
 _KIND_LABELS = {
     "commit": ("commit", "commits"),
     "pr": ("PR", "PRs"),
@@ -80,14 +86,135 @@ def _meeting_person(ids: IdentityMaps, person_id: str,
     return slug, ids.display_name(slug)
 
 
+def _weekly_report_blocks(text: str) -> dict[str, list[str]] | None:
+    lines = text.splitlines()
+    if any(re.match(r"^ {0,3}(?:```|~~~)", line) for line in lines):
+        return None
+    headings = [
+        (i, line[3:].rstrip())
+        for i, line in enumerate(lines)
+        if line.startswith("## ")
+    ]
+    if [heading for _, heading in headings] != list(_WEEKLY_REPORT_SECTIONS):
+        return None
+
+    sections = {}
+    for section_index, (line_index, heading) in enumerate(headings):
+        end = (
+            headings[section_index + 1][0]
+            if section_index + 1 < len(headings)
+            else len(lines)
+        )
+        blocks: list[str] = []
+        current: list[str] = []
+
+        def finish_block() -> None:
+            while current and not current[-1].strip():
+                current.pop()
+            if current:
+                blocks.append("\n".join(current))
+                current.clear()
+
+        for line in lines[line_index + 1:end]:
+            if not line.strip():
+                if current and current[0].startswith("- "):
+                    current.append(line)
+                else:
+                    finish_block()
+            elif line.startswith("- ") and current:
+                finish_block()
+                current = [line]
+            elif (
+                current
+                and current[0].startswith("- ")
+                and not line[0].isspace()
+                and not current[-1].strip()
+            ):
+                finish_block()
+                current = [line]
+            else:
+                current.append(line)
+        finish_block()
+        sections[heading] = blocks
+    return sections
+
+
+def _project_weekly_brief(summary, project: str, raw_cutoff: str) -> list[str]:
+    if (
+        summary is None
+        or summary.evidence_cutoff is None
+        or summary.cutoff_precision not in {"instant", "date"}
+        or summary.coverage_state not in {"provisional", "friday-checkpoint"}
+    ):
+        return []
+    sections = _weekly_report_blocks(summary.text)
+    if sections is None:
+        return []
+    canonical = unicodedata.normalize("NFC", project).casefold()
+
+    def attributes_project(block: str) -> bool:
+        for bold in re.findall(r"\*\*([^*\n]+)\*\*", block):
+            label = unicodedata.normalize("NFC", bold).casefold().strip()
+            parenthetical = [
+                part.strip() for part in re.findall(r"\(([^()]*)\)", label)
+            ]
+            if canonical in parenthetical or label == canonical:
+                return True
+            if (
+                "-" in canonical
+                and label.startswith(f"{canonical} ")
+                and label.endswith(":")
+            ):
+                return True
+        return False
+
+    matched = {
+        heading: [block for block in blocks if attributes_project(block)]
+        for heading, blocks in sections.items()
+    }
+    if not any(matched.values()):
+        return []
+
+    state_label = {
+        "provisional": "Provisional",
+        "friday-checkpoint": "Friday checkpoint",
+    }[summary.coverage_state]
+    body = [
+        "\n## Weekly brief\n",
+        f"\n> {state_label} summary evidence through "
+        f"{summary.evidence_cutoff} ({summary.cutoff_precision} precision); "
+        f"raw activity evidence through {raw_cutoff}.\n",
+    ]
+    for heading in _WEEKLY_REPORT_SECTIONS:
+        if matched[heading]:
+            body.append(f"\n### {heading}\n\n")
+            body.append("\n\n".join(matched[heading]) + "\n")
+    return body
+
+
 def _person_link(name: str, up: int = 1) -> str:
     return (f"[{meeting_render.escape_md_label(name)}]"
             f"({'../' * up}Person/{quote(name)}/README.md)")
 
 
-def _project_link(proj: str, up: int = 1) -> str:
+def _markdown_text(text: str) -> str:
+    return re.sub(r"([\\`*_{}\[\]()<>#+.!|])", r"\\\1", text)
+
+
+def _project_root(proj: str, ids: IdentityMaps) -> str | None:
+    """The managed folder a project label renders under, or None when hidden."""
+    projection = ids.projection(proj)
+    if projection == "hidden":
+        return None
+    return "Areas" if projection == "area" else "Projects"
+
+
+def _project_link(proj: str, ids: IdentityMaps, up: int = 1) -> str:
+    root = _project_root(proj, ids)
+    if root is None:
+        return _markdown_text(proj)
     return (f"[{meeting_render.escape_md_label(proj)}]"
-            f"({'../' * up}Projects/{quote(_project_fname(proj))}/README.md)")
+            f"({'../' * up}{root}/{quote(_project_fname(proj))}/README.md)")
 
 
 def _week_link(label: str, up: int = 1) -> str:
@@ -132,19 +259,42 @@ def _evidence_notice(cutoff: tuple[str | None, str, str | None]) -> str:
     return f"Evidence through {value}{detail}."
 
 
-def _validate_project_filenames(conn: sqlite3.Connection,
-                                extra: dict[str, list[str]] | None = None) -> None:
+def _validate_projection_filenames(
+    conn: sqlite3.Connection, ids: IdentityMaps,
+    extra: dict[str, list[str]] | None = None,
+) -> None:
     """`extra` maps a project a meeting named to the occurrences that named it,
     so a collision a producer caused costs those meetings and not the render."""
     extra = extra or {}
-    seen = {"readme.md": "project index"}
-    projects = conn.execute(
-        "SELECT DISTINCT project FROM events WHERE project IS NOT NULL ORDER BY project"
+    slugs = set(ids.project_slugs()) | set(ids.area_slugs())
+    slugs.update({
+        project
+        for (project,) in conn.execute(
+            "SELECT DISTINCT project FROM events "
+            "WHERE project IS NOT NULL ORDER BY project"
+        )
+        if project and project != "(no project)"
+    })
+    slugs.update(
+        project
+        for (project,) in conn.execute(
+            "SELECT DISTINCT project FROM weekly_commit_counts ORDER BY project"
+        )
+        if ids.projection(project) == "count-only"
     )
-    names = sorted({row[0] for row in projects} | set(extra))
-    for project in names:
+    slugs.update(extra)
+    seen_by_root = {
+        "Projects": {"readme.md": "project index"},
+        "Areas": {"readme.md": "area index"},
+    }
+    for project in sorted(slugs):
         if not project or project == "(no project)":
             continue
+        projection = ids.projection(project)
+        if projection == "hidden":
+            continue
+        root = "Areas" if projection == "area" else "Projects"
+        seen = seen_by_root[root]
         folder = _project_fname(project)
         key = folder.casefold()
         if folder in (".", "..") or key in seen:
@@ -273,7 +423,7 @@ def _meeting_naming(ids: IdentityMaps) -> "meeting_render.VaultNaming":
                                                                 provider_name),
         person_folder=_fname,
         person_link=_person_link,
-        project_link=_project_link,
+        project_link=lambda proj, up: _project_link(proj, ids, up),
         safe_filename=_project_fname,
     )
 
@@ -298,19 +448,29 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     notes = meeting_render.collect_notes(conn, naming=naming, today=today,
                                          withhold=withhold)
     person_meetings = meeting_render.person_backlinks(notes)
-    project_meetings = meeting_render.project_backlinks(notes)
-    meeting_projects = sorted(project_meetings)
+    # A meeting's project lands where the event projection files that label:
+    # Projects/ (full, unclassified, count-only) or Areas/. A hidden label gets
+    # no page, so its meetings name it as plain text and link nowhere.
+    meetings_by_root: dict[str, dict[str, tuple[str, ...]]] = {
+        "Projects": {}, "Areas": {}}
+    for proj, bullets in meeting_render.project_backlinks(notes).items():
+        root = _project_root(proj, ids)
+        if root is not None:
+            meetings_by_root[root][proj] = bullets
+    meeting_items = {root: sorted(items) for root, items in meetings_by_root.items()}
     project_owners: dict[str, list[str]] = {}
     for note in notes:
         for project in note.projects:
-            project_owners.setdefault(project, []).append(note.occurrence_id)
-    _validate_project_filenames(conn, project_owners)
+            if _project_root(project, ids) is not None:
+                project_owners.setdefault(project, []).append(note.occurrence_id)
+    _validate_projection_filenames(conn, ids, project_owners)
     vault_dir.mkdir(parents=True, exist_ok=True)
     for m in MANAGED:
         p = vault_dir / m
         shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
     (vault_dir / "Person").mkdir()
     (vault_dir / "Projects").mkdir()
+    (vault_dir / "Areas").mkdir()
     (vault_dir / "Work Journal").mkdir()
     (vault_dir / "Meetings").mkdir()
 
@@ -395,7 +555,7 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             people = len({r["person"] for r in rs})
             prev = prior_proj.get(proj, 0)
             arrow = "▲" if len(rs) > prev else ("▼" if len(rs) < prev else "▬")
-            link = proj if proj == "(no project)" else _project_link(proj)
+            link = proj if proj == "(no project)" else _project_link(proj, ids)
             projects.append(f"- {link} — {len(rs)} events, {people} people "
                       f"(prev {prev} {arrow})\n")
 
@@ -414,7 +574,7 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         for proj, slug, share in (
             [] if coverage_state == "provisional" else f.get("concentration", [])
         ):
-            flags_md.append(f"- **Concentration**: {_project_link(proj)} — {int(share * 100)}% by "
+            flags_md.append(f"- **Concentration**: {_project_link(proj, ids)} — {int(share * 100)}% by "
                       f"{_person_link(_fname(ids.display_name(slug)))}\n")
         if provenance_incomplete:
             flags_md.append(
@@ -527,7 +687,7 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         _write(pdir / "README.md", meeting_render.person_page(backlinks, today))
         files += 1
 
-    # ---- Project pages: one folder per project, one file per active week -----
+    # ---- Project and area pages: one folder per item, one file per week ------
     # Match Person/: full-ledger history survives the managed-dir wipe, while
     # each folder README gives the forge UI a useful latest-week landing page.
     def _project_person_link(person: str) -> str:
@@ -561,131 +721,350 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                         f"({_kind_summary(prs)})\n")
         return body
 
+    def _event_weeks(rows: list[dict]) -> dict[str, list[tuple[date, list[dict]]]]:
+        rows_by_week: dict[date, dict[str, list[dict]]] = {}
+        for row in rows:
+            monday = week_monday(date.fromisoformat(row["ts"][:10]))
+            grouped = rows_by_week.setdefault(monday, {})
+            grouped.setdefault(row["project"], []).append(row)
+        row_mondays = sorted(rows_by_week, reverse=True)
+        return {
+            proj: [
+                (monday, rows_by_week[monday][proj])
+                for monday in row_mondays
+                if proj in rows_by_week[monday]
+            ]
+            for proj in sorted(by_key(rows, "project"))
+            if proj != "(no project)"
+        }
+
     cur = conn.execute(
         "SELECT person, project, ts, kind, summary, refs, hash, source FROM events"
         " WHERE project IS NOT NULL AND project != '' ORDER BY ts DESC"
     )
     cols = [column[0] for column in cur.description]
-    project_rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-    projects_by_week: dict[date, dict[str, list[dict]]] = {}
-    for row in project_rows:
-        monday = week_monday(date.fromisoformat(row["ts"][:10]))
-        grouped = projects_by_week.setdefault(monday, {})
-        grouped.setdefault(row["project"], []).append(row)
-    project_mondays = sorted(projects_by_week, reverse=True)
-    project_weeks: dict[str, list[tuple[date, list[dict]]]] = {}
-    for proj in sorted(by_key(project_rows, "project")):
-        if proj == "(no project)":
-            continue
-        project_weeks[proj] = [(m, projects_by_week[m][proj])
-                               for m in project_mondays
-                               if proj in projects_by_week[m]]
+    classified_rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    project_rows = [
+        row for row in classified_rows
+        if ids.projection(row["project"]) in {"full", "unclassified"}
+    ]
+    area_rows = [
+        row for row in classified_rows
+        if ids.projection(row["project"]) == "area"
+    ]
+    project_weeks = _event_weeks(project_rows)
+    area_weeks = _event_weeks(area_rows)
+    for proj in ids.project_slugs():
+        if ids.projection(proj) == "full":
+            project_weeks.setdefault(proj, [])
+    for area in ids.area_slugs():
+        area_weeks.setdefault(area, [])
 
-    for proj, weeks_mine in project_weeks.items():
-        pdir = vault_dir / "Projects" / _project_fname(proj)
-        if pdir.name == "README.md" or pdir.exists():
-            raise ValueError(f"filename collision in vault render: {pdir}")
-        pdir.mkdir()
-        latest_m, latest_mine = weeks_mine[0]
-        latest_label = week_label(latest_m)
-        md = [f"---\nproject: {proj}\ngenerated: {today.isoformat()}\n---\n",
-              f"# {proj}\n"]
-        docs = [n for n in ("architecture", "summary")
-                if (vault_dir / "Docs" / proj / f"{n}.md").is_file()]
-        if docs:
-            md.append("\n" + " · ".join(
-                f"[{n.capitalize()}](../../Docs/{quote(proj)}/{n}.md)"
-                for n in docs) + "\n")
-        latest_cutoff = _evidence_cutoff(latest_mine)
-        md.append(f"\n## [{latest_label}]({quote(latest_label)}.md)\n\n"
-                  f"{_activity_summary(latest_mine)}\n\n"
-                  f"{_evidence_notice(latest_cutoff)}\n")
-        md += _project_contributors(latest_mine)
-        md.append("\n## Weeks\n")
-        for m, mine in weeks_mine:
-            lbl = week_label(m)
-            md.append(f"- [{lbl}]({quote(lbl)}.md) — "
-                      f"{_activity_summary(mine, separator=', ')}\n")
-        bullets = project_meetings.pop(proj, None)
-        if bullets is not None:
-            md.append(meeting_render.meetings_section(bullets))
-        _write(pdir / "README.md", "".join(md))
-        files += 1
+    count_dates: dict[str, set[date]] = {}
+    for row in classified_rows:
+        if ids.projection(row["project"]) == "count-only":
+            count_dates.setdefault(row["project"], set()).add(
+                week_monday(date.fromisoformat(row["ts"][:10]))
+            )
+    for proj, week_start in conn.execute(
+        "SELECT DISTINCT project, week_start FROM weekly_commit_counts "
+        "ORDER BY project, week_start DESC"
+    ):
+        if ids.projection(proj) == "count-only":
+            count_dates.setdefault(proj, set()).add(date.fromisoformat(week_start))
+    collected_count_dates = {
+        proj: set(project_dates)
+        for proj, project_dates in count_dates.items()
+    }
+    for proj in ids.project_slugs():
+        if ids.projection(proj) == "count-only":
+            count_dates.setdefault(proj, set()).add(mondays[0])
+    count_weeks = {
+        proj: [
+            (monday, weekly_commit_counts(conn, proj, monday.isoformat()))
+            for monday in sorted(project_dates, reverse=True)
+        ]
+        for proj, project_dates in sorted(count_dates.items())
+    }
+    count_index_weeks = {
+        proj: [
+            (monday, counts)
+            for monday, counts in weeks_mine
+            if monday in collected_count_dates.get(proj, set())
+        ]
+        for proj, weeks_mine in count_weeks.items()
+    }
 
-        for m, mine in weeks_mine:
-            lbl = week_label(m)
-            cutoff = _evidence_cutoff(mine)
-            navigation = f"\n[{meeting_render.escape_md_label(proj)}](README.md)"
-            if m in week_of:
-                navigation += (f" · [{lbl} — Team]"
-                               f"(../../Work%20Journal/{quote(lbl)}.md)")
-            wmd = [f"---\nproject: {proj}\nweek: {m.isoformat()}\n"
-                   f"evidence_through: {cutoff[0]}\n"
-                   f"cutoff_precision: {cutoff[1]}\n"
-                   f"generated: {today.isoformat()}\n---\n",
-                   f"# {proj} — {lbl}\n",
-                   f"{navigation}\n\n",
-                   f"{_activity_summary(mine)}\n\n",
-                   f"{_evidence_notice(cutoff)}\n"]
-            wmd += _project_week_body(mine)
-            _write(pdir / f"{_fname(lbl)}.md", "".join(wmd))
+    def _meetings_tail(root_name: str, proj: str) -> list[str]:
+        bullets = meetings_by_root[root_name].pop(proj, None)
+        return [] if bullets is None else [meeting_render.meetings_section(bullets)]
+
+    def _render_event_pages(
+        root_name: str,
+        frontmatter_name: str,
+        item_weeks: dict[str, list[tuple[date, list[dict]]]],
+    ) -> None:
+        nonlocal files
+        for proj, weeks_mine in item_weeks.items():
+            pdir = vault_dir / root_name / _project_fname(proj)
+            if pdir.name == "README.md" or pdir.exists():
+                raise ValueError(f"filename collision in vault render: {pdir}")
+            pdir.mkdir()
+            if not weeks_mine:
+                md = [
+                    f"---\n{frontmatter_name}: {proj}\n"
+                    f"generated: {today.isoformat()}\n---\n",
+                    f"# {proj}\n\n",
+                    f"No activity has been collected for this {frontmatter_name}.\n",
+                ]
+                md += _meetings_tail(root_name, proj)
+                _write(pdir / "README.md", "".join(md))
+                files += 1
+                continue
+            latest_m, latest_mine = weeks_mine[0]
+            latest_label = week_label(latest_m)
+            md = [
+                f"---\n{frontmatter_name}: {proj}\n"
+                f"generated: {today.isoformat()}\n---\n",
+                f"# {proj}\n",
+            ]
+            docs = [
+                name for name in ("architecture", "summary")
+                if (vault_dir / "Docs" / proj / f"{name}.md").is_file()
+            ]
+            if docs:
+                md.append("\n" + " · ".join(
+                    f"[{name.capitalize()}](../../Docs/{quote(proj)}/{name}.md)"
+                    for name in docs
+                ) + "\n")
+            latest_cutoff = _evidence_cutoff(latest_mine)
+            md.append(f"\n## [{latest_label}]({quote(latest_label)}.md)\n\n"
+                      f"{_activity_summary(latest_mine)}\n\n"
+                      f"{_evidence_notice(latest_cutoff)}\n")
+            md += _project_contributors(latest_mine)
+            md.append("\n## Weeks\n")
+            for monday, mine in weeks_mine:
+                label = week_label(monday)
+                md.append(f"- [{label}]({quote(label)}.md) — "
+                          f"{_activity_summary(mine, separator=', ')}\n")
+            md += _meetings_tail(root_name, proj)
+            _write(pdir / "README.md", "".join(md))
             files += 1
 
-    for proj, bullets in sorted(project_meetings.items()):
-        pdir = vault_dir / "Projects" / _project_fname(proj)
-        if pdir.name == "README.md" or pdir.exists():
-            raise meeting_render.MeetingWithheld(
-                project_owners[proj],
-                f"filename collision in vault render: {pdir}")
-        pdir.mkdir()
-        _write(pdir / "README.md", meeting_render.project_page(proj, bullets, today))
+            for monday, mine in weeks_mine:
+                label = week_label(monday)
+                cutoff = _evidence_cutoff(mine)
+                navigation = f"\n[{meeting_render.escape_md_label(proj)}](README.md)"
+                if monday in week_of:
+                    navigation += (f" · [{label} — Team]"
+                                   f"(../../Work%20Journal/{quote(label)}.md)")
+                wmd = [
+                    f"---\n{frontmatter_name}: {proj}\nweek: {monday.isoformat()}\n"
+                    f"evidence_through: {cutoff[0]}\n"
+                    f"cutoff_precision: {cutoff[1]}\n"
+                    f"generated: {today.isoformat()}\n---\n",
+                    f"# {proj} — {label}\n",
+                    f"{navigation}\n\n",
+                    f"{_activity_summary(mine)}\n\n",
+                    f"{_evidence_notice(cutoff)}\n",
+                ]
+                if root_name == "Projects":
+                    wmd += _project_weekly_brief(
+                        weekly_summaries.get(monday), proj, cutoff[0]
+                    )
+                wmd += _project_week_body(mine)
+                _write(pdir / f"{_fname(label)}.md", "".join(wmd))
+                files += 1
+
+    def _commit_summary(counts: list, separator: str = " · ") -> str:
+        if not counts:
+            return _NO_COMMIT_COUNTS
+        return separator.join((
+            _count("commit", sum(count.commit_count for count in counts)),
+            _count("contributor", len({count.person for count in counts})),
+        ))
+
+    def _commit_body(counts: list) -> list[str]:
+        if not counts:
+            return [f"\n{_NO_COMMIT_COUNTS}\n"]
+        ordered = sorted(
+            counts,
+            key=lambda count: (
+                -count.commit_count,
+                ids.display_name(count.person),
+                count.person,
+            ),
+        )
+        body = [
+            f"\n{_commit_summary(ordered)}\n\n",
+            "| Contributor | Commits |\n",
+            "|---|---:|\n",
+        ]
+        body.extend(
+            f"| {_markdown_text(ids.display_name(count.person))} "
+            f"| {count.commit_count} |\n"
+            for count in ordered
+        )
+        return body
+
+    def _render_count_pages() -> None:
+        nonlocal files
+        for proj, weeks_mine in count_weeks.items():
+            pdir = vault_dir / "Projects" / _project_fname(proj)
+            if pdir.name == "README.md" or pdir.exists():
+                raise ValueError(f"filename collision in vault render: {pdir}")
+            pdir.mkdir()
+            latest_m, latest_counts = weeks_mine[0]
+            latest_label = week_label(latest_m)
+            md = [
+                f"---\nproject: {proj}\ngenerated: {today.isoformat()}\n---\n",
+                f"# {proj}\n",
+                f"\n## [{latest_label}]({quote(latest_label)}.md)\n",
+            ]
+            md += _commit_body(latest_counts)
+            md.append("\n## Weeks\n")
+            for monday, counts in weeks_mine:
+                label = week_label(monday)
+                md.append(f"- [{label}]({quote(label)}.md) — "
+                          f"{_commit_summary(counts, separator=', ')}\n")
+            md += _meetings_tail("Projects", proj)
+            _write(pdir / "README.md", "".join(md))
+            files += 1
+
+            for monday, counts in weeks_mine:
+                label = week_label(monday)
+                navigation = f"\n[{meeting_render.escape_md_label(proj)}](README.md)"
+                if monday in week_of:
+                    navigation += (f" · [{label} — Team]"
+                                   f"(../../Work%20Journal/{quote(label)}.md)")
+                wmd = [
+                    f"---\nproject: {proj}\nweek: {monday.isoformat()}\n"
+                    f"generated: {today.isoformat()}\n---\n",
+                    f"# {proj} — {label}\n",
+                    f"{navigation}\n",
+                ]
+                wmd += _commit_body(counts)
+                _write(pdir / f"{_fname(label)}.md", "".join(wmd))
+                files += 1
+
+    def _render_index(
+        root_name: str,
+        event_item_weeks: dict[str, list[tuple[date, list[dict]]]],
+        count_item_weeks: dict[str, list[tuple[date, list]]] | None = None,
+    ) -> None:
+        nonlocal files
+        count_item_weeks = count_item_weeks or {}
+        all_item_weeks = {**event_item_weeks, **count_item_weeks}
+        current_m = mondays[0]
+        current = {
+            proj: next(
+                (mine for monday, mine in weeks_mine if monday == current_m),
+                None,
+            )
+            for proj, weeks_mine in all_item_weeks.items()
+        }
+        current = {proj: mine for proj, mine in current.items() if mine is not None}
+
+        def item_summary(proj: str, rows: list, separator: str = " · ") -> str:
+            if proj in count_item_weeks:
+                return _commit_summary(rows, separator=separator)
+            return _activity_summary(rows, separator=separator)
+
+        def item_size(proj: str, rows: list) -> int:
+            if proj in count_item_weeks:
+                return sum(count.commit_count for count in rows)
+            return len(rows)
+
+        md = [
+            f"---\ngenerated: {today.isoformat()}\n---\n",
+            f"# {root_name}\n",
+            f"\n## {week_label(current_m)}\n",
+        ]
+        current_event_rows = [
+            row
+            for proj, rows in current.items()
+            if proj not in count_item_weeks
+            for row in rows
+        ]
+        if current_event_rows:
+            md.append(f"\n{_evidence_notice(_evidence_cutoff(current_event_rows))}\n")
+        for proj, rows in sorted(
+            current.items(),
+            key=lambda item: (-item_size(*item), item[0]),
+        ):
+            md.append(f"- [{meeting_render.escape_md_label(proj)}]"
+                      f"({quote(_project_fname(proj))}/README.md) — "
+                      f"{item_summary(proj, rows)}\n")
+        if not current:
+            noun = "project" if root_name == "Projects" else "area"
+            md.append(f"- No mapped {noun} activity.\n")
+
+        future = {
+            proj: weeks_mine[0]
+            for proj, weeks_mine in all_item_weeks.items()
+            if weeks_mine and weeks_mine[0][0] > current_m
+        }
+        if future:
+            md.append("\n## Future-dated activity\n\nCheck source timestamps.\n")
+            for proj, (latest_m, latest_rows) in sorted(future.items()):
+                label = week_label(latest_m)
+                folder = quote(_project_fname(proj))
+                md.append(f"- [{meeting_render.escape_md_label(proj)}]({folder}/README.md) — "
+                          f"[{label}]({folder}/{quote(label)}.md) · "
+                          f"{item_summary(proj, latest_rows)}\n")
+        earlier = [
+            proj for proj in all_item_weeks
+            if all_item_weeks[proj]
+            and proj not in current and proj not in future
+        ]
+        if earlier:
+            md.append("\n## Earlier activity\n")
+            for proj in sorted(
+                earlier,
+                key=lambda item: (-all_item_weeks[item][0][0].toordinal(), item),
+            ):
+                latest_m, latest_rows = all_item_weeks[proj][0]
+                label = week_label(latest_m)
+                folder = quote(_project_fname(proj))
+                md.append(f"- [{meeting_render.escape_md_label(proj)}]({folder}/README.md) — latest "
+                          f"[{label}]({folder}/{quote(label)}.md) · "
+                          f"{item_summary(proj, latest_rows)}\n")
+        configured_empty = sorted(
+            proj for proj, weeks_mine in all_item_weeks.items()
+            if not weeks_mine
+        )
+        if configured_empty:
+            md.append("\n## Configured, no collected activity\n")
+            for proj in configured_empty:
+                md.append(
+                    f"- [{meeting_render.escape_md_label(proj)}]"
+                    f"({quote(_project_fname(proj))}/README.md)\n"
+                )
+        if meeting_items[root_name]:
+            md.append("\n## Discussed in meetings\n")
+            for proj in meeting_items[root_name]:
+                md.append(f"- [{meeting_render.escape_md_label(proj)}]"
+                          f"({quote(_project_fname(proj))}/README.md)\n")
+        _write(vault_dir / root_name / "README.md", "".join(md))
         files += 1
 
-    current_m = mondays[0]
-    current = {
-        proj: rows for proj, rows in by_key(week_of[current_m], "project").items()
-        if proj != "(no project)"
-    }
-    pmd = [f"---\ngenerated: {today.isoformat()}\n---\n",
-           "# Projects\n",
-           f"\n## {week_label(current_m)}\n"]
-    if current:
-        current_rows = [row for rows in current.values() for row in rows]
-        pmd.append(f"\n{_evidence_notice(_evidence_cutoff(current_rows))}\n")
-    for proj, rows in sorted(current.items(), key=lambda item: (-len(item[1]), item[0])):
-        pmd.append(f"- [{meeting_render.escape_md_label(proj)}]"
-                   f"({quote(_project_fname(proj))}/README.md) — "
-                   f"{_activity_summary(rows)}\n")
-    if not current:
-        pmd.append("- No mapped project activity.\n")
-    future = {proj: weeks[0] for proj, weeks in project_weeks.items()
-              if weeks[0][0] > current_m}
-    if future:
-        pmd.append("\n## Future-dated activity\n\nCheck source timestamps.\n")
-        for proj, (latest_m, latest_rows) in sorted(future.items()):
-            lbl = week_label(latest_m)
-            folder = quote(_project_fname(proj))
-            pmd.append(f"- [{meeting_render.escape_md_label(proj)}]({folder}/README.md) — "
-                       f"[{lbl}]({folder}/{quote(lbl)}.md) · "
-                       f"{_activity_summary(latest_rows)}\n")
-    earlier = [proj for proj in project_weeks
-               if proj not in current and proj not in future]
-    if earlier:
-        pmd.append("\n## Earlier activity\n")
-        for proj in sorted(earlier, key=lambda p: (-project_weeks[p][0][0].toordinal(), p)):
-            latest_m, latest_rows = project_weeks[proj][0]
-            lbl = week_label(latest_m)
-            folder = quote(_project_fname(proj))
-            pmd.append(f"- [{meeting_render.escape_md_label(proj)}]({folder}/README.md) — latest "
-                       f"[{lbl}]({folder}/{quote(lbl)}.md) · "
-                       f"{_activity_summary(latest_rows)}\n")
-    if meeting_projects:
-        pmd.append("\n## Discussed in meetings\n")
-        for proj in meeting_projects:
-            pmd.append(f"- [{meeting_render.escape_md_label(proj)}]"
-                       f"({quote(_project_fname(proj))}/README.md)\n")
-    _write(vault_dir / "Projects" / "README.md", "".join(pmd))
-    files += 1
+    _render_event_pages("Projects", "project", project_weeks)
+    _render_count_pages()
+    _render_event_pages("Areas", "area", area_weeks)
+    # Projects and areas the ledger knows only from meetings.
+    for root_name, frontmatter_name in (("Projects", "project"), ("Areas", "area")):
+        for proj, bullets in sorted(meetings_by_root[root_name].items()):
+            pdir = vault_dir / root_name / _project_fname(proj)
+            if pdir.name == "README.md" or pdir.exists():
+                raise meeting_render.MeetingWithheld(
+                    project_owners[proj],
+                    f"filename collision in vault render: {pdir}")
+            pdir.mkdir()
+            _write(pdir / "README.md", meeting_render.project_page(
+                proj, bullets, today, key=frontmatter_name))
+            files += 1
+    _render_index("Projects", project_weeks, count_index_weeks)
+    _render_index("Areas", area_weeks)
 
     for relative, content in meeting_render.meeting_files(notes, today).items():
         path = vault_dir / relative
@@ -695,8 +1074,9 @@ def _render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
 
     label = week_label(mondays[0])
     (vault_dir / "README.md").write_text(
-        f"# Team Vault\n\nGENERATED — do not edit Person/, Projects/, Work Journal/, "
-        f"or Meetings/ by hand; every render regenerates them from the ledger.\n\n"
+        f"# Team Vault\n\nGENERATED — do not edit Person/, Projects/, Areas/, "
+        f"Work Journal/, or Meetings/ by hand; every render regenerates them from "
+        f"the ledger.\n\n"
         f"- generated: {today.isoformat()}\n- weeks rendered: {weeks}\n"
         f"- events in window: {len(all_rows)}\n"
         f"- meetings: {len(notes)} — [Meetings](Meetings/README.md)\n"
@@ -897,7 +1277,11 @@ def _meeting_facts(meeting: dict, ids: IdentityMaps) -> dict:
                 short=short_occurrence_id(meeting["occurrence_id"]))),
         "person_folders": {_fname(name[pid]) for pid in attended},
         "project_folders": {_project_fname(project["name"])
-                            for project in meeting["projects"]},
+                            for project in meeting["projects"]
+                            if _project_root(project["name"], ids) == "Projects"},
+        "area_folders": {_project_fname(project["name"])
+                         for project in meeting["projects"]
+                         if _project_root(project["name"], ids) == "Areas"},
         "speakers": [name[entry["person_id"]] for entry in meeting["person_summaries"]
                      if entry["person_id"] in spoke and entry["person_id"] in attended],
     }
@@ -1140,6 +1524,8 @@ def _meeting_pages(expected: dict[str, dict]) -> dict[str, tuple[str, ...]]:
                     for folder in sorted(facts["person_folders"])]
         touched += [str(PurePosixPath("Projects", folder, "README.md"))
                     for folder in sorted(facts["project_folders"])]
+        touched += [str(PurePosixPath("Areas", folder, "README.md"))
+                    for folder in sorted(facts["area_folders"])]
         for page in touched:
             pages.setdefault(page, []).append(occurrence_id)
     return {page: tuple(owners) for page, owners in sorted(pages.items())}
@@ -1287,6 +1673,9 @@ def verify_meeting_semantics(conn: sqlite3.Connection, ids: IdentityMaps,
         ("Projects", "project_folders", "meeting.project.backlinks",
          "the page of a discussed project does not link the meeting",
          "the page of a project the meeting did not discuss links it"),
+        ("Areas", "area_folders", "meeting.project.backlinks",
+         "the page of a discussed area does not link the meeting",
+         "the page of an area the meeting did not discuss links it"),
     ):
         pages = _vault_pages(vault_dir, top)
         folders = {folder for folder, _, _ in pages}

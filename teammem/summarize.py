@@ -2,10 +2,14 @@
 LLM callable. Daily and weekly cache versions evolve independently."""
 
 import json
+import os
 import re
 import sqlite3
+import subprocess
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from .queries import ReportContext
 from .slices import (
@@ -17,6 +21,35 @@ from .slices import (
 from .store import SummaryRecord, get_summary, put_summary
 
 LLM = Callable[[str, str], str]
+
+CODEX_TEXT_SCHEMA = {
+    "type": "object",
+    "properties": {"text": {"type": "string"}},
+    "required": ["text"],
+    "additionalProperties": False,
+}
+
+_CODEX_ENV_ALLOWLIST = {
+    "ALL_PROXY",
+    "CODEX_HOME",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "NO_PROXY",
+    "PATH",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+}
 
 DAILY_PROMPT_VERSION = "2"
 DAILY_HASH_SCHEMA_VERSION = "local-projects-v1"
@@ -114,8 +147,8 @@ def http_llm(model: str, api_key: str, max_tokens: int) -> LLM:
     return llm
 
 
-def _claude_cli_failure_detail(stderr: str, stdout: str) -> str:
-    """Return a compact, deterministic diagnostic from Claude CLI output."""
+def _cli_failure_detail(stderr: str, stdout: str) -> str:
+    """Return a compact, deterministic diagnostic from CLI output."""
     excerpts = []
     for label, stream in (("stderr", stderr), ("stdout", stdout)):
         text = re.sub(r"[\s\x00-\x1f\x7f]+", " ", stream).strip()
@@ -129,20 +162,99 @@ def claude_cli_llm(model: str, claude_bin: str = "claude") -> LLM:
     --system-prompt replaces the default; --strict-mcp-config/--setting-sources=
     isolate the call from skills, CLAUDE.md, and MCP servers. The user prompt
     rides stdin (weekly report inputs can exceed ARG_MAX)."""
-    import subprocess
-
     def llm(system: str, user: str) -> str:
         proc = subprocess.run(
             [claude_bin, "-p", "--model", model, "--system-prompt", system,
              "--strict-mcp-config", "--setting-sources="],
             input=user, capture_output=True, text=True, timeout=600)
         if proc.returncode != 0:
-            detail = _claude_cli_failure_detail(proc.stderr, proc.stdout)
+            detail = _cli_failure_detail(proc.stderr, proc.stdout)
             raise ValueError(f"claude cli failed ({proc.returncode}): {detail}")
         text = proc.stdout.strip()
         if not text:
             raise ValueError("claude cli returned empty output")
         return text
+
+    return llm
+
+
+def _scrubbed_llm_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key in _CODEX_ENV_ALLOWLIST
+    }
+
+
+def codex_cli_llm(
+    model: str,
+    *,
+    reasoning_effort: str = "high",
+    codex_bin: str = "codex",
+) -> LLM:
+    """Run one confined Codex synthesis call using the operator's login."""
+
+    def llm(system: str, user: str) -> str:
+        with tempfile.TemporaryDirectory(prefix="teammem-codex-") as temporary:
+            directory = Path(temporary)
+            schema_path = directory / "text-schema.json"
+            output_path = directory / "response.json"
+            schema_path.write_text(json.dumps(CODEX_TEXT_SCHEMA))
+            command = [
+                codex_bin,
+                "exec",
+                "--model",
+                model,
+                "--config",
+                f"developer_instructions={json.dumps(system)}",
+                "--config",
+                f'model_reasoning_effort="{reasoning_effort}"',
+                "--disable",
+                "shell_tool",
+                "--disable",
+                "multi_agent",
+                "--config",
+                "tools.view_image=false",
+                "--config",
+                'web_search="disabled"',
+                "--ephemeral",
+                "--sandbox",
+                "read-only",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--skip-git-repo-check",
+                "--json",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ]
+            try:
+                process = subprocess.run(
+                    command,
+                    input=user,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    env=_scrubbed_llm_env(),
+                    cwd=temporary,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise ValueError("codex cli timed out after 600s") from error
+            if process.returncode != 0:
+                detail = _cli_failure_detail(process.stderr, process.stdout)
+                raise ValueError(
+                    f"codex cli failed ({process.returncode}): {detail}"
+                )
+            try:
+                body = json.loads(output_path.read_text())
+                text = body["text"]
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ValueError("codex cli returned invalid output") from error
+            return text.strip()
 
     return llm
 
@@ -207,12 +319,17 @@ def prepare_daily_journal(
 
 
 def daily_cache_status(
-    conn: sqlite3.Connection, prepared: PreparedDailyJournal
+    conn: sqlite3.Connection,
+    prepared: PreparedDailyJournal,
+    model: str | None = None,
 ) -> tuple[str, str | None]:
     existing = get_summary(conn, "daily-person", prepared.key)
     if existing is None:
         return "miss", None
-    if existing.input_hash == prepared.input_hash:
+    if (
+        existing.input_hash == prepared.input_hash
+        and (model is None or existing.model == model)
+    ):
         return "cached", existing.text
     migration_target_is_current = (
         DAILY_PROMPT_VERSION,
@@ -221,6 +338,7 @@ def daily_cache_status(
     if (
         migration_target_is_current
         and existing.input_hash == prepared.legacy_input_hash
+        and (model is None or existing.model == model)
     ):
         put_summary(conn, replace(existing, input_hash=prepared.input_hash))
         return "migrated", existing.text
@@ -255,7 +373,7 @@ def daily_person_journal(conn: sqlite3.Connection, person: str, display_name: st
     )
     if prepared is None:
         return None
-    status, cached_text = daily_cache_status(conn, prepared)
+    status, cached_text = daily_cache_status(conn, prepared, model)
     if status != "miss":
         return cached_text
     text = llm(DAILY_SYSTEM, prepared.user_prompt)
@@ -334,7 +452,11 @@ def weekly_team_report(
     }))
     key = f"team|{monday_iso}"
     existing = get_summary(conn, "weekly-team", key)
-    if existing is not None and existing.input_hash == input_hash:
+    if (
+        existing is not None
+        and existing.input_hash == input_hash
+        and existing.model == model
+    ):
         return existing
 
     user = (

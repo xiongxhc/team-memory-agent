@@ -1,10 +1,13 @@
 connectors:
   github:
     enabled: false
+    # count_weeks: 4             # rolling UTC-aligned count-only window (1..52)
   gitlab:
     enabled: false
     # collect_mr_commits: false   # opt out of unseen commits from in-window merged MRs
     # exclude_note_authors: []    # GitLab usernames (e.g. bot accounts) whose MR/issue comments are not collected
+    # Historical attribution only; collection still uses TEAMMEM_GITLAB_URL.
+    # reclaim_origins: [https://gitlab-history.example]
   slack:
     enabled: false
   feishu:

@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timezone
-from pathlib import Path
+
+import pytest
 
 from teammem.config import Config
 from teammem.connectors.config import ConnectorSettings
@@ -10,24 +11,42 @@ from teammem.gitlab_collector import collect_gitlab
 from teammem.identity import IdentityMaps
 
 NOW = datetime(2026, 7, 15, tzinfo=timezone.utc)
-# Hermetic fixture dir: only .example files, so IdentityMaps.load's fallback is
-# deterministic regardless of the operator's real config/roster.yaml.
-CONFIG_DIR = Path(__file__).parent / "fixtures" / "config"
 
 PROJECTS = [{"id": 1, "path_with_namespace": "team/project-alpha"}]
 BRANCHES = [{"name": "main"}]
 COMMIT = {"id": "sha-abc", "author_email": "alex@example.com", "author_name": "Alex",
           "committed_date": "2026-07-14T09:00:00Z", "title": "fix: JWT refresh race",
-          "web_url": "https://gitlab.internal/team/project-alpha/-/commit/sha-abc"}
+          "web_url": "https://gitlab.example/team/project-alpha/-/commit/sha-abc"}
 MR = {"iid": 7, "state": "merged", "title": "Auth middleware fix",
       "author": {"username": "alexdev"}, "updated_at": "2026-07-14T10:00:00Z",
       "merged_at": "2026-07-14T10:00:00Z",
-      "web_url": "https://gitlab.internal/team/project-alpha/-/merge_requests/7"}
+      "web_url": "https://gitlab.example/team/project-alpha/-/merge_requests/7"}
 ISSUE = {"iid": 31, "state": "opened", "title": "Login rate limit",
          "author": {"username": "alexdev"}, "assignee": None,
          "created_at": "2026-07-14T08:00:00Z",
          "updated_at": "2026-07-14T11:00:00Z", "closed_at": None,
-         "web_url": "https://gitlab.internal/team/project-alpha/-/issues/31"}
+         "web_url": "https://gitlab.example/team/project-alpha/-/issues/31"}
+
+
+def _ids():
+    return IdentityMaps({
+        "members": {
+            "alex": {
+                "emails": ["alex@example.com"],
+                "gitlab": ["alexdev"],
+            },
+            "sam": {
+                "emails": ["sam@example.com", "sam.li@example.com"],
+                "gitlab": ["samdev"],
+            },
+        },
+    }, {
+        "projects": {
+            "project-alpha": {
+                "gitlab_repos": ["team/project-alpha"],
+            },
+        },
+    })
 
 
 def fake_fetch(responses):
@@ -44,17 +63,153 @@ def _collect(responses):
     if "/projects/1/repository/commits" in responses:
         responses.setdefault("/projects/1/repository/branches", [BRANCHES])
     cfg = Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"})
-    ids = IdentityMaps.load(CONFIG_DIR)
+    ids = _ids()
     return collect_gitlab(cfg, ids, fake_fetch(responses), NOW)
 
 
 def _collect_result(fetch):
     return GitLabConnector(fetch_json=fetch).collect(
         Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
-        IdentityMaps.load(CONFIG_DIR),
+        _ids(),
         ConnectorSettings(name="gitlab", enabled=True, options={}),
         NOW,
     )
+
+
+def test_explicitly_mapped_repositories_outside_group_are_collected_once():
+    ids = IdentityMaps({}, {
+        "projects": {
+            "project-in-group": {
+                "gitlab_repos": ["team/project-in-group"],
+            },
+            "project-external": {
+                "gitlab_repos": [
+                    "outside-one/project-alpha",
+                    "outside-two/project-beta",
+                ],
+            },
+        },
+    })
+    group_project = {
+        "id": 1,
+        "path_with_namespace": "TEAM/PROJECT-IN-GROUP",
+    }
+    external_projects = {
+        "/projects/outside-one%2Fproject-alpha": {
+            "id": 2,
+            "path_with_namespace": "OUTSIDE-ONE/PROJECT-ALPHA",
+        },
+        "/projects/outside-two%2Fproject-beta": {
+            "id": 3,
+            "path_with_namespace": "outside-two/project-beta",
+        },
+    }
+    seen: list[str] = []
+
+    def fetch(path, params):
+        seen.append(path)
+        if path == "/groups/42/projects":
+            return [group_project] if params["page"] == 1 else []
+        if path in external_projects:
+            return external_projects[path]
+        if path.endswith("/repository/branches"):
+            return [{"name": "main"}] if params["page"] == 1 else []
+        if path.endswith("/repository/commits"):
+            project_id = path.split("/")[2]
+            return [{
+                **COMMIT,
+                "id": "shared-sha",
+                "title": f"commit from project {project_id}",
+            }] if params["page"] == 1 else []
+        return []
+
+    result = GitLabConnector(fetch_json=fetch).collect(
+        Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
+        ids,
+        ConnectorSettings(name="gitlab", enabled=True, options={}),
+        NOW,
+    )
+
+    assert [(event.project, event.hash) for event in result.events
+            if event.kind == "commit"] == [
+        ("project-in-group", event_hash("commit", "1", "shared-sha")),
+        ("project-external", event_hash("commit", "2", "shared-sha")),
+        ("project-external", event_hash("commit", "3", "shared-sha")),
+    ]
+    assert seen.count("/projects/outside-one%2Fproject-alpha") == 1
+    assert seen.count("/projects/outside-two%2Fproject-beta") == 1
+    assert "/projects/team%2Fproject-in-group" not in seen
+    assert [seen.count(f"/projects/{project_id}/repository/branches")
+            for project_id in (1, 2, 3)] == [1, 1, 1]
+    assert "/groups/outside-one/projects" not in seen
+    assert "/groups/outside-two/projects" not in seen
+
+
+def test_explicitly_mapped_repository_lookup_failure_is_not_silent():
+    ids = IdentityMaps({}, {
+        "projects": {
+            "project-in-group": {
+                "gitlab_repos": ["team/project-in-group"],
+            },
+            "project-external": {
+                "gitlab_repos": ["outside-one/project-alpha"],
+            },
+        },
+    })
+
+    def fetch(path, params):
+        if path == "/groups/42/projects":
+            return [{
+                "id": 1,
+                "path_with_namespace": "team/project-in-group",
+            }] if params["page"] == 1 else []
+        if path == "/projects/outside-one%2Fproject-alpha":
+            raise RuntimeError("mapped project is unavailable")
+        return []
+
+    with pytest.raises(RuntimeError, match="mapped project is unavailable"):
+        GitLabConnector(fetch_json=fetch).collect(
+            Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
+            ids,
+            ConnectorSettings(name="gitlab", enabled=True, options={}),
+            NOW,
+        )
+
+
+def test_explicitly_mapped_repository_lookup_rejects_a_different_returned_path():
+    ids = IdentityMaps({}, {
+        "projects": {
+            "project-external": {
+                "gitlab_repos": ["outside-one/project-alpha"],
+            },
+        },
+    })
+    seen = []
+
+    def fetch(path, params):
+        seen.append(path)
+        if path == "/groups/42/projects":
+            return []
+        if path == "/projects/outside-one%2Fproject-alpha":
+            return {
+                "id": 99,
+                "path_with_namespace": "another-group/project-alpha",
+            }
+        return []
+
+    result = GitLabConnector(fetch_json=fetch).collect(
+        Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
+        ids,
+        ConnectorSettings(name="gitlab", enabled=True, options={}),
+        NOW,
+    )
+
+    assert result.events == ()
+    assert result.warnings == (
+        "mapped repository lookup path mismatch for outside-one/project-alpha: "
+        "returned another-group/project-alpha; collection deferred",
+    )
+    assert not any(path.startswith("/projects/99/") for path in seen)
 
 
 def test_commit_and_mr_become_events():
@@ -107,7 +262,7 @@ def test_since_and_updated_after_params_sent():
             return BRANCHES if params["page"] == 1 else []
         return []
     cfg = Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"})
-    ids = IdentityMaps.load(CONFIG_DIR)
+    ids = _ids()
     collect_gitlab(cfg, ids, fetch, NOW)
     assert seen["/projects/1/repository/commits"]["since"] == "2026-07-08T00:00:00Z"
     assert seen["/projects/1/repository/commits"]["ref_name"] == "main"
@@ -325,7 +480,7 @@ def test_ghost_issue_author_is_unmapped_not_crash():
 def test_new_repo_becomes_attributed_event():
     """Removing repo-creation collection or creator lookup breaks this."""
     new_project = dict(PROJECTS[0], created_at="2026-07-14T08:00:00Z", creator_id=5,
-                       web_url="https://gitlab.internal/team/project-alpha")
+                       web_url="https://gitlab.example/team/project-alpha")
     events = _collect({
         "/groups/42/projects": [[new_project]],
         "/users/5": [{"username": "alexdev"}],
@@ -494,7 +649,7 @@ def test_unmerged_mr_does_not_fetch_commits():
         "/projects/1/merge_requests": [[opened]],
     })
     cfg = Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"})
-    collect_gitlab(cfg, IdentityMaps.load(CONFIG_DIR), fetch, NOW)
+    collect_gitlab(cfg, _ids(), fetch, NOW)
     assert "/projects/1/merge_requests/7/commits" not in seen
 
 
@@ -507,7 +662,7 @@ def test_mr_merged_before_window_does_not_fetch_commits():
         "/projects/1/merge_requests": [[stale]],
     })
     cfg = Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"})
-    collect_gitlab(cfg, IdentityMaps.load(CONFIG_DIR), fetch, NOW)
+    collect_gitlab(cfg, _ids(), fetch, NOW)
     assert "/projects/1/merge_requests/7/commits" not in seen
 
 
@@ -520,7 +675,7 @@ def test_mr_merged_at_exact_lookback_boundary_backfills_commits():
     })
 
     cfg = Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"})
-    collect_gitlab(cfg, IdentityMaps.load(CONFIG_DIR), fetch, NOW)
+    collect_gitlab(cfg, _ids(), fetch, NOW)
 
     assert "/projects/1/merge_requests/7/commits" in seen
 
@@ -546,7 +701,7 @@ def test_collect_mr_commits_option_disables_backfill():
     })
     result = GitLabConnector(fetch_json=fetch).collect(
         Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
-        IdentityMaps.load(CONFIG_DIR),
+        _ids(),
         ConnectorSettings(name="gitlab", enabled=True,
                           options={"collect_mr_commits": False}),
         NOW,
@@ -628,22 +783,22 @@ def test_connector_preserves_non_commit_gitlab_identities():
         "/projects/1/issues": [[ISSUE, closed]],
     })).collect(
         Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
-        IdentityMaps.load(CONFIG_DIR),
+        _ids(),
         ConnectorSettings(name="gitlab", enabled=True, options={}),
         NOW,
     )
     assert [(event.source, event.kind, event.refs, event.hash) for event in result.events] == [
         ("gitlab", "commit",
-         '{"sha": "sha-abc", "url": "https://gitlab.internal/team/project-alpha/-/commit/sha-abc"}',
+         '{"sha": "sha-abc", "url": "https://gitlab.example/team/project-alpha/-/commit/sha-abc"}',
          event_hash("commit", "1", "sha-abc")),
         ("gitlab", "mr",
-         '{"iid": 7, "url": "https://gitlab.internal/team/project-alpha/-/merge_requests/7"}',
+         '{"iid": 7, "url": "https://gitlab.example/team/project-alpha/-/merge_requests/7"}',
          "b56227665acb0f91946d18838c871e0cd076abdbcfade0e3bc52ba25d107c767"),
         ("gitlab", "issue",
-         '{"iid": 31, "url": "https://gitlab.internal/team/project-alpha/-/issues/31"}',
+         '{"iid": 31, "url": "https://gitlab.example/team/project-alpha/-/issues/31"}',
          "907928208df1c752749c3bea14cd056955dde724d7df620eaf597e7ac9c4beed"),
         ("gitlab", "issue",
-         '{"iid": 31, "url": "https://gitlab.internal/team/project-alpha/-/issues/31"}',
+         '{"iid": 31, "url": "https://gitlab.example/team/project-alpha/-/issues/31"}',
          "789bb2e605c8237773c1eb4c159aa90a6ad895365f1b86de054cb1cc1a23ccf8"),
     ]
 
@@ -687,7 +842,7 @@ def test_system_bot_and_stale_notes_not_collected():
         "/projects/1/merge_requests/7/notes": [[system_note, bot_note, stale_note]],
     })).collect(
         Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
-        IdentityMaps.load(CONFIG_DIR),
+        _ids(),
         ConnectorSettings(name="gitlab", enabled=True,
                           options={"exclude_note_authors": ["fgbot"]}),
         NOW,
@@ -716,7 +871,7 @@ def test_failed_note_lookup_warns_without_losing_other_events():
         })(path, params)
     result = GitLabConnector(fetch_json=fetch).collect(
         Config.load(env={"TEAMMEM_GITLAB_GROUP": "42"}),
-        IdentityMaps.load(CONFIG_DIR),
+        _ids(),
         ConnectorSettings(name="gitlab", enabled=True, options={}),
         NOW,
     )
