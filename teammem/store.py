@@ -80,6 +80,9 @@ def _private_ledger(path: Path) -> None:
     journal, WAL and SHM files the database file's own mode, so fixing the mode
     of the main file before SQLite opens it covers the sidecars as well. An
     existing ledger is tightened to owner-only on every open.
+
+    On Windows mode bits only toggle read-only, so privacy there rests on the
+    containing directory's ACL (see docs/privacy.md); this sets no ACL.
     """
     if str(path) == ":memory:" or str(path).startswith("file:"):
         return

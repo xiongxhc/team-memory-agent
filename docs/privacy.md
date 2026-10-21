@@ -18,6 +18,13 @@ any parent directory it has to create at 0700) whatever the process umask, and
 tightens an existing group- or world-readable ledger to owner-only when it opens
 it; SQLite gives its journal, WAL and SHM files the same mode. The generated
 meeting units run with `UMask=0077` (launchd `Umask` 0o077).
+On Windows none of this applies: file mode bits only toggle read-only and Task
+Scheduler has no umask, so the ledger, its sidecars and the meeting directories
+inherit the ACL of the directory they are created in. Put the ledger and every
+meeting directory under a directory only the hub's account can read (for
+example inside that user's profile, with inheritance from broader groups
+removed), and check it with `icacls` before enabling meetings. TeamMem does not
+set or verify Windows ACLs.
 
 ## Central provider visibility
 
