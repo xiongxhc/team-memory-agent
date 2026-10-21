@@ -578,3 +578,49 @@ def test_get_or_make_keys_are_independent(tmp_path):
     get_or_make(conn, "daily-person", "a|2026-07-14", "h1", lambda: ("A", "m"), "t")
     get_or_make(conn, "weekly-team", "team|2026-07-13", "h1", lambda: ("W", "m"), "t")
     assert conn.execute("SELECT COUNT(*) FROM summaries").fetchone()[0] == 2
+
+
+# The ledger holds meeting transcripts, names and summaries, so it is private
+# whatever umask the scheduler or shell happens to run under.
+
+@pytest.fixture
+def open_umask():
+    import os
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX modes")
+def test_open_db_creates_a_private_ledger_and_parent_under_an_open_umask(tmp_path, open_umask):
+    import os
+    import stat as stat_module
+    path = tmp_path / "state" / "nested" / "ledger.db"
+    conn = open_db(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS probe (x)")
+    conn.execute("INSERT INTO probe VALUES (1)")
+    conn.commit()
+
+    def mode(p):
+        return stat_module.S_IMODE(os.stat(p).st_mode)
+
+    assert mode(path) == 0o600
+    for sidecar in ("-wal", "-shm"):
+        assert mode(f"{path}{sidecar}") == 0o600
+    assert mode(path.parent) == 0o700
+    assert mode(path.parent.parent) == 0o700
+    conn.close()
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX modes")
+def test_open_db_tightens_an_existing_exposed_ledger(tmp_path, open_umask):
+    import os
+    import stat as stat_module
+    path = tmp_path / "ledger.db"
+    open_db(path).close()
+    os.chmod(path, 0o644)
+    open_db(path).close()
+    assert stat_module.S_IMODE(os.stat(path).st_mode) == 0o600

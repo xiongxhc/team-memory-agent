@@ -231,17 +231,21 @@ def _launchd_jobs(
             **schedule,
         }
 
+    def private(data: dict) -> dict:
+        # Meeting jobs write transcripts, receipts and alerts: owner-only.
+        return {**data, "Umask": 0o077}
+
     jobs = [(LABEL, payload(
         LABEL, "run-daily", "schedule",
         {"StartCalendarInterval": {"Hour": hour, "Minute": minute}}))]
     if cfg.meetings_enabled:
-        jobs.append((MEETINGS_LABEL, payload(
+        jobs.append((MEETINGS_LABEL, private(payload(
             MEETINGS_LABEL, "process-meetings", "schedule-meetings",
-            {"StartInterval": MEETING_INTERVAL_MINUTES * 60})))
-        jobs.append((RETENTION_LABEL, payload(
+            {"StartInterval": MEETING_INTERVAL_MINUTES * 60}))))
+        jobs.append((RETENTION_LABEL, private(payload(
             RETENTION_LABEL, "expire-meeting-audio", "schedule-meeting-retention",
             {"ProgramArguments": arguments("expire-meeting-audio") + ["--watch"],
-             "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 5})))
+             "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 5}))))
     return [(label, plistlib.dumps(data, sort_keys=True)) for label, data in jobs]
 
 
@@ -392,6 +396,7 @@ Description={description}
 
 [Service]
 {settings}
+UMask=0077
 ExecStart={_systemd_exec(arguments)}
 """.encode()
 

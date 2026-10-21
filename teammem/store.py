@@ -2,6 +2,7 @@
 UNIQUE(person, source, hash) key makes every ingest path idempotent."""
 
 import json
+import os
 import shutil
 import sqlite3
 from contextlib import contextmanager
@@ -72,7 +73,37 @@ class SummaryRecord:
     effective_flags_json: str | None = None
 
 
+def _private_ledger(path: Path) -> None:
+    """Create the ledger 0600 (missing parents 0700) whatever the umask.
+
+    The ledger holds meeting transcripts, names and summaries. SQLite gives its
+    journal, WAL and SHM files the database file's own mode, so fixing the mode
+    of the main file before SQLite opens it covers the sidecars as well. An
+    existing ledger is tightened to owner-only on every open.
+    """
+    if str(path) == ":memory:" or str(path).startswith("file:"):
+        return
+    path = Path(path)
+    missing = []
+    parent = path.parent
+    while not parent.exists() and parent != parent.parent:
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+    os.close(os.open(path, os.O_CREAT | os.O_RDONLY | getattr(os, "O_CLOEXEC", 0), 0o600))
+    for name in (path, *(Path(f"{path}{suffix}") for suffix in ("-journal", "-wal", "-shm"))):
+        try:
+            mode = os.stat(name).st_mode & 0o777
+        except FileNotFoundError:
+            continue
+        if mode & 0o077:
+            os.chmod(name, mode & ~0o077)
+
+
 def open_db(path: Path) -> sqlite3.Connection:
+    _private_ledger(path)
     conn = sqlite3.connect(path)
     try:
         _initialize_db(conn)

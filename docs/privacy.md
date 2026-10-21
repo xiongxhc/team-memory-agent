@@ -13,7 +13,11 @@ a screen lock is supported, while logout prevents future runs. Provider payloads
 and the SQLite ledger remain on that machine.
 Rendered views expose normalized summaries and references; operators are
 responsible for access control to the ledger, inbox, archive, quarantine,
-snapshots, and rendered views.
+snapshots, and rendered views. TeamMem creates the ledger file at mode 0600 (and
+any parent directory it has to create at 0700) whatever the process umask, and
+tightens an existing group- or world-readable ledger to owner-only when it opens
+it; SQLite gives its journal, WAL and SHM files the same mode. The generated
+meeting units run with `UMask=0077` (launchd `Umask` 0o077).
 
 ## Central provider visibility
 

@@ -1879,3 +1879,28 @@ def test_remove_schedule_removes_the_launchd_meeting_jobs_too(tmp_path):
     assert remove_schedule(platform="darwin", agents_dir=directory,
                            runner=RecordingRunner()) is True
     assert list(directory.iterdir()) == []
+
+
+def test_meeting_units_run_under_a_private_umask(tmp_path):
+    """Meeting jobs write transcripts, receipts and alerts; whatever the user
+    manager's umask, their files are owner-only."""
+    import plistlib
+
+    enabled = tmp_path / "enabled" / "user"
+    install_schedule(
+        _meeting_cfg(tmp_path), platform="linux", systemd_dir=enabled,
+        executable="/opt/pipx/bin/teammem", runner=RecordingRunner(),
+    )
+    for name in ("teammem-meetings.service", "teammem-meeting-retention.service"):
+        assert "\nUMask=0077\n" in (enabled / name).read_text()
+    assert "UMask" not in (enabled / "teammem-daily.service").read_text()
+
+    agents = tmp_path / "meeting-agents"
+    install_schedule(
+        _meeting_cfg(tmp_path), platform="darwin", agents_dir=agents,
+        executable="/opt/pipx/bin/teammem",
+        runner=RecordingRunner(handler=lambda command: 1
+                               if command[:2] == ["launchctl", "print"] else 0),
+    )
+    for name in MEETING_PLISTS:
+        assert plistlib.loads((agents / name).read_bytes())["Umask"] == 0o077
