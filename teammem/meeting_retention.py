@@ -243,13 +243,20 @@ def _expire_quarantine(quarantine: Path, now: datetime, *, dry_run: bool,
                 continue
             if now < _quarantine_expiry(bundle, info):
                 continue
+            if info.st_nlink != 1:
+                # Zeroing would destroy whatever else shares the inode.
+                failed.append(RetentionFailure(
+                    "", 0, "quarantine",
+                    f"quarantined audio {label} has another hard link; not destroyed"))
+                continue
             deleted.append(label)
             if dry_run:
                 continue
             descriptor = os.open(audio, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
                                  | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
             try:
-                if not _same_inode(os.fstat(descriptor), info):
+                held = os.fstat(descriptor)
+                if not _same_inode(held, info) or held.st_nlink != 1:
                     raise OSError("quarantined audio changed during expiry")
                 os.ftruncate(descriptor, 0)
                 os.fsync(descriptor)

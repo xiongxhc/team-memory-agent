@@ -529,7 +529,8 @@ The promise covers every copy TeamMem holds, including a rejected bundle moved
 into `TEAMMEM_MEETING_QUARANTINE` with its ciphertext. Each retention pass zeroes
 and removes a quarantined `audio.enc` once fourteen days have passed since the
 earlier of the bundle's declared `ended_at` (when readable) and the file's own
-modification time; nothing in a rejected bundle can extend that. The reason file
+modification time; nothing in a rejected bundle can extend that. A copy with
+another hard link is reported, never zeroed. The reason file
 and metadata stay. The watcher reaches these copies on its next pass (at most its
 sixty-second recovery interval), since they have no ledger row to wake it.
 

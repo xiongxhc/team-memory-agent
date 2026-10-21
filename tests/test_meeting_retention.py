@@ -1287,3 +1287,19 @@ def test_a_symlink_in_the_quarantine_is_never_followed(tmp_path):
 def _instant_seconds(value: str) -> float:
     from datetime import datetime
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def test_a_hard_linked_quarantined_file_is_reported_not_zeroed(tmp_path):
+    conn = _db(tmp_path)
+    _quarantine_conflict(conn, tmp_path)
+    quarantined = _quarantined_audio(tmp_path)[0]
+    outside = tmp_path / "linked-elsewhere.enc"
+    os.link(quarantined, outside)
+    size = outside.stat().st_size
+
+    result = _expire(conn, tmp_path, EXPIRY, quarantine=_quarantine(tmp_path))
+
+    assert outside.stat().st_size == size
+    assert result.quarantine_deleted == ()
+    assert [failure.stage for failure in result.failed] == ["quarantine"]
+    assert "hard link" in result.failed[0].detail
