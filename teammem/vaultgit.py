@@ -53,10 +53,23 @@ def verify_tree_manifest(path: Path, tree: str, manifest: dict[str, bytes]) -> N
     if actual.keys() != manifest.keys():
         names = sorted(actual.keys() ^ manifest.keys())
         raise VerifiedTreeMismatch("Git tree differs from verified paths: " + ", ".join(names))
-    for name, expected in manifest.items():
-        blob = subprocess.run(["git", "-C", str(path), "cat-file", "blob", actual[name]],
-                              capture_output=True, check=True).stdout
-        if blob != expected:
+    names = list(manifest)
+    if not names:
+        return
+    # One `cat-file --batch` process reads every blob, so the byte-for-byte
+    # comparison costs one fork rather than one per vault file.
+    output = subprocess.run(
+        ["git", "-C", str(path), "cat-file", "--batch"],
+        input="".join(f"{actual[name]}\n" for name in names).encode("ascii"),
+        capture_output=True, check=True).stdout
+    offset = 0
+    for name in names:
+        end = output.index(b"\n", offset)
+        oid, kind, size = output[offset:end].split(b" ")
+        start = end + 1
+        blob = output[start:start + int(size)]
+        offset = start + int(size) + 1
+        if kind != b"blob" or oid.decode("ascii") != actual[name] or blob != manifest[name]:
             raise VerifiedTreeMismatch(f"Git tree differs from verified bytes: {name}")
 
 

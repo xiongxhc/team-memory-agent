@@ -1158,10 +1158,15 @@ def import_meeting_inbox(
             record(row["occurrence_id"], "unchanged", "ok" if resolved else "archive_failed",
                    row["relative_path"])
     physical_inbox = inbox.resolve()
+    # A candidate is skipped when it is a governed source or one of its
+    # ancestors. One set of both keeps a rescan linear in the inbox size
+    # instead of comparing every candidate with every source ever governed.
+    shielded = set(governed)
+    for source in governed:
+        shielded.update(source.parents)
     for candidate in _candidates(inbox) if inbox.is_dir() else ():
         physical_candidate = physical_inbox / candidate.path.relative_to(inbox)
-        if any(physical_candidate == source or physical_candidate in source.parents
-               for source in governed):
+        if physical_candidate in shielded:
             continue
         if candidate.symlink:
             if not dry_run:
