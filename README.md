@@ -475,10 +475,9 @@ revision, so
 invariant names only. Later runs skip that revision and print `held` on stderr
 without failing; a higher revision publishes normally. A note that only matches
 another meeting's transcript is withheld and retried every run with
-`cross_meeting_transcript_text`, never held for good. While a revision is held,
-`TEAMMEM_MEETING_ALERTS` carries `<occurrence-segment>.publication-refused.json`
-(`teammem-meeting-publication-refused-alert/v1`: occurrence, revision, reason code,
-action), restored on every run and removed once a newer revision publishes. See
+`cross_meeting_transcript_text`, never held for good. The refusal record is the
+producer's signal: Meeting Agent reads it and raises the operator alert, so TeamMem
+writes none of its own. See
 `docs/schemas/teammem-meeting-v1.md`.
 
 #### Audio retention

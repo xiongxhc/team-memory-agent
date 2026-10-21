@@ -1605,34 +1605,16 @@ def test_text_matching_another_meetings_transcript_is_withheld_but_never_held_fo
         assert "cross_meeting_transcript_text" in capsys.readouterr().err
 
 
-def test_a_recorded_refusal_raises_an_operator_alert_until_a_revision_publishes(bench):
-    """Meeting Agent does not read refusal records yet, so the operator alert
-    spool carries the refusal: written with the record, kept while the
-    revision is held, removed once a newer revision publishes."""
-    from teammem.services import meeting_refusal_alert_path
-
+def test_a_recorded_refusal_writes_no_teammem_operator_alert(bench):
+    """Meeting Agent reads the refusal record and raises the one operator alert
+    for it, so TeamMem's alert spool stays out of it: one alert per refusal."""
     payload = _quoting_payload()
     bench.drop(payload)
-    occurrence_id = payload["occurrence_id"]
     assert bench.run() == 1
-
-    alert_file = meeting_refusal_alert_path(bench.cfg, occurrence_id)
-    alert = json.loads(alert_file.read_text())
-    assert alert == {
-        "schema": "teammem-meeting-publication-refused-alert/v1",
-        "status": "publication_refused",
-        "occurrence_id": occurrence_id,
-        "revision": payload["revision"],
-        "reason_code": "transcript_text_in_note",
-        "action": "submit a higher revision that does not quote the transcript",
-    }
-    alert_file.unlink()
-    assert bench.run() == 0                       # held: the alert is restored
-    assert alert_file.exists()
-
-    bench.drop({**_payload(), "revision": payload["revision"] + 1})
-    assert bench.run() == 0
-    assert not alert_file.exists()
+    assert bench.run() == 0                       # held
+    alerts = bench.cfg.meeting_alerts
+    assert not alerts.exists() or not [
+        p for p in alerts.iterdir() if "refused" in p.name]
 
 
 def test_an_unusable_meeting_lock_is_not_reported_as_another_run(bench, monkeypatch, capsys):
