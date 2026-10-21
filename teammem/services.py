@@ -11,7 +11,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from functools import partial
@@ -39,7 +39,7 @@ from .reclaim import reclaim, reclaim_channel_projects
 # `render._meeting_facts` across the same boundary for the same reason.
 from .render import MANAGED, render_vault_verified, verify_vault
 from .render import _managed_files as managed_vault_files
-from .run_lock import RunLockedError, acquire_publication_lock
+from .run_lock import RunLockedError, acquire_publication_lock, acquire_run_lock
 from .slices import active_person_days
 from .store import get_summary, insert_events, open_db, open_db_snapshot, reconcile_gitlab_events
 from .summarize import (
@@ -955,7 +955,34 @@ def execute_process_meetings(
     Each occurrence is independent: a refusal is recorded and the loop continues,
     so one malformed bundle or one unreachable remote cannot keep another
     meeting's note out of the vault.
+
+    A real run holds the meeting-run lock (beside the ledger, taken before the
+    publication lock) from import through receipts, so a timer run and a manual
+    run never stage the same bundle at once. A run that finds it held returns
+    a retryable `lock` refusal without touching the inbox.
     """
+    if dry_run:
+        return _execute_process_meetings(cfg, ids, now=now, conn=conn, dry_run=True,
+                                         weeks=weeks, channel_names=channel_names)
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(acquire_run_lock(meeting_run_lock_target(cfg), wait_seconds=0))
+        except (OSError, RunLockedError):
+            return MeetingRunResult(imported=MeetingImportResult(), refused=(MeetingFailure(
+                "", "lock", "another meeting run is active; retry required"),))
+        return _execute_process_meetings(cfg, ids, now=now, conn=conn, dry_run=False,
+                                         weeks=weeks, channel_names=channel_names)
+
+
+def meeting_run_lock_target(cfg: Config) -> Path:
+    """`<ledger>.meetings`, so the lock file is `<ledger>.meetings.lock`."""
+    return Path(f"{cfg.db_path}.meetings")
+
+
+def _execute_process_meetings(
+    cfg: Config, ids: IdentityMaps, *, now: str, conn: sqlite3.Connection,
+    dry_run: bool, weeks: int, channel_names: dict | None,
+) -> MeetingRunResult:
     today = _utc_day(now)
     imported = import_meeting_inbox(
         conn, cfg.meeting_inbox, cfg.meeting_archive, cfg.meeting_quarantine,

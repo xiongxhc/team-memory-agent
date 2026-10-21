@@ -1425,3 +1425,39 @@ def test_expire_meeting_audio_reaches_the_quarantined_copy(bench, capsys):
     run_expire_meeting_audio(bench.cfg, now="2026-09-30T00:00:00Z")
     assert ciphertext() == []
     assert "deleted quarantined copy" in capsys.readouterr().out
+
+
+def test_overlapping_meeting_runs_are_serialized_and_the_second_exits_cleanly(
+    bench, monkeypatch, capsys
+):
+    """A timer run and a manual run must not import the same bundle at once.
+    The second run leaves the inbox alone and reports a retryable lock refusal
+    instead of racing the first one's staging and raising."""
+    payload = _payload()
+    bench.drop(payload)
+    entered, release = threading.Event(), threading.Event()
+    real_import = services_module.import_meeting_inbox
+
+    def slow_import(*args, **kwargs):
+        entered.set()
+        assert release.wait(30)
+        return real_import(*args, **kwargs)
+
+    monkeypatch.setattr(services_module, "import_meeting_inbox", slow_import)
+    codes = []
+    first = threading.Thread(target=lambda: codes.append(bench.run()))
+    first.start()
+    try:
+        assert entered.wait(30)
+        monkeypatch.setattr(services_module, "import_meeting_inbox", real_import)
+        assert bench.run() == 1
+        assert "another meeting run is active" in capsys.readouterr().err
+        assert not bench.receipt(payload["occurrence_id"]).exists()
+        assert (bench.cfg.meeting_inbox / occurrence_path_segment(payload["occurrence_id"])
+                / str(payload["revision"]) / "audio.enc").stat().st_size > 0
+    finally:
+        release.set()
+        first.join(60)
+    assert codes == [0]
+    assert bench.receipt(payload["occurrence_id"]).exists()
+    assert bench.run() == 0

@@ -421,6 +421,11 @@ at any step. A receipt therefore means the note is published: rendered locally
 and committed locally are not receipts, and a failed publication writes no receipt
 for that occurrence.
 
+One real run at a time processes meetings: it holds a lock beside the ledger
+(`ledger.db.meetings.lock` for `ledger.db`) from import through receipts. A run
+that finds the lock held, such as a manual run during a timer run, touches
+nothing and exits `1` with a `lock` refusal; the next run picks the work up.
+
 Occurrences are processed independently. A malformed bundle is quarantined with
 its reason and the next one still publishes; a refused publication leaves that
 occurrence without a receipt and retryable on the next run, without holding up
