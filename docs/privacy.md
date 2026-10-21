@@ -114,7 +114,8 @@ timestamps, references, and raw response are not persisted as events. The only
 durable projection produced by that count-only collection is the aggregate
 `weekly_commit_counts` table, whose exact fields are `project`, `week_start`,
 `person`, and `commit_count`; rendered pages show only those contributor/count
-values. GitHub's count-only window is
+values from GitHub, plus links to published meeting notes that name the
+project. No commit detail appears on a count-only page. GitHub's count-only window is
 controlled by the GitHub connector option `count_weeks` (default `4`, valid range
 `1..52`).
 
