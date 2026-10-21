@@ -64,12 +64,17 @@ def verify_tree_manifest(path: Path, tree: str, manifest: dict[str, bytes]) -> N
         capture_output=True, check=True).stdout
     offset = 0
     for name in names:
-        end = output.index(b"\n", offset)
-        oid, kind, size = output[offset:end].split(b" ")
+        end = output.find(b"\n", offset)
+        header = output[offset:end].split(b" ") if end >= 0 else []
+        if len(header) != 3 or header[1] != b"blob" or not header[2].isdigit():
+            # `<oid> missing`, or output cut short: the object store cannot
+            # prove this file, so the tree is unverifiable, not a crash.
+            raise VerifiedTreeMismatch(f"git_object_missing: Git cannot read {name}")
+        oid, _kind, size = header
         start = end + 1
         blob = output[start:start + int(size)]
         offset = start + int(size) + 1
-        if kind != b"blob" or oid.decode("ascii") != actual[name] or blob != manifest[name]:
+        if oid.decode("ascii") != actual[name] or blob != manifest[name]:
             raise VerifiedTreeMismatch(f"Git tree differs from verified bytes: {name}")
 
 
