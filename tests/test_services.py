@@ -1404,3 +1404,24 @@ def test_a_finding_no_meeting_owns_stops_the_commit_and_the_push(bench, capsys):
     assert code == 1
     assert "nothing committed or pushed" in captured.err
     assert _remote_ref(bench.bare, bench.branch) == before
+
+
+def test_expire_meeting_audio_reaches_the_quarantined_copy(bench, capsys):
+    """Deletion covers every copy: a conflicting redelivery carries ciphertext
+    into the quarantine, and the retention command destroys it on time."""
+    from teammem.services import run_expire_meeting_audio
+
+    payload = _payload()
+    bench.drop(payload)
+    assert bench.run() == 0
+    bench.drop({**payload, "title": payload["title"] + " (resent)"})
+    assert bench.run() == 1                        # revision_conflict quarantined
+
+    def ciphertext():
+        return [path for path in bench.tmp_path.rglob("*audio.enc*")
+                if path.is_file() and path.stat().st_size > 0]
+
+    assert any(bench.cfg.meeting_quarantine in path.parents for path in ciphertext())
+    run_expire_meeting_audio(bench.cfg, now="2026-09-30T00:00:00Z")
+    assert ciphertext() == []
+    assert "deleted quarantined copy" in capsys.readouterr().out

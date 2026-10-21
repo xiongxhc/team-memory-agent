@@ -1090,6 +1090,7 @@ def execute_expire_meeting_audio(
         alert_path=partial(meeting_alert_path, cfg) if alerts_enabled else None,
         warn_days=cfg.meeting_warn_days,
         dry_run=dry_run,
+        quarantine=cfg.meeting_quarantine,
     )
 
 
@@ -1181,6 +1182,8 @@ def _run_expire_meeting_audio(
         print(f"{prefix}{deleted} {occurrence_id} revision {revision}")
     for occurrence_id, revision in result.swept:
         print(f"{prefix}{swept} {occurrence_id} revision {revision}")
+    for label in result.quarantine_deleted:
+        print(f"{prefix}{deleted} quarantined copy {label}")
     for occurrence_id, revision in result.mismatched:
         print(
             f"MISMATCH {occurrence_id} revision {revision}: the deleted audio was "

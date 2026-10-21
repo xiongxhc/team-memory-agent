@@ -51,6 +51,7 @@ from .meeting_importer import (
     sync_source_cleanup_alerts,
 )
 from .meeting_store import (
+    MEETING_AUDIO_RETENTION_DAYS,
     MEETING_AUDIO_WARN_DAYS,
     audio_due_for_expiry,
     get_meeting,
@@ -87,6 +88,7 @@ class RetentionResult:
     failed: tuple[RetentionFailure, ...] = ()
     dry_run: bool = False
     source_cleanup_pending: tuple[tuple[str, int], ...] = ()
+    quarantine_deleted: tuple[str, ...] = ()       # quarantined bundle directories
 
     @property
     def exit_code(self) -> int:
@@ -115,8 +117,12 @@ def expire_meeting_audio(
     alert_path: Callable[[str], Path] | None,
     warn_days: int = MEETING_AUDIO_WARN_DAYS,
     dry_run: bool = False,
+    quarantine: Path | None = None,
 ) -> RetentionResult:
     """Delete every expired recording, sweep revived ones, then warn.
+
+    `quarantine`, when given, is swept as well: a rejected bundle carries its
+    ciphertext there, and the fourteen-day promise covers every copy.
 
     `alert_path` maps an occurrence id to its one alert file; the caller owns
     that spelling (`services.meeting_alert_path`) so it cannot diverge from the
@@ -159,6 +165,8 @@ def expire_meeting_audio(
                 row["occurrence_id"], row["revision"], "path", str(error)))
     swept = [] if store is None else _sweep_revived(
         conn, store, dry_run=dry_run, failed=failed)
+    quarantine_deleted = [] if quarantine is None else _expire_quarantine(
+        Path(quarantine), _instant(now, "now"), dry_run=dry_run, failed=failed)
     # A redelivery after an earlier expiry must not bypass source governance
     # just because deleted_at is already set. Preserve that historical audit
     # timestamp while independently destroying its new captured source copy.
@@ -190,7 +198,70 @@ def expire_meeting_audio(
         source_cleanup_pending=tuple(sorted({
             (row["occurrence_id"], row["revision"]) for row in pending_source_cleanup(conn)
         })),
+        quarantine_deleted=tuple(quarantine_deleted),
     )
+
+
+def _quarantine_expiry(bundle: Path, audio_info: os.stat_result) -> datetime:
+    """The earliest defensible deadline for one quarantined copy.
+
+    A quarantined bundle was rejected, so nothing in it is trusted to extend
+    retention: its declared `ended_at` (when readable) and the ciphertext's own
+    mtime each bound the deadline, and the earlier one wins.
+    """
+    deadline = datetime.fromtimestamp(audio_info.st_mtime, timezone.utc)
+    try:
+        with open(bundle / "meeting.json", "rb") as handle:
+            ended_at = json.loads(handle.read(4 * 1024 * 1024))["ended_at"]
+        deadline = min(deadline, _instant(ended_at, "ended_at"))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return deadline + timedelta(days=MEETING_AUDIO_RETENTION_DAYS)
+
+
+def _expire_quarantine(quarantine: Path, now: datetime, *, dry_run: bool,
+                       failed: list[RetentionFailure]) -> list[str]:
+    """Destroy expired ciphertext under the quarantine, never following a link.
+
+    Only `audio.enc` regular files are touched. Each is zeroed through a
+    no-follow descriptor, then its name is removed; the reason file and the
+    bundle's metadata stay for the operator.
+    """
+    deleted: list[str] = []
+    if not quarantine.is_dir() or quarantine.is_symlink():
+        return deleted
+    for directory, subdirectories, files in os.walk(quarantine, followlinks=False):
+        subdirectories.sort()
+        if AUDIO_FILENAME not in files:
+            continue
+        bundle = Path(directory)
+        audio = bundle / AUDIO_FILENAME
+        label = bundle.relative_to(quarantine).as_posix()
+        try:
+            info = audio.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
+                continue
+            if now < _quarantine_expiry(bundle, info):
+                continue
+            deleted.append(label)
+            if dry_run:
+                continue
+            descriptor = os.open(audio, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                                 | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
+            try:
+                if not _same_inode(os.fstat(descriptor), info):
+                    raise OSError("quarantined audio changed during expiry")
+                os.ftruncate(descriptor, 0)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            audio.unlink()
+        except OSError as error:
+            if deleted and deleted[-1] == label:
+                deleted.pop()
+            failed.append(RetentionFailure("", 0, "quarantine",
+                                           f"quarantined audio {label}: {error.strerror or error}"))
+    return deleted
 
 
 def _expire_one(

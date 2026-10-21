@@ -1179,3 +1179,111 @@ def test_an_unlistable_occurrence_directory_costs_only_the_janitor(
         (later["occurrence_id"], 0, "sweep")     # 0: above any single revision
     ]
     assert result.exit_code == 1
+
+
+# --- quarantined copies -----------------------------------------------------
+# A rejected bundle is moved whole into the quarantine, ciphertext included.
+# The fourteen-day promise covers every copy, so expiry must reach those too.
+
+
+def _quarantine(tmp_path: Path) -> Path:
+    return tmp_path / "meeting-quarantine"
+
+
+def _quarantined_audio(tmp_path: Path) -> list[Path]:
+    return [path for path in _files(_quarantine(tmp_path))
+            if path.name == "audio.enc" and path.stat().st_size > 0]
+
+
+def _quarantine_conflict(conn, tmp_path: Path) -> dict:
+    """Publish revision 1, then redeliver revision 1 with a changed title."""
+    payload = _payload()
+    _import(conn, tmp_path, payload)
+    conflicting = {**payload, "title": payload["title"] + " (resent)"}
+    write_meeting_bundle(tmp_path / "meeting-inbox", conflicting)
+    result = import_meeting_inbox(
+        conn, tmp_path / "meeting-inbox", tmp_path / "meeting-archive",
+        _quarantine(tmp_path), _store(tmp_path), vault_dir=tmp_path / "vault",
+        now=IMPORTED_AT)
+    assert [code for *_, code in result.details if code != "ok"] == ["revision_conflict"]
+    assert len(_quarantined_audio(tmp_path)) == 1
+    return payload
+
+
+def test_quarantined_ciphertext_is_retained_before_expiry(tmp_path):
+    conn = _db(tmp_path)
+    _quarantine_conflict(conn, tmp_path)
+
+    result = _expire(conn, tmp_path, JUST_BEFORE, quarantine=_quarantine(tmp_path))
+
+    assert len(_quarantined_audio(tmp_path)) == 1
+    assert result.quarantine_deleted == ()
+
+
+def test_quarantined_ciphertext_is_deleted_at_expiry_with_every_other_copy(tmp_path):
+    conn = _db(tmp_path)
+    _quarantine_conflict(conn, tmp_path)
+
+    result = _expire(conn, tmp_path, EXPIRY, quarantine=_quarantine(tmp_path))
+
+    assert len(result.quarantine_deleted) == 1
+    assert result.failed == ()
+    leftovers = [path for path in _files(tmp_path)
+                 if path.name.endswith("audio.enc") and path.stat().st_size > 0]
+    assert leftovers == []
+    # The reason file and the metadata stay: only the ciphertext is the promise.
+    assert any(path.name.endswith(".reason.json") for path in _files(_quarantine(tmp_path)))
+    assert _expire(conn, tmp_path, LATER,
+                   quarantine=_quarantine(tmp_path)).quarantine_deleted == ()
+
+
+def test_quarantine_dry_run_reports_and_keeps_the_ciphertext(tmp_path):
+    conn = _db(tmp_path)
+    _quarantine_conflict(conn, tmp_path)
+
+    result = _expire(conn, tmp_path, EXPIRY, quarantine=_quarantine(tmp_path),
+                     dry_run=True)
+
+    assert len(result.quarantine_deleted) == 1
+    assert len(_quarantined_audio(tmp_path)) == 1
+
+
+def test_unparseable_quarantined_bundle_expires_from_its_audio_mtime(tmp_path):
+    conn = _db(tmp_path)
+    inbox = tmp_path / "meeting-inbox"
+    for name in ("meeting-inbox", "meeting-archive", "meeting-quarantine", "meeting-audio"):
+        (tmp_path / name).mkdir(mode=0o700, exist_ok=True)
+    bundle = write_meeting_bundle(inbox, _payload())
+    (bundle / "meeting.json").write_text("{not json", encoding="utf-8")
+    written = _instant_seconds("2026-09-10T00:00:00Z")
+    os.utime(bundle / "audio.enc", (written, written))
+    result = import_meeting_inbox(
+        conn, inbox, tmp_path / "meeting-archive", _quarantine(tmp_path), _store(tmp_path),
+        vault_dir=tmp_path / "vault", now=IMPORTED_AT)
+    assert result.quarantined == 1
+
+    assert _expire(conn, tmp_path, "2026-09-23T23:59:59Z",
+                   quarantine=_quarantine(tmp_path)).quarantine_deleted == ()
+    assert len(_quarantined_audio(tmp_path)) == 1
+    _expire(conn, tmp_path, "2026-09-24T00:00:00Z", quarantine=_quarantine(tmp_path))
+    assert _quarantined_audio(tmp_path) == []
+
+
+def test_a_symlink_in_the_quarantine_is_never_followed(tmp_path):
+    conn = _db(tmp_path)
+    outside = tmp_path / "outside.enc"
+    outside.write_bytes(b"x" * 64)
+    old = _instant_seconds("2026-01-01T00:00:00Z")
+    os.utime(outside, (old, old))
+    planted = _quarantine(tmp_path) / "seg" / "1"
+    planted.mkdir(parents=True)
+    (planted / "audio.enc").symlink_to(outside)
+
+    _expire(conn, tmp_path, LATER, quarantine=_quarantine(tmp_path))
+
+    assert outside.read_bytes() == b"x" * 64
+
+
+def _instant_seconds(value: str) -> float:
+    from datetime import datetime
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
