@@ -337,6 +337,10 @@ first bytes coincidentally match a magic number is rejected as a false
 positive. Recovery from that false positive is resubmission — the same content
 under a new revision has different bytes.
 
+The false positive needs random leading bytes. An encrypted container that opens
+with a fixed ASCII magic of its own, as the `aes-256-gcm` recording container
+does (`CRSREC02`/`CRSREC03`, then an identifier byte), never matches the screen.
+
 ## Idempotency and revisions
 
 Identity is `(occurrence_id, revision)`; content identity is `artifact_hash`.

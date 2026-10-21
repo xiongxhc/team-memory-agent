@@ -975,3 +975,20 @@ def test_multi_line_text_keeps_line_breaks_but_rejects_other_controls(tmp_path):
     _load(tmp_path / "ok", payload)
     payload["summary"] = "Summary\x1b[31m"
     assert "control" in _reject(tmp_path / "bad", payload)
+
+
+@pytest.mark.parametrize("magic", [b"CRSREC02", b"CRSREC03"])
+@pytest.mark.parametrize("tail", [b"\xff\xe0", b"\xff\xff", b"RIFF", b"ftyp"])
+def test_the_aes_256_gcm_recording_container_always_passes_the_plaintext_screen(
+    tmp_path, magic, tail
+):
+    """The production `aes-256-gcm` container opens with a fixed 8-byte ASCII
+    magic, then an identifier byte, zeros and random nonce/binding bytes. Its
+    first bytes therefore never match a screened container magic, whatever the
+    random fields hold, so a valid recording is never false-rejected."""
+    payload = _fixture(MINIMAL)
+    payload["audio"]["encryption"] = "aes-256-gcm"
+    header = magic + b"\x01\x00\x00\x00" + tail * 9
+    data = (header + _audio_bytes(256))[:256]
+    _set_audio(payload, data)
+    assert _load(tmp_path, payload, audio=data).payload["audio"]["encryption"] == "aes-256-gcm"
