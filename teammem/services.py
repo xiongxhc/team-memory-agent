@@ -827,6 +827,33 @@ def meeting_refusal_path(cfg: Config, occurrence_id: str, revision: int) -> Path
     return revision_refusal_path(meeting_receipt_path(cfg, occurrence_id), revision)
 
 
+def meeting_refusal_alert_path(cfg: Config, occurrence_id: str) -> Path:
+    """The operator alert for a revision refused for good, beside the others."""
+    base = meeting_alert_path(cfg, occurrence_id)
+    return base.with_name(base.stem + ".publication-refused.json")
+
+
+def _write_refusal_alert(cfg: Config, occurrence_id: str, revision: int, reason: str) -> None:
+    """Until Meeting Agent reads refusal records, the operator alert spool is
+    where a held revision becomes visible. Identity and reason code only."""
+    payload = {
+        "schema": "teammem-meeting-publication-refused-alert/v1",
+        "status": "publication_refused",
+        "occurrence_id": occurrence_id,
+        "revision": revision,
+        "reason_code": reason,
+        "action": "submit a higher revision that does not quote the transcript",
+    }
+    blob = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    path = meeting_refusal_alert_path(cfg, occurrence_id)
+    try:
+        if path.read_bytes() == blob:
+            return
+    except OSError:
+        pass
+    _write_receipt(path, blob)
+
+
 def _recorded_refusal(cfg: Config, meeting: dict) -> str | None:
     """The reason code when this exact revision was refused for good."""
     path = meeting_refusal_path(cfg, meeting["occurrence_id"], meeting["current_revision"])
@@ -1048,6 +1075,14 @@ def _execute_process_meetings(
                         _backfill_revision_receipt(cfg, meeting)
                 elif (reason := _recorded_refusal(cfg, meeting)) is not None:
                     held.append((meeting["occurrence_id"], meeting["current_revision"], reason))
+                    if not dry_run:
+                        try:
+                            _write_refusal_alert(cfg, meeting["occurrence_id"],
+                                                 meeting["current_revision"], reason)
+                        except OSError:
+                            refused.append(MeetingFailure(
+                                meeting["occurrence_id"], "refusal_alert",
+                                "the refusal alert could not be written; retry required"))
                 else:
                     unpublished.append(meeting["occurrence_id"])
             if dry_run:
@@ -1057,13 +1092,16 @@ def _execute_process_meetings(
                 head = _vault_head(cfg.vault_dir)
                 snapshot = _managed_snapshot(cfg.vault_dir)
                 try:
-                    receipts.append(publish_meeting(
+                    receipt = publish_meeting(
                         conn, ids, cfg.vault_dir, today,
                         occurrence_id=occurrence_id,
                         receipt_path=meeting_receipt_path(cfg, occurrence_id),
                         web_base=cfg.vault_web_base, weeks=weeks,
                         channel_names=channel_names,
-                    ))
+                    )
+                    receipts.append(receipt)
+                    # A published revision ends any earlier refusal alert.
+                    meeting_refusal_alert_path(cfg, occurrence_id).unlink(missing_ok=True)
                 except PublishRefused as refusal:
                     # The snapshot and this restore share the publication lock:
                     # refusal cannot roll back another publisher's valid render.
@@ -1087,6 +1125,7 @@ def _record_refusal(cfg: Config, occurrence_id: str, refusal: PublishRefused,
     try:
         _write_receipt(meeting_refusal_path(cfg, occurrence_id, refusal.revision),
                        refusal_bytes(occurrence_id, refusal))
+        _write_refusal_alert(cfg, occurrence_id, refusal.revision, refusal.terminal)
     except OSError:
         refused.append(MeetingFailure(
             occurrence_id, "refusal", "the refusal record could not be written; retry required"))
