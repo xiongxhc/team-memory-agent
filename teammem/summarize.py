@@ -345,6 +345,34 @@ def daily_cache_status(
     return "miss", None
 
 
+def validate_daily_journal(text: str) -> None:
+    """Reject model conversation/format failures without editing source quotations."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("invalid daily journal: empty output")
+    seen_bullet = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        bullet = stripped.startswith("- ")
+        if bullet:
+            seen_bullet = True
+        elif not (seen_bullet and line.startswith(("  ", "\t"))):
+            raise ValueError("invalid daily journal: expected bullet lines only")
+        # Match the model speaking to the operator, not a quoted request or a
+        # journal describing somebody asking for information.
+        # Wrapped source quotations can begin with these words on the next
+        # line. Classify bullet openings only; preserve their continuations.
+        body = stripped[2:].lstrip() if bullet else ""
+        if re.match(
+            r"(?:co-authored-by\s*:|(?:could|can|would) you (?:provide|share|clarify)\b"
+            r"|i (?:need|cannot|can't|have only|would need)\b)",
+            body,
+            re.IGNORECASE,
+        ):
+            raise ValueError("invalid daily journal: model commentary")
+
+
 def put_daily_journal(
     conn: sqlite3.Connection,
     prepared: PreparedDailyJournal,
@@ -352,6 +380,7 @@ def put_daily_journal(
     model: str,
     created_ts: str,
 ) -> None:
+    validate_daily_journal(text)
     put_summary(
         conn,
         SummaryRecord(
@@ -421,6 +450,35 @@ def _coverage_line(context: ReportContext) -> str:
     )
 
 
+def validate_weekly_report(text: str) -> None:
+    """Validate new narratives without imposing a template on legacy caches."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("invalid weekly report: empty output")
+    has_content = False
+    paragraph_start = True
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            paragraph_start = True
+            continue
+        bullet = stripped.startswith("- ")
+        body = stripped[2:].lstrip() if bullet else stripped
+        # Wrapped quotations belong to the preceding paragraph/bullet. Do not
+        # classify their continuation lines as the model speaking to us.
+        if (bullet or paragraph_start) and not line.startswith(("  ", "\t")):
+            if re.match(
+                r"(?:co-authored-by\s*:|(?:could|can|would) you (?:provide|share|clarify)\b"
+                r"|please (?:provide|share|clarify)\b"
+                r"|i (?:need|cannot|can't|have only|would need)\b)",
+                body, re.IGNORECASE,
+            ):
+                raise ValueError("invalid weekly report: model commentary")
+        has_content = has_content or bool(body)
+        paragraph_start = False
+    if not has_content:
+        raise ValueError("invalid weekly report: no narrative")
+
+
 def weekly_team_report(
     conn: sqlite3.Connection,
     *,
@@ -471,6 +529,7 @@ def weekly_team_report(
         f"{_weekly_input(ordered_dailies)}"
     )
     narrative = llm(REPORT_SYSTEM, user)
+    validate_weekly_report(narrative)
     record = SummaryRecord(
         kind="weekly-team",
         key=key,

@@ -341,6 +341,30 @@ calls). The runtime optimization preserves the complete ordered text of every
 person-day slice. It adds no ranking, event cap, truncation, cross-person
 batching, retry loop, compaction, or model change.
 
+For historical late arrivals and mapping corrections, opt in after reviewing and
+repairing existing journals. Set `TEAMMEM_RECONCILE_FROM=YYYY-MM-DD` to the first
+day of the journal era and `TEAMMEM_RECONCILE_BATCH_SIZE=25` (range `1`–`100`),
+then run `teammem reconcile-init` once. Initialization calls no models and refuses
+to overwrite state. It accepts the observed evidence behind existing valid
+journals and existing reports; it does not certify their prose or compare legacy
+prompt/model hash contracts. Missing or invalid journals remain pending.
+
+Full daily runs then compare actual source fingerprints after normal synthesis,
+repair changed historical journals and affected weekly reports, and atomically
+update the private `ledger.db.reconciliation.json` beside the canonical ledger.
+The batch budget counts journal and report attempts together. Current caches
+already refreshed by normal synthesis avoid duplicate model calls. Capture-only
+runs never read or advance this baseline. Existing later reports are checked too,
+including changes to their four-week activity-gap evidence.
+
+Keep the baseline with ledger backups. A missing, invalid, or differently scoped
+baseline fails the reconciliation stage; it is never silently recreated. Failed
+or overflow work remains pending for the next full run, and any pending work
+makes that run return nonzero while other stages continue. Source disappearance
+preserves the cached journal and a private receipt, requiring operator review of
+the orphan before reconciliation can clear. Do not delete or reinitialize the
+baseline to dismiss pending work; review and repair the underlying evidence first.
+
 Only after the observed run succeeds, explicitly install the daily job. The
 default and example below are 18:20 in the operator machine's local timezone:
 

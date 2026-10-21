@@ -35,6 +35,7 @@ _ALLOWED_STAGES = frozenset(
         "lock",
         "push",
         "reclaim",
+        "reconciliation",
         "render",
         "report",
         "run",

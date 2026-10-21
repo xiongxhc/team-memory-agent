@@ -7,6 +7,7 @@ sanctioned fix: UPDATE in place, then the collector's next run inserts 0.
 """
 
 import json
+import re
 import sqlite3
 from collections.abc import Iterable
 from urllib.parse import unquote, urlsplit
@@ -81,10 +82,16 @@ def _repository_path(
     url: str,
     gitlab_origins: frozenset[Origin],
 ) -> str | None:
-    origin = normalize_http_origin(url)
+    # GitLab comment references carry a note anchor; it does not change the
+    # repository or origin. Keep configuration validation strict and retain the
+    # original reference in the ledger. Other fragments remain unsupported.
+    repository_url, separator, fragment = url.partition("#")
+    if separator and (source != "gitlab" or re.fullmatch(r"note_[0-9]+", fragment) is None):
+        return None
+    origin = normalize_http_origin(repository_url)
     if origin is None:
         return None
-    parsed = urlsplit(url)
+    parsed = urlsplit(repository_url)
 
     path = unquote(parsed.path).strip("/")
     if source == "github":

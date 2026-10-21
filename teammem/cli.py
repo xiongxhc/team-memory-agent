@@ -20,6 +20,7 @@ from .reclaim import (
     reclaim_repository_projects,
 )
 from .services import (
+    redact_secrets,
     collect_connector,
     resolve_llm_backend,
     run_collect,
@@ -76,6 +77,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     sub.add_parser("stats", help="ledger row counts")
+    sub.add_parser("reconcile-init", help="initialize reviewed historical synthesis baseline")
 
     p_reclaim = sub.add_parser(
         "reclaim", help="re-attribute _unmapped rows via roster"
@@ -310,6 +312,24 @@ def main(argv: list[str] | None = None) -> int:
         if values["unmapped"]:
             print(f"unmapped: {values['unmapped']}")
         return 0
+
+    if args.cmd == "reconcile-init":
+        from .reconciliation import initialize_baseline
+        from .run_lock import acquire_run_lock, RunLockedError
+
+        try:
+            ids = IdentityMaps.load(cfg.config_dir)
+            with acquire_run_lock(cfg.db_path, wait_seconds=0):
+                conn = open_db(cfg.db_path)
+                try:
+                    path = initialize_baseline(cfg, ids, conn=conn, today=date.today())
+                finally:
+                    conn.close()
+            print(f"initialized reconciliation baseline: {path}")
+            return 0
+        except (OSError, ValueError, RunLockedError) as error:
+            print(redact_secrets(error, cfg), file=sys.stderr)
+            return 2
 
     if args.cmd == "reclaim":
         try:

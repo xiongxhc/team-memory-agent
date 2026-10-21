@@ -379,7 +379,7 @@ def test_journal_live_generates_then_hits_cache(tmp_path, monkeypatch, capsys):
     def fake_http_llm(model, api_key, max_tokens):
         def llm(system, user):
             calls.append(model)
-            return "Alex fixed the JWT race."
+            return "- Alex fixed the JWT race."
         return llm
 
     import teammem.services as services_mod
@@ -1455,3 +1455,20 @@ def test_main_render_verify_flag(tmp_path, monkeypatch, capsys):
     assert "vault matches" in capsys.readouterr().out
     (tmp_path / "vault" / "README.md").write_text("tampered")
     assert main(["render", "--today", "2026-07-16", "--verify"]) == 1
+
+
+def test_reconcile_init_is_explicit_refuses_overwrite_and_never_calls_models(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('TEAMMEM_DB', str(tmp_path / 'ledger.db'))
+    monkeypatch.setenv('TEAMMEM_CONFIG_DIR', str(CONFIG_DIR))
+    monkeypatch.delenv('TEAMMEM_RECONCILE_FROM', raising=False)
+    monkeypatch.setattr(cli_module, 'resolve_llm_backend', lambda *a: pytest.fail('initialization must not call models'))
+    assert main(['reconcile-init']) == 2
+    path = tmp_path / 'ledger.db.reconciliation.json'
+    assert not path.exists()
+    monkeypatch.setenv('TEAMMEM_RECONCILE_FROM', '2026-07-01')
+    assert main(['reconcile-init']) == 0
+    original = path.read_bytes()
+    assert json.loads(original)['daily'] == {}
+    assert main(['reconcile-init']) == 2
+    assert path.read_bytes() == original
+    assert 'already exists' in capsys.readouterr().err

@@ -80,6 +80,63 @@ def test_person_page_content(tmp_path):
     assert "fix: JWT refresh race" in page
 
 
+@pytest.mark.parametrize("source, readable", [
+    ("[design.md](/uploads/abc/design.md)", "design.md"),
+    ("[design](../design.md)", "design"),
+    ("[design](design.md)", "design"),
+    ("[section](#design)", "section"),
+    ("[design](<../design draft.md>)", "design"),
+    ("[design](../design(v2).md)", "design"),
+    ("![diagram](/uploads/abc/diagram.png)", "diagram"),
+    ("![](/uploads/abc/diagram.png)", "attachment"),
+])
+def test_source_relative_links_keep_labels_and_source_permalink(tmp_path, source, readable):
+    conn = _seed(tmp_path)
+    permalink = "https://gitlab.example.test/group/project/-/issues/7#note_42"
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T10:00:00+04:00", source="gitlab",
+        kind="comment", summary=f"[#7] {source}", hash="attachment-comment",
+        project="project-alpha", refs=json.dumps({"url": permalink}),
+    )])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    for relative in (
+        "Person/Alex Rivera/README.md",
+        "Person/Alex Rivera/Week 2026-07-13-17.md",
+        "Projects/project-alpha/Week 2026-07-13-17.md",
+        "Work Journal/Week 2026-07-13-17.md",
+    ):
+        page = (vault / relative).read_text()
+        assert f"- comment — [#7] {readable} ([ref]({permalink}))" in page
+        assert source not in page
+    assert conn.execute(
+        "SELECT summary FROM events WHERE hash = 'attachment-comment'"
+    ).fetchone()[0] == f"[#7] {source}"
+
+
+@pytest.mark.parametrize("source", [
+    "[design](https://files.example.test/design.md)",
+    "[design](<https://files.example.test/design.md>)",
+    "[design](//files.example.test/design.md)",
+    "[contact](mailto:author@example.test)",
+    "`[design](../design.md)`",
+    "``[design](../design.md)``",
+    "```markdown\n[design](../design.md)\n```",
+    "~~~markdown\n[design](../design.md)\n~~~",
+])
+def test_source_absolute_links_and_code_quotations_are_preserved(tmp_path, source):
+    conn = _seed(tmp_path)
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T10:00:00+04:00", source="gitlab",
+        kind="comment", summary=source, hash="source-link", project="project-alpha",
+    )])
+    vault = tmp_path / "vault"
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+    page = (vault / "Person/Alex Rivera/Week 2026-07-13-17.md").read_text()
+    assert f"- comment — {source}\n" in page
+
+
 def test_render_is_idempotent_and_removes_stale(tmp_path):
     conn = _seed(tmp_path)
     vault = tmp_path / "vault"
@@ -1310,6 +1367,111 @@ def test_person_history_renders_beyond_window(tmp_path):
     old_week = vault / "Person" / "Alex Rivera" / "Week 2026-05-04-08.md"
     assert old_week.exists() and "ancient work" in old_week.read_text()
     assert not (vault / "Work Journal" / "Week 2026-05-04-08.md").exists()
+
+
+@pytest.mark.parametrize("weeks, linked", [(1, False), (4, False), (12, True)])
+def test_person_history_links_only_to_rendered_team_weeks(tmp_path, weeks, linked):
+    """A historical person's latest week must not link outside the report window."""
+    conn = open_db(tmp_path / "l.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-05-05T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="historical work", hash="historical-person",
+        project="project-alpha")])
+    vault = tmp_path / "vault"
+
+    render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY, weeks=weeks)
+
+    person = vault / "Person" / "Alex Rivera"
+    target = vault / "Work Journal" / "Week 2026-05-04-08.md"
+    assert target.exists() is linked
+    for page in [person / "README.md", person / "Week 2026-05-04-08.md"]:
+        text = page.read_text()
+        assert "Week 2026-05-04-08" in text
+        assert "historical work" in text
+        assert ("../../Work%20Journal/Week%202026-05-04-08.md" in text) is linked
+    assert "[Week 2026-05-04-08](Week%202026-05-04-08.md)" in (
+        person / "README.md"
+    ).read_text()
+
+
+@pytest.mark.parametrize(
+    "person, shown",
+    [("departed", "Departed Member"), ("former-alex", "former-alex"),
+     ("_unmapped/guest@example.test", "`_unmapped/guest@example.test`")],
+)
+def test_stored_flags_keep_absent_people_readable_without_links(tmp_path, person, shown):
+    """Stored gap/concentration identities can outlive their generated Person page."""
+    conn = _seed(tmp_path)
+    ids = IdentityMaps(
+        {"members": {"alex": {"name": "Alex Rivera"},
+                     "sam": {"name": "Sam Lee"},
+                     "departed": {"name": "Departed Member"}}},
+        {"projects": {"project-alpha": {}, "project-beta": {}}},
+    )
+    _store_weekly_summary(
+        conn, text="## Shipped\n- historical checkpoint",
+        coverage_state="friday-checkpoint",
+        effective_flags={"gaps": [person], "unmapped": [],
+                         "unmapped_channels": [],
+                         "concentration": [["project-alpha", person, 0.9]]},
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, ids, vault, TODAY)
+
+    report = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text()
+    assert f"**Gap**: {shown} — active in prior 4 weeks" in report
+    assert f"90% by {shown}\n" in report
+    assert "[Alex Rivera](../Person/Alex%20Rivera/README.md)" in report
+
+
+def test_stored_flags_do_not_link_to_future_only_person(tmp_path):
+    """Roster membership and future activity do not guarantee a rendered Person page."""
+    conn = _seed(tmp_path)
+    insert_events(conn, [Event(
+        person="future", ts="2026-07-21T09:00:00+04:00", source="gitlab",
+        kind="commit", summary="future work", hash="future-flag",
+        project="project-alpha")])
+    ids = IdentityMaps(
+        {"members": {"future": {"name": "Future Member"}}},
+        {"projects": {"project-alpha": {}, "project-beta": {}}},
+    )
+    _store_weekly_summary(
+        conn, text="## Shipped\n- checkpoint",
+        coverage_state="friday-checkpoint",
+        effective_flags={"gaps": ["future"], "unmapped": [],
+                         "unmapped_channels": [], "concentration": []},
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, ids, vault, TODAY)
+
+    report = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text()
+    assert "**Gap**: Future Member — active in prior 4 weeks" in report
+    assert not (vault / "Person" / "Future Member").exists()
+
+
+def test_stored_flag_links_follow_current_display_name(tmp_path):
+    """Renaming a roster member must link flags to the newly rendered folder."""
+    conn = _seed(tmp_path)
+    ids = IdentityMaps(
+        {"members": {"alex": {"name": "Alex Morgan"}}},
+        {"projects": {"project-alpha": {}, "project-beta": {}}},
+    )
+    _store_weekly_summary(
+        conn, text="## Shipped\n- checkpoint",
+        coverage_state="friday-checkpoint",
+        effective_flags={"gaps": [], "unmapped": [], "unmapped_channels": [],
+                         "concentration": [["project-alpha", "alex", 0.9]]},
+    )
+    vault = tmp_path / "vault"
+
+    render_vault(conn, ids, vault, TODAY)
+
+    report = (vault / "Work Journal" / "Week 2026-07-13-17.md").read_text()
+    assert "90% by [Alex Morgan](../Person/Alex%20Morgan/README.md)" in report
+    assert (vault / "Person" / "Alex Morgan" / "README.md").is_file()
+    assert not (vault / "Person" / "Alex Rivera").exists()
 
 
 def test_person_week_activity_detail_capped(tmp_path):

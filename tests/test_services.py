@@ -62,7 +62,7 @@ def _seed(cfg):
 def _fake_journal_llm(calls):
     def llm(system, user):
         calls.append((system, user))
-        return "generated journal"
+        return "- generated journal"
 
     return llm
 
@@ -308,7 +308,7 @@ def test_execute_journal_bounds_workers_keeps_sqlite_on_caller_and_persists_sort
                 assert later_day_finished[person].wait(timeout=1)
             else:
                 later_day_finished[person].set()
-            return user.splitlines()[0]
+            return "- " + user.splitlines()[0]
         finally:
             with lock:
                 active -= 1
@@ -354,7 +354,7 @@ def test_execute_journal_drains_failures_retains_successes_and_redacts_details(
         called.append((person, day))
         if "alex" in person:
             raise ValueError(f"provider rejected provider-secret for {user[:20]}")
-        return "sam succeeded"
+        return "- sam succeeded"
 
     result = execute_journal(
         cfg,
@@ -379,7 +379,7 @@ def test_execute_journal_drains_failures_retains_successes_and_redacts_details(
     assert all("provider-secret" not in failure.detail for failure in result.failures)
     assert all("[REDACTED]" in failure.detail for failure in result.failures)
     assert result.metrics.backend_seconds.count == 3
-    assert get_summary(conn, "daily-person", "sam|2026-07-15").text == "sam succeeded"
+    assert get_summary(conn, "daily-person", "sam|2026-07-15").text == "- sam succeeded"
     assert get_summary(conn, "daily-person", "alex|2026-07-14") is None
     assert get_summary(conn, "daily-person", "alex|2026-07-15") is None
 
@@ -918,3 +918,87 @@ def test_render_service_verify_rejects_push_and_dry_run(tmp_path, capsys):
                       push_requested=True) == 2
     assert run_render(cfg, ids, today=date(2026, 7, 16), verify=True,
                       dry_run=True) == 2
+
+
+def test_reconcile_selected_historical_days_updates_only_dependent_week(tmp_path):
+    cfg = _cfg(tmp_path)
+    _seed_person_days(cfg, [('alex', '2026-07-14'), ('sam', '2026-07-15'),
+                            ('alex', '2026-08-04')])
+    conn = open_db(cfg.db_path)
+    # An unrelated unverifiable legacy contract must not enter the repair batch.
+    legacy = SummaryRecord('daily-person', 'sam|2026-07-15', 'legacy-hash',
+                           '- Legacy journal.', 'old-model', 'old')
+    put_summary(conn, legacy)
+    previous = SummaryRecord('weekly-team', 'team|2026-07-13', 'old-hash',
+                             'old report', 'old-model', 'old')
+    put_summary(conn, previous)
+    result = services_module.reconcile_journals(
+        cfg, IdentityMaps.load(CONFIG_DIR), conn=conn,
+        person_days=[('alex', '2026-07-14')], journal_start='2026-07-01',
+        operator_date=date(2026, 8, 20),
+        daily_llm=lambda _s, _u: '- Repaired historical work.',
+        report_llm=lambda _s, _u: '## Shipped\n- Repaired outcome.',
+    )
+    assert result.journal.exit_code == 0
+    assert [(r.target_monday, r.status) for r in result.reports] == [
+        (date(2026, 7, 13), 'generated')]
+    assert get_summary(conn, 'daily-person', 'alex|2026-07-14').text == '- Repaired historical work.'
+    assert get_summary(conn, 'daily-person', legacy.key) == legacy
+    assert get_summary(conn, 'daily-person', 'alex|2026-08-04') is None
+    assert get_summary(conn, 'weekly-team', previous.key).text != previous.text
+
+
+def test_reconciliation_enforces_scope_before_any_model_or_cache_write(tmp_path):
+    import pytest
+    cfg = _cfg(tmp_path)
+    _seed_person_days(cfg, [('alex', '2026-07-14'), ('sam', '2026-07-15')])
+    conn = open_db(cfg.db_path)
+    def forbidden(*_args):
+        pytest.fail('scope errors must fail before model calls')
+    for pairs, start, limit in [
+        ([('alex', '2026-07-14')], '2026-07-15', 10),
+        ([('alex', '2026-07-14'), ('sam', '2026-07-15')], '2026-07-01', 1),
+        ([('alex', '2026-09-01')], '2026-07-01', 10),
+    ]:
+        with pytest.raises(ValueError):
+            services_module.reconcile_journals(
+                cfg, IdentityMaps.load(CONFIG_DIR), conn=conn,
+                person_days=pairs, journal_start=start, max_pairs=limit,
+                operator_date=date(2026, 8, 20), daily_llm=forbidden, report_llm=forbidden,
+            )
+    assert conn.execute('select count(*) from summaries').fetchone()[0] == 0
+
+
+def test_reconciliation_invalid_output_retains_cache_and_blocks_only_affected_week(tmp_path):
+    cfg = _cfg(tmp_path)
+    _seed_person_days(cfg, [('alex', '2026-07-14'), ('sam', '2026-07-21')])
+    conn = open_db(cfg.db_path)
+    previous = SummaryRecord('daily-person', 'alex|2026-07-14', 'old-hash',
+                             '- Good old journal.', 'old-model', 'old')
+    put_summary(conn, previous)
+    def daily(_system, user):
+        return 'Could you provide more details?' if 'slug: alex' in user else '- Sam shipped a fix.'
+    result = services_module.reconcile_journals(
+        cfg, IdentityMaps.load(CONFIG_DIR), conn=conn,
+        person_days=[('alex', '2026-07-14'), ('sam', '2026-07-21')],
+        journal_start='2026-07-01', operator_date=date(2026, 8, 20),
+        daily_llm=daily, report_llm=lambda _s, _u: '## Shipped\n- Sam shipped.',
+    )
+    assert result.journal.failed_person_days == (('alex', '2026-07-14'),)
+    assert [(r.target_monday, r.status) for r in result.reports] == [
+        (date(2026, 7, 13), 'skipped'), (date(2026, 7, 20), 'generated')]
+    assert get_summary(conn, 'daily-person', previous.key) == previous
+
+
+def test_repair_discovery_limits_era_and_ignores_legacy_hash_mismatch(tmp_path):
+    cfg = _cfg(tmp_path)
+    _seed_person_days(cfg, [('alex', '2026-06-01'), ('alex', '2026-07-14'),
+                            ('sam', '2026-07-15'), ('sam', '2026-07-16')])
+    conn = open_db(cfg.db_path)
+    put_summary(conn, SummaryRecord('daily-person', 'sam|2026-07-15', 'legacy',
+                                    '- Historical grounded work.', 'old', 'old'))
+    put_summary(conn, SummaryRecord('daily-person', 'sam|2026-07-16', 'legacy',
+                                    'Could you provide more details?', 'old', 'old'))
+    assert services_module.journal_repair_candidates(
+        conn, journal_start='2026-07-01', end_day='2026-07-16',
+    ) == [('alex', '2026-07-14', 'missing'), ('sam', '2026-07-16', 'invalid-output')]

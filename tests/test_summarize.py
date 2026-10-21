@@ -40,7 +40,7 @@ def _db(tmp_path):
 def _fake_llm(calls):
     def llm(system, user):
         calls.append((system, user))
-        return "Alex fixed the JWT refresh race in [[project-alpha]]."
+        return "- Alex fixed the JWT refresh race in [[project-alpha]]."
     return llm
 
 
@@ -74,18 +74,18 @@ def test_daily_journal_regenerates_when_model_changes(tmp_path):
 
     first = daily_person_journal(
         **common,
-        llm=lambda _system, _user: "claude summary",
+        llm=lambda _system, _user: "- claude summary",
         model="claude-haiku-4-5",
         created_ts="t1",
     )
     second = daily_person_journal(
         **common,
-        llm=lambda _system, _user: "codex summary",
+        llm=lambda _system, _user: "- codex summary",
         model="gpt-5.6-sol",
         created_ts="t2",
     )
 
-    assert (first, second) == ("claude summary", "codex summary")
+    assert (first, second) == ("- claude summary", "- codex summary")
     assert get_summary(conn, "daily-person", "alex|2026-07-14").model == "gpt-5.6-sol"
 
 
@@ -196,7 +196,7 @@ def test_legacy_daily_cache_from_another_model_is_not_migrated(tmp_path):
         created_ts="new-created",
     )
 
-    assert text == "Alex fixed the JWT refresh race in [[project-alpha]]."
+    assert text == "- Alex fixed the JWT refresh race in [[project-alpha]]."
     assert len(calls) == 1
     assert get_summary(conn, "daily-person", prepared.key).model == "gpt-5.6-sol"
 
@@ -863,3 +863,85 @@ def test_codex_cli_llm_reports_nonzero_and_timeout(monkeypatch):
     )
     with pytest.raises(ValueError, match="timed out after 600s"):
         summarize_module.codex_cli_llm("gpt-5.6-sol")("system", "user")
+
+
+@pytest.mark.parametrize('text', [
+    '',
+    'I need more information to write a meaningful journal entry.\n- Could you provide the message?',
+    'Looking at the events, here is the journal:\n- Work completed.',
+    '- Brief coordination only.\nCo-Authored-By: Claude <noreply@example.com>',
+    '- Could you provide more details about what Alex worked on?',
+])
+def test_invalid_daily_output_does_not_replace_good_cache(tmp_path, text):
+    conn = _db(tmp_path)
+    previous = SummaryRecord('daily-person', 'alex|2026-07-14', 'old-hash',
+                             '- Existing grounded journal.', 'old-model', 'old')
+    put_summary(conn, previous)
+    with pytest.raises(ValueError, match='journal'):
+        daily_person_journal(conn, 'alex', 'Alex', '2026-07-14', [],
+                             lambda _s, _u: text, 'new-model', 'new')
+    assert get_summary(conn, 'daily-person', previous.key) == previous
+
+
+def test_daily_output_preserves_quoted_request_and_source_signature(tmp_path):
+    conn = _db(tmp_path)
+    text = ('- **Review** — Alex asked the owner: “Could you provide more details?”\n'
+            '    - Removed the literal `Co-Authored-By:` trailer from a commit.')
+    result = daily_person_journal(conn, 'alex', 'Alex', '2026-07-14', [],
+                                  lambda _s, _u: text, 'model', 'new')
+    assert result == text
+    assert get_summary(conn, 'daily-person', 'alex|2026-07-14').text == text
+
+
+def test_daily_output_accepts_wrapped_bullets_without_changing_content(tmp_path):
+    conn = _db(tmp_path)
+    text = ('- **Review** — Alex requested a deployment check,\n'
+            '  with acceptance still pending.\n'
+            '    - Captured the literal source response:\n'
+            '      > Could you provide more details?')
+    result = daily_person_journal(conn, 'alex', 'Alex', '2026-07-14', [],
+                                  lambda _s, _u: text, 'model', 'new')
+    assert result == text
+
+
+@pytest.mark.parametrize('text', [
+    '- **Support** — Alex recorded the customer message: “After deployment,\n  I cannot sign in to the portal.”',
+    '- **Review** — Alex reviewed the commit subject “Remove the\n  Co-Authored-By: trailer from generated commits”.',
+])
+def test_daily_output_preserves_source_quotes_wrapped_across_lines(tmp_path, text):
+    conn = _db(tmp_path)
+    result = daily_person_journal(conn, 'alex', 'Alex', '2026-07-14', [],
+                                  lambda _s, _u: text, 'model', 'new')
+    assert result == text
+
+
+@pytest.mark.parametrize('text', ['', ' \n ', '## Shipped\n## Needs attention',
+    'Could you provide the source journals?', '## Shipped\n\nPlease share more context.',
+    '- I cannot write a grounded report without evidence.', 'Co-Authored-By: Model'])
+def test_weekly_generation_quality_rejects_empty_or_model_conversation(text):
+    with pytest.raises(ValueError, match='invalid weekly report'):
+        summarize_module.validate_weekly_report(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Released the portal update.',
+    '## Shipped\n- Alex released the portal.\n\n## Needs attention\nNone recorded.',
+    '## Needs attention\n- Alex recorded the customer message: “After deployment,\n  I cannot sign in to the portal.”',
+    '## Needs attention\n> Could you provide a screenshot?\n\nAlex is following up.',
+    '- Alex reviewed “Remove the\n  Co-Authored-By: trailer from generated commits”.',
+])
+def test_weekly_generation_quality_preserves_report_styles_and_quoted_sources(text):
+    summarize_module.validate_weekly_report(text)
+
+
+def test_weekly_generation_guard_does_not_revalidate_legacy_cache_reads(tmp_path):
+    from dataclasses import replace
+    conn = open_db(tmp_path / 'legacy-report.db')
+    kwargs = dict(conn=conn, monday_iso='2026-07-13',
+                  dailies=[DailySummaryInput('alex', '2026-07-14', 'daily-hash', '- Shipped.')],
+                  context=_report_context(), model='model', created_ts='now')
+    current = weekly_team_report(**kwargs, llm=lambda _s, _u: 'Released the portal.')
+    legacy = replace(current, text='## Historical cached layout')
+    put_summary(conn, legacy)
+    result = weekly_team_report(**kwargs, llm=lambda *_: pytest.fail('cache hit must not call model'))
+    assert result == legacy

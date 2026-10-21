@@ -687,3 +687,47 @@ def test_reclaim_repository_projects_ignores_malformed_ports(
     assert conn.execute(
         "SELECT project FROM events WHERE hash = 'malformed-port'"
     ).fetchone()[0] is None
+
+
+def test_reclaim_gitlab_note_fragment_uses_trusted_repository_without_changing_reference(tmp_path):
+    conn = open_db(tmp_path / 'l.db')
+    url = 'https://gitlab-history.example/team/common/mcp-core/-/merge_requests/3#note_26281'
+    insert_events(conn, [_forge_event('gitlab', 'comment', 'note', url)])
+    ids = IdentityMaps({'members': {}}, {'projects': {
+        'common': {'gitlab_repos': ['team/common/mcp-core']},
+    }})
+    before = conn.execute('SELECT refs, raw, hash, summary FROM events').fetchone()
+    assert reclaim_repository_projects(
+        conn, ids, dry_run=True, gitlab_url='https://gitlab.example',
+        reclaim_origins=['https://gitlab-history.example'],
+    ) == [('team/common/mcp-core', 'common', 1)]
+    assert conn.execute('SELECT project FROM events').fetchone()[0] is None
+    assert reclaim_repository_projects(
+        conn, ids, gitlab_url='https://gitlab.example',
+        reclaim_origins=['https://gitlab-history.example'],
+    ) == [('team/common/mcp-core', 'common', 1)]
+    assert conn.execute('SELECT project FROM events').fetchone()[0] == 'common'
+    assert conn.execute('SELECT refs, raw, hash, summary FROM events').fetchone() == before
+    assert reclaim_repository_projects(
+        conn, ids, gitlab_url='https://gitlab-history.example',
+    ) == []
+
+
+@pytest.mark.parametrize('url', [
+    'https://untrusted.example/team/common/mcp-core/-/merge_requests/3#note_1',
+    'http://gitlab.example/team/common/mcp-core/-/merge_requests/3#note_1',
+    'https://gitlab.example:444/team/common/mcp-core/-/merge_requests/3#note_1',
+    'https://user:password@gitlab.example/team/common/mcp-core/-/merge_requests/3#note_1',
+    'https://gitlab.example/team/common/mcp-core/-/merge_requests/3?foo=bar#note_1',
+    'https://gitlab.example/team/common/mcp-core/-/merge_requests/3#note_1#extra',
+    'https://gitlab.example/team/common/mcp-core/-/merge_requests/3#not_a_note',
+    'https://gitlab.example/team/common/mcp-core/-/merge_requests/3#note_1\n',
+])
+def test_reclaim_gitlab_note_keeps_strict_origin_and_fragment_checks(tmp_path, url):
+    conn = open_db(tmp_path / 'l.db')
+    insert_events(conn, [_forge_event('gitlab', 'comment', 'note', url)])
+    ids = IdentityMaps({'members': {}}, {'projects': {
+        'common': {'gitlab_repos': ['team/common/mcp-core']},
+    }})
+    assert reclaim_repository_projects(conn, ids, gitlab_url='https://gitlab.example') == []
+    assert conn.execute('SELECT project FROM events').fetchone()[0] is None

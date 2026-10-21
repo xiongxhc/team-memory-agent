@@ -16,11 +16,52 @@ def _rows(conn: sqlite3.Connection, person: str, day: str) -> list[dict]:
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def _post_text(post: object) -> str:
+    if not isinstance(post, dict):
+        return ""
+    if not {"title", "content", "content_v2"}.intersection(post):
+        # Localized posts wrap the same shape under locale keys.
+        texts = [_post_text(post[locale]) for locale in sorted(post)]
+        return "\n".join(dict.fromkeys(text for text in texts if text))
+    title = post.get("title")
+    lines = [title] if isinstance(title, str) and title else []
+    rows = post.get("content_v2")
+    if not isinstance(rows, list):
+        rows = post.get("content")
+    for line in rows if isinstance(rows, list) else []:
+        if not isinstance(line, list):
+            continue
+        parts = []
+        for node in line:
+            if not isinstance(node, dict):
+                continue
+            tag = node.get("tag")
+            text = node.get("text")
+            text = text if isinstance(text, str) else ""
+            if tag in {"text", "md", "code_block"}:
+                parts.append(text)
+            elif tag == "a":
+                href = node.get("href")
+                href = href if isinstance(href, str) else ""
+                parts.append(f"{text} ({href})" if text and href and text != href
+                             else text or href)
+            elif tag == "at":
+                name = node.get("user_name") or node.get("user_id")
+                if isinstance(name, str):
+                    parts.append(name if name.startswith("@") else f"@{name}")
+        text = "".join(parts)
+        if text.strip():
+            lines.append(text)
+    return "\n".join(lines)
+
+
 def _message_text(row: dict) -> str:
     try:
         raw = json.loads(row["raw"])
         if raw.get("msg_type") == "text":
             return json.loads(raw["body"]["content"]).get("text") or row["summary"]
+        if raw.get("msg_type") == "post":
+            return _post_text(json.loads(raw["body"]["content"])) or row["summary"]
     except (TypeError, ValueError, KeyError, AttributeError):
         pass
     return row["summary"]

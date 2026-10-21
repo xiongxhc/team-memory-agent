@@ -5,6 +5,7 @@ import os
 import stat
 import sys
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -175,8 +176,18 @@ class Config:
     archive: Path | None = None
     quarantine: Path | None = None
     snapshots: Path | None = None
+    reconcile_from: str | None = None
+    reconcile_batch_size: int = 25
 
     def __post_init__(self) -> None:
+        if self.reconcile_from is not None:
+            try:
+                if date.fromisoformat(self.reconcile_from).isoformat() != self.reconcile_from:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise ValueError("TEAMMEM_RECONCILE_FROM must be YYYY-MM-DD") from None
+        if type(self.reconcile_batch_size) is not int or not 1 <= self.reconcile_batch_size <= 100:
+            raise ValueError("TEAMMEM_RECONCILE_BATCH_SIZE must be an integer from 1 to 100")
         if self.llm_provider not in ("claude", "codex"):
             raise ValueError(
                 "TEAMMEM_LLM_PROVIDER must be one of: claude, codex"
@@ -246,4 +257,6 @@ class Config:
             archive=Path(values["TEAMMEM_ARCHIVE"]) if values.get("TEAMMEM_ARCHIVE") else None,
             quarantine=Path(values["TEAMMEM_QUARANTINE"]) if values.get("TEAMMEM_QUARANTINE") else None,
             snapshots=Path(values["TEAMMEM_SNAPSHOTS"]) if values.get("TEAMMEM_SNAPSHOTS") else None,
+            reconcile_from=values.get("TEAMMEM_RECONCILE_FROM") or None,
+            reconcile_batch_size=_bounded_integer(values, "TEAMMEM_RECONCILE_BATCH_SIZE", 25, 1, 100),
         )

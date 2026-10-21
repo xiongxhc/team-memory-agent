@@ -987,3 +987,25 @@ def test_daily_snapshot_uses_sqlite_backup_and_retains_fourteen(tmp_path, monkey
     assert open_db(snapshots / "ledger-2026-07-17.db").execute(
         "SELECT COUNT(*) FROM events"
     ).fetchone()[0] == 0
+
+
+def test_enabled_reconciliation_missing_baseline_fails_visibly_without_bootstrap(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path, TEAMMEM_RECONCILE_FROM='2026-07-01')
+    monkeypatch.setattr('teammem.daily.resolve_llm_backend', lambda *_args: None)
+    result = run_daily(cfg, IdentityMaps.load(CONFIG_DIR), _settings(), NOW, connectors={})
+    assert result.status('reconciliation') == 'failed'
+    assert result.exit_code == 1
+    assert 'baseline' in result.step('reconciliation').detail
+    assert not cfg.db_path.with_name(cfg.db_path.name + '.reconciliation.json').exists()
+    assert result.status('render') == 'ok'
+
+
+def test_capture_only_never_creates_or_advances_reconciliation_baseline(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path, TEAMMEM_RECONCILE_FROM='2026-07-01')
+    path = cfg.db_path.with_name(cfg.db_path.name + '.reconciliation.json')
+    path.write_text('baseline must not be read or rewritten')
+    monkeypatch.setattr('teammem.daily.resolve_llm_backend', lambda *_args: pytest.fail('no model resolution'))
+    result = run_daily(cfg, IdentityMaps.load(CONFIG_DIR), _settings(), NOW,
+                       connectors={}, capture_only=True)
+    assert result.status('reconciliation') == 'skipped'
+    assert path.read_text() == 'baseline must not be read or rewritten'

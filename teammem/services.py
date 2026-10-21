@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -43,6 +43,7 @@ from .summarize import (
     http_llm,
     prepare_daily_journal,
     put_daily_journal,
+    validate_daily_journal,
     weekly_team_report,
 )
 from .telemetry import (
@@ -106,6 +107,12 @@ class ReportRunResult:
     status: str
     detail: str
     elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    journal: JournalRunResult
+    reports: tuple[ReportRunResult, ...]
 
 
 @dataclass(frozen=True)
@@ -385,6 +392,7 @@ def _invoke_daily_llm(
     error = None
     try:
         text = llm(DAILY_SYSTEM, prepared.user_prompt)
+        validate_daily_journal(text)
     except Exception as failure:
         error = failure
     finished_at = monotonic()
@@ -437,9 +445,14 @@ def execute_journal(
     llm: LLM,
     reporter: Reporter = noop_reporter,
     monotonic: Callable[[], float] = time.monotonic,
+    person_days: Sequence[tuple[str, str]] | None = None,
+    force: bool = False,
 ) -> JournalRunResult:
     run_started_at = monotonic()
-    pairs = active_person_days(conn, start_day, end_day)
+    pairs = (active_person_days(conn, start_day, end_day)
+             if person_days is None else sorted(set(person_days)))
+    if any(not start_day <= day <= end_day for _person, day in pairs):
+        raise ValueError("journal person-day outside requested date bounds")
     global_projects = [
         row[0]
         for row in conn.execute(
@@ -461,7 +474,7 @@ def execute_journal(
         if prepared is None:
             continue
         prepared_journals.append(prepared)
-        status, _text = daily_cache_status(
+        status, _text = ("miss", None) if force else daily_cache_status(
             conn, prepared, cfg.llm_daily_model
         )
         if status == "cached":
@@ -700,6 +713,79 @@ def execute_report(
         detail,
         monotonic() - started_at,
     )
+
+
+def journal_repair_candidates(
+    conn: sqlite3.Connection,
+    *,
+    journal_start: str,
+    end_day: str,
+) -> list[tuple[str, str, str]]:
+    """Read-only missing/invalid discovery; hash mismatches need separate evidence."""
+    if date.fromisoformat(journal_start) > date.fromisoformat(end_day):
+        raise ValueError("journal repair date bounds are reversed")
+    candidates = []
+    for person, day in active_person_days(conn, journal_start, end_day):
+        existing = get_summary(conn, "daily-person", f"{person}|{day}")
+        if existing is None:
+            candidates.append((person, day, "missing"))
+        else:
+            try:
+                validate_daily_journal(existing.text)
+            except ValueError:
+                candidates.append((person, day, "invalid-output"))
+    return candidates
+
+
+def reconcile_journals(
+    cfg: Config,
+    ids: IdentityMaps,
+    *,
+    conn: sqlite3.Connection,
+    person_days: Sequence[tuple[str, str]],
+    journal_start: str,
+    operator_date: date,
+    daily_llm: LLM,
+    report_llm: LLM,
+    max_pairs: int = 100,
+    force: bool = True,
+) -> ReconciliationResult:
+    """Repair a reviewed, bounded set; never infer staleness from legacy hashes.
+
+    The caller supplies the established journal era and exact affected keys.
+    No collection, rendering, publication, or live-database selection happens here.
+    Invalid generations retain existing caches and block only their own week.
+    """
+    start = date.fromisoformat(journal_start)
+    pairs = sorted(set(person_days))
+    if max_pairs < 1 or len(pairs) > max_pairs:
+        raise ValueError("reconciliation exceeds person-day batch limit")
+    for person, day in pairs:
+        if (person.startswith("_unmapped/")
+                or not start <= date.fromisoformat(day) <= operator_date):
+            raise ValueError("reconciliation person-day outside journal scope")
+        if conn.execute(
+            "SELECT 1 FROM events WHERE person=? AND substr(ts,1,10)=? LIMIT 1",
+            (person, day),
+        ).fetchone() is None:
+            raise ValueError("reconciliation person-day has no source events")
+    result = execute_journal(
+        cfg, ids, conn=conn, start_day=journal_start,
+        end_day=operator_date.isoformat(), created_ts=operator_date.isoformat(),
+        person_days=pairs, force=force, llm=daily_llm,
+    )
+    failed_weeks = {week_monday(date.fromisoformat(day))
+                    for _person, day in result.failed_person_days}
+    reports = []
+    for monday in sorted({week_monday(date.fromisoformat(day)) for _person, day in pairs}):
+        if monday in failed_weeks:
+            reports.append(ReportRunResult(monday, "skipped", "journal failed for target week", 0))
+        else:
+            reports.append(execute_report(
+                cfg, ids, conn=conn, target_week=monday,
+                operator_date=operator_date, llm=report_llm,
+            ))
+    return ReconciliationResult(result, tuple(reports))
 
 
 def run_report(

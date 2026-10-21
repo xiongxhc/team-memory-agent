@@ -270,10 +270,28 @@ def _validate_projection_filenames(
         seen[key] = project
 
 
+def _source_summary(text: str) -> str:
+    """Source-relative links have no verified base in the generated vault."""
+    def readable_link(match: re.Match) -> str:
+        if match.group("code"):
+            return match.group(0)
+        target = match.group("target").strip().lstrip("<")
+        if re.match(r"(?:[a-zA-Z][a-zA-Z0-9+.-]*:|//)", target):
+            return match.group(0)
+        return match.group("label") or ("attachment" if match.group("image") else "")
+
+    return re.sub(
+        r"(?P<code>(?P<fence>`+|~{3,}).*?(?P=fence))|"
+        r"(?<!\\)(?P<image>!?)\[(?P<label>(?:\\.|[^\]\\\n])*)\]"
+        r"\((?P<target>(?:\\.|[^()\\\n]|\([^()\n]*\))*)\)",
+        readable_link, text, flags=re.DOTALL,
+    )
+
+
 def _line(r: dict) -> str:
     url = ref_url(r)
     ref = f" ([ref]({url}))" if url else ""
-    return f"- {r['kind']} — {r['summary']}{ref}\n"
+    return f"- {r['kind']} — {_source_summary(r['summary'])}{ref}\n"
 
 
 def _day_headline(text: str) -> str:
@@ -382,7 +400,29 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         path.write_text(content)
 
     week_of = {m: events_between(conn, *week_range(m)) for m in mondays}
+    # Person pages retain full history, while team reports use the render window.
+    min_ts = conn.execute("SELECT min(ts) FROM events").fetchone()[0]
+    hist_mondays = list(mondays)
+    if min_ts:
+        first = week_monday(date.fromisoformat(min_ts[:10]))
+        span = (week_monday(today) - first).days // 7 + 1
+        hist_mondays = [week_monday(today) - timedelta(weeks=i)
+                        for i in range(max(span, weeks))]
+    hist_week_of = {m: week_of[m] if m in week_of
+                    else events_between(conn, *week_range(m))
+                    for m in hist_mondays}
+    hist_rows = [r for rows in hist_week_of.values() for r in rows]
+    rendered_people = {
+        r["person"] for r in hist_rows if not r["person"].startswith("_unmapped/")
+    }
     files = 0
+
+    def _flag_person_link(person: str) -> str:
+        if person.startswith("_unmapped/"):
+            return f"`{person}`"
+        name = ids.display_name(person)
+        return (_person_link(_fname(name)) if person in rendered_people
+                else _markdown_text(name))
 
     def _summary(kind: str, key: str) -> str | None:
         summary = get_summary(conn, kind, key)
@@ -460,7 +500,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
 
         flags_md = ["\n## Flags\n"]
         for slug in ([] if coverage_state == "provisional" else f.get("gaps", [])):
-            flags_md.append(f"- **Gap**: {_person_link(_fname(ids.display_name(slug)))} — active in "
+            flags_md.append(f"- **Gap**: {_flag_person_link(slug)} — active in "
                       f"prior 4 weeks, no activity this week\n")
         for person, n in f.get("unmapped", []):
             flags_md.append(f"- **Unmapped**: `{person}` ({n} events) — add to "
@@ -474,7 +514,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             [] if coverage_state == "provisional" else f.get("concentration", [])
         ):
             flags_md.append(f"- **Concentration**: {_project_link(proj, ids)} — {int(share * 100)}% by "
-                      f"{_person_link(_fname(ids.display_name(slug)))}\n")
+                      f"{_flag_person_link(slug)}\n")
         if provenance_incomplete:
             flags_md.append(
                 "- Stored effective flags unavailable; no current-ledger flags are shown.\n"
@@ -502,16 +542,6 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     # from the vault. README.md is the per-person index — the forge web UI
     # auto-renders it when the folder is opened.
     all_rows = [r for rows in week_of.values() for r in rows]
-    min_ts = conn.execute("SELECT min(ts) FROM events").fetchone()[0]
-    hist_mondays = list(mondays)
-    if min_ts:
-        first = week_monday(date.fromisoformat(min_ts[:10]))
-        span = (week_monday(today) - first).days // 7 + 1
-        hist_mondays = [week_monday(today) - timedelta(weeks=i)
-                        for i in range(max(span, weeks))]
-    hist_week_of = {m: week_of[m] if m in week_of
-                    else events_between(conn, *week_range(m))
-                    for m in hist_mondays}
 
     def _person_week_body(person: str, mine: list[dict]) -> list[str]:
         body = []
@@ -531,8 +561,6 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
             body.append(_msg_line(msgs))
         return body
 
-    hist_rows = [r for rows in hist_week_of.values() for r in rows]
-    rendered_people: set[str] = set()
     for person, rs in sorted(by_key(hist_rows, "person").items()):
         if person.startswith("_unmapped/"):
             continue
@@ -546,24 +574,27 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         weeks_mine = [(m, mine) for m, mine in weeks_mine if mine]
 
         latest_m, latest_mine = weeks_mine[0]
+        latest_week = week_label(latest_m)
+        if latest_m in week_of:
+            latest_week = _week_link(latest_week, up=2)
         md = [f"---\nslug: {person}\ngenerated: {today.isoformat()}\n---\n",
               f"# {name}\n",
-              f"\n## {_week_link(week_label(latest_m), up=2)}\n"]
+              f"\n## {latest_week}\n"]
         md += _person_week_body(person, latest_mine)
         md.append("\n## Weeks\n")
         for m, mine in weeks_mine:
             lbl = week_label(m)
             md.append(f"- [{lbl}]({quote(lbl)}.md) — {len(mine)} events\n")
         _write(pdir / "README.md", "".join(md))
-        rendered_people.add(person)
         files += 1
 
         for m, mine in weeks_mine:
             lbl = week_label(m)
+            team_week = _week_link(lbl, up=2) if m in week_of else lbl
             wmd = [f"---\nslug: {person}\nweek: {m.isoformat()}\n"
                    f"generated: {today.isoformat()}\n---\n",
                    f"# {name} — {lbl}\n",
-                   f"\n[{name}](README.md) · {_week_link(lbl, up=2)}\n"]
+                   f"\n[{name}](README.md) · {team_week}\n"]
             wmd += _person_week_body(person, mine)
             _write(pdir / f"{lbl}.md", "".join(wmd))
             files += 1

@@ -236,3 +236,23 @@ def test_llm_provider_rejects_values_other_than_claude_or_codex(
         Config.load(
             env={"TEAMMEM_LLM_PROVIDER": value}, env_file=empty_env_file
         )
+
+
+def test_historical_reconciliation_is_explicit_and_bounded(empty_env_file):
+    defaults = Config.load(env={}, env_file=empty_env_file)
+    assert defaults.reconcile_from is None
+    configured = Config.load(env={'TEAMMEM_RECONCILE_FROM': '2026-07-01',
+                                  'TEAMMEM_RECONCILE_BATCH_SIZE': '12'}, env_file=empty_env_file)
+    assert configured.reconcile_from == '2026-07-01'
+    assert configured.reconcile_batch_size == 12
+
+
+@pytest.mark.parametrize('values', [
+    {'TEAMMEM_RECONCILE_FROM': 'July 1'},
+    {'TEAMMEM_RECONCILE_FROM': '20260701'},
+    {'TEAMMEM_RECONCILE_BATCH_SIZE': '0'},
+    {'TEAMMEM_RECONCILE_BATCH_SIZE': '101'},
+])
+def test_historical_reconciliation_rejects_invalid_configuration(empty_env_file, values):
+    with pytest.raises(ValueError, match='TEAMMEM_RECONCILE'):
+        Config.load(env=values, env_file=empty_env_file)

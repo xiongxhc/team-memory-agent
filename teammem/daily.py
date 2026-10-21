@@ -24,6 +24,7 @@ from .reclaim import (
     reclaim_repository_projects,
 )
 from .run_lock import acquire_run_lock
+from .reconciliation import reconcile_history
 from .services import (
     collect_connector,
     execute_journal,
@@ -72,7 +73,7 @@ _LOCAL_STAGES = (
     "push",
     "snapshot",
 )
-_FATAL_STAGES = frozenset({"lock", "ledger", "reclaim", "render", "snapshot"})
+_FATAL_STAGES = frozenset({"lock", "ledger", "reclaim", "reconciliation", "render", "snapshot"})
 StageFields: TypeAlias = tuple[tuple[str, object], ...]
 StageOutcome: TypeAlias = StepResult | tuple[StepResult, StageFields]
 
@@ -279,6 +280,7 @@ def _run_full_stages(
     current_monday = local_day - timedelta(days=local_day.weekday())
     previous_monday = current_monday - timedelta(days=7)
     daily_llm = None
+    report_llm = None
     failed_person_days: tuple[tuple[str, str], ...] = ()
     journal_unavailable = False
 
@@ -315,6 +317,7 @@ def _run_full_stages(
     run.timed("journal", journal_action)
 
     def report_action() -> StepResult:
+        nonlocal report_llm
         backend_error = None
         report_llm = None
         if daily_llm is not None:
@@ -339,6 +342,28 @@ def _run_full_stages(
         )
 
     run.timed("report", report_action)
+    if cfg.reconcile_from is not None:
+        def reconciliation_action() -> StepResult:
+            def unavailable(_system, _prompt):
+                raise ValueError("no LLM backend")
+
+            try:
+                result = reconcile_history(
+                    cfg, ids, conn=conn, today=local_day,
+                    daily_llm=daily_llm or unavailable,
+                    report_llm=report_llm or unavailable,
+                )
+            except Exception as error:
+                return StepResult("reconciliation", "failed", redact_secrets(error, cfg))
+            pending = bool(result.pending_days or result.pending_reports)
+            return StepResult(
+                "reconciliation", "failed" if pending else "ok",
+                f"attempts={result.attempts} pending_days={len(result.pending_days)} "
+                f"pending_reports={len(result.pending_reports)} orphans={len(result.orphans)}",
+                tuple(redact_secrets(error, cfg) for error in result.failures),
+            )
+
+        run.timed("reconciliation", reconciliation_action)
     if cfg.obsidian_projects is None:
         run.skip(("docs-sync",), "TEAMMEM_OBSIDIAN_PROJECTS not set")
     else:
@@ -527,6 +552,8 @@ def _run_locked_stages(
             ("journal", "report", "docs-sync", "render", "push"),
             skip_reason,
         )
+        if cfg.reconcile_from is not None:
+            run.skip(("reconciliation",), skip_reason)
 
     def snapshot_action() -> StepResult:
         if cfg.snapshots is None:

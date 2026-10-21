@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from teammem.events import Event
 from teammem.slices import (active_person_days, daily_person_projects,
                             daily_person_slice, slice_hash, weekly_team_input)
@@ -89,3 +91,62 @@ def test_message_text_handles_non_dict_json_content(tmp_path):
     s = daily_person_slice(conn, "alex", "2026-07-14")
     # Should fallback to summary instead of raising AttributeError
     assert "Array content fallback" in s
+
+
+def _post_slice(tmp_path, content):
+    conn = open_db(tmp_path / "posts.db")
+    insert_events(conn, [Event(
+        person="alex", ts="2026-07-14T10:12:03+00:00", source="feishu-channel",
+        kind="message", project="test", summary="[post]", hash="post",
+        raw=json.dumps({"msg_type": "post", "body": {"content": content}}),
+    )])
+    return daily_person_slice(conn, "alex", "2026-07-14")
+
+
+def test_post_slice_preserves_readable_evidence_without_duplicate_versions(tmp_path):
+    rows = [
+        [{"tag": "at", "user_name": "Alex", "user_id": "@_user_1"},
+         {"tag": "text", "text": " KPI changes are documented; some remain unfinished."}],
+        [{"tag": "a", "text": "Plan", "href": "https://example.com/plan"}],
+        [{"tag": "img", "image_key": "private-image-key"}],
+        [{"tag": "code_block", "text": "activity_unique_id\n  not id"}],
+        [{"tag": "md", "text": '> "Could you confirm the date?"\n  Preserve this quotation.'}],
+    ]
+    text = _post_slice(tmp_path, json.dumps({
+        "title": "KPI status", "content": rows, "content_v2": rows,
+    }))
+    assert "KPI status\n@Alex KPI changes are documented; some remain unfinished." in text
+    assert "Plan (https://example.com/plan)" in text
+    assert "activity_unique_id\n  not id" in text
+    assert '> "Could you confirm the date?"\n  Preserve this quotation.' in text
+    assert text.count("KPI changes") == 1
+    assert "private-image-key" not in text
+
+
+def test_post_slice_prefers_newer_content_and_supports_localized_posts(tmp_path):
+    text = _post_slice(tmp_path, json.dumps({
+        "zh_cn": {"title": "进展", "content": [[{"tag": "text", "text": "尚未完成"}]]},
+        "en_us": {"title": "Progress", "content": [[{"tag": "text", "text": "old text"}]],
+                  "content_v2": [[{"tag": "text", "text": "Still unfinished"}]]},
+    }))
+    assert "Progress\nStill unfinished\n进展\n尚未完成" in text
+    assert "old text" not in text
+
+
+def test_post_slice_uses_legacy_content_when_newer_content_is_malformed(tmp_path):
+    text = _post_slice(tmp_path, json.dumps({
+        "content_v2": "invalid", "content": [[
+            {"tag": "text", "text": "Use the HSE sender address."},
+            {"tag": "a", "href": "https://example.com/matrix"},
+        ]],
+    }))
+    assert "Use the HSE sender address.https://example.com/matrix" in text
+
+
+@pytest.mark.parametrize("content", [
+    "This message was recalled", "null", "[]", "42",
+    json.dumps({"content": [[{"tag": "img", "image_key": "image-only"}]]}),
+    json.dumps({"title": 42, "content": [None, [None, {"tag": "text", "text": []}]]}),
+])
+def test_post_slice_malformed_or_nontext_content_keeps_summary(tmp_path, content):
+    assert _post_slice(tmp_path, content).endswith("message  test  [post]")
