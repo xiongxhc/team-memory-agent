@@ -423,7 +423,7 @@ def test_backlinks_land_on_the_existing_page_of_a_rostered_participant(tmp_path)
 def test_meeting_only_project_gets_a_page_and_an_index_entry(tmp_path):
     vault = _render(tmp_path, _seeded(tmp_path))
     page = (vault / "Projects" / "project-atlas" / "README.md").read_text()
-    assert page.startswith("---\nproject: project-atlas\n")
+    assert page.startswith('---\nproject: "project-atlas"\n')
     assert "## Meetings" in page
     index = (vault / "Projects" / "README.md").read_text()
     assert "[project-atlas](project-atlas/README.md)" in index
@@ -1274,3 +1274,17 @@ def test_link_labels_carry_balanced_brackets_and_an_odd_one_starts_over():
     # an opener nothing closes does not swallow the link that follows it
     assert render_module._md_links("[stray [b](c.md)") == ["c.md"]
     assert render_module._md_links("[a] (b.md) [c](d.md)") == ["d.md"]
+
+
+def test_meeting_only_front_matter_values_are_quoted_yaml(tmp_path):
+    """A project name such as `Ops: "Q3" #1` must stay one YAML string."""
+    conn = _seeded(tmp_path)
+    conn.execute("UPDATE meeting_projects SET name = ? WHERE name = ?",
+                 ('Ops: "Q3" #1', "project-atlas"))
+    conn.commit()
+    vault = _render(tmp_path, conn)
+    page = next((vault / "Projects").glob("Ops*/README.md")).read_text()
+    assert page.startswith('---\nproject: "Ops: \\"Q3\\" #1"\n')
+    person = next(p for p in (vault / "Person").glob("*/README.md")
+                  if "person_ids:" in p.read_text())
+    assert person.read_text().split("\n")[1].startswith('person_ids: "')

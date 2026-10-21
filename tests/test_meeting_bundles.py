@@ -945,3 +945,33 @@ def test_open_attendance_interval_must_be_the_last_one(tmp_path):
         {"joined_at": "2026-09-02T14:24:05Z", "left_at": "2026-09-02T14:52:00Z"},
     ]
     assert "left_at" in _reject(tmp_path, payload)
+
+
+# --- control characters and dot names -------------------------------------
+# Titles, names and project names become folder names and front matter, so a
+# line break or control character there is refused at the boundary, where the
+# producer sees it, instead of withholding the note on every render.
+
+@pytest.mark.parametrize("value", ["Atlas\nInjected: yes", "Atlas\x00", "Atlas\x1b[2J",
+                                   "Atlas\x7f", "Atlas\x85", "Atlas\r"])
+def test_single_line_fields_reject_control_characters(tmp_path, value):
+    payload = _fixture(COMPLETE)
+    payload["title"] = value
+    assert "control" in _reject(tmp_path / "title", payload)
+    payload = _fixture(COMPLETE)
+    payload["projects"][0]["name"] = value
+    assert "control" in _reject(tmp_path / "project", payload)
+
+
+@pytest.mark.parametrize("name", [".", ".."])
+def test_a_display_name_cannot_be_a_dot_path_segment(tmp_path, name):
+    raw = COMPLETE.read_text(encoding="utf-8").replace("Ben Ortiz", name)
+    assert "display_name" in _reject(tmp_path, json.loads(raw))
+
+
+def test_multi_line_text_keeps_line_breaks_but_rejects_other_controls(tmp_path):
+    payload = _fixture(COMPLETE)
+    payload["summary"] = "First paragraph.\n\nSecond\tparagraph.\r\n"
+    _load(tmp_path / "ok", payload)
+    payload["summary"] = "Summary\x1b[31m"
+    assert "control" in _reject(tmp_path / "bad", payload)

@@ -162,12 +162,31 @@ def _list(container: dict, key: str, maximum: int, label: str) -> list:
     return value
 
 
+# Line breaks and tabs are prose in multi-line text; every other C0 control,
+# DEL and the C1 range never are. Single-line values (ids, names, titles) also
+# become folder names and front matter, so they admit no control at all.
+_TEXT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_LINE_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
 def _text(container: dict, key: str, maximum: int, label: str = "") -> str:
     value = container[key]
     if not isinstance(value, str) or not value.strip():
         raise _error(f"{label}{key} must be a non-empty string")
     if len(value) > maximum:
         raise _error(f"{label}{key} is longer than {maximum} characters")
+    if _TEXT_CONTROL.search(value):
+        raise _error(f"{label}{key} contains control characters")
+    return value
+
+
+def _line(container: dict, key: str, maximum: int, label: str = "") -> str:
+    """A single-line value: no control character, and not a dot path segment."""
+    value = _text(container, key, maximum, label)
+    if _LINE_CONTROL.search(value):
+        raise _error(f"{label}{key} contains control characters")
+    if value.strip() in (".", ".."):
+        raise _error(f"{label}{key} must not be a relative path segment")
     return value
 
 
@@ -258,8 +277,8 @@ def _validate_organizer(data: dict) -> None:
             )
         return
     _object(organizer, _ORGANIZER_KEYS, "organizer")
-    _text(organizer, "person_id", MAX_ID, "organizer ")
-    _text(organizer, "display_name", MAX_NAME, "organizer ")
+    _line(organizer, "person_id", MAX_ID, "organizer ")
+    _line(organizer, "display_name", MAX_NAME, "organizer ")
     if data["organizer_source"] not in ORGANIZER_SOURCES:
         raise _error("organizer_source must be reservation or calendar_event")
     if data["organizer_unresolved_reason"] is not None:
@@ -274,8 +293,8 @@ def _validate_participants(data: dict, ended: datetime) -> dict[str, str]:
     for index, participant in enumerate(participants):
         label = f"participant {index} "
         _object(participant, _PARTICIPANT_KEYS, f"participant {index}")
-        person_id = _text(participant, "person_id", MAX_ID, label)
-        display_name = _text(participant, "display_name", MAX_NAME, label)
+        person_id = _line(participant, "person_id", MAX_ID, label)
+        display_name = _line(participant, "display_name", MAX_NAME, label)
         if person_id in people:
             raise _error(f"duplicate participant {person_id}")
         intervals = _list(participant, "attendance", MAX_INTERVALS, label)
@@ -349,7 +368,7 @@ def _validate_transcript(
         provenance = _object(segment["provenance"], _SEGMENT_PROVENANCE_KEYS, f"{label}provenance")
         if provenance["stage"] not in SEGMENT_STAGES:
             raise _error(f"{label}provenance stage must be live_stream or final_batch")
-        _text(provenance, "model", MAX_NAME, f"{label}provenance ")
+        _line(provenance, "model", MAX_NAME, f"{label}provenance ")
         segment_ids.add(segment_id)
         previous_start = segment_start
         previous_end = segment_end
@@ -362,7 +381,7 @@ def _validate_speaker(speaker, people: dict[str, str], spoke: set[str], label: s
     kind = speaker["kind"]
     if kind == "person":
         _object(speaker, {"kind", "person_id", "display_name", "reconciled"}, f"{label}speaker")
-        person_id = _text(speaker, "person_id", MAX_ID, f"{label}speaker ")
+        person_id = _line(speaker, "person_id", MAX_ID, f"{label}speaker ")
         if person_id not in people:
             raise _error(f"{label}speaker {person_id} is not an actual participant")
         if speaker["display_name"] != people[person_id]:
@@ -384,7 +403,7 @@ def _validate_synthesis(data: dict, people: dict[str, str], segment_ids: set[str
     for index, project in enumerate(_list(data, "projects", MAX_ITEMS, "")):
         label = f"project {index} "
         _object(project, _PROJECT_KEYS, f"project {index}")
-        name = _text(project, "name", MAX_NAME, label)
+        name = _line(project, "name", MAX_NAME, label)
         if name in names:
             raise _error(f"duplicate project {name}")
         names.add(name)
@@ -405,8 +424,8 @@ def _validate_synthesis(data: dict, people: dict[str, str], segment_ids: set[str
         owner = item["owner"]
         if owner is not None:
             _object(owner, _OWNER_KEYS, f"{label}owner")
-            _text(owner, "person_id", MAX_ID, f"{label}owner ")
-            _text(owner, "display_name", MAX_NAME, f"{label}owner ")
+            _line(owner, "person_id", MAX_ID, f"{label}owner ")
+            _line(owner, "display_name", MAX_NAME, f"{label}owner ")
             if owner["explicitly_stated"] is not True:
                 raise _error(f"{label}owner must be marked explicitly_stated")
         due_date = item["due_date"]
@@ -426,7 +445,7 @@ def _validate_synthesis(data: dict, people: dict[str, str], segment_ids: set[str
     for index, item in enumerate(_list(data, "person_summaries", MAX_ITEMS, "")):
         label = f"person summary {index} "
         _object(item, _SUMMARY_KEYS, f"person summary {index}")
-        person_id = _text(item, "person_id", MAX_ID, label)
+        person_id = _line(item, "person_id", MAX_ID, label)
         _text(item, "text", MAX_SUMMARY, label)
         if person_id not in people:
             raise _error(f"{label}{person_id} is not an actual participant")
@@ -471,7 +490,7 @@ def _validate_provenance(data: dict) -> None:
     if provenance["runtime_profile"] not in RUNTIME_PROFILES:
         raise _error("provenance runtime_profile must be offline or online")
     for key in ("stt_provider", "stt_model", "text_provider", "text_model", "agent_version"):
-        _text(provenance, key, MAX_NAME, "provenance ")
+        _line(provenance, key, MAX_NAME, "provenance ")
     _instant(provenance, "processed_at", "provenance ")
 
 
@@ -522,7 +541,7 @@ def _validate_payload(data) -> None:
     _pattern(data, "provider", _TOKEN, MAX_NAME)
     if data["provider_meeting_id"] != meeting_id:
         raise _error("provider_meeting_id must equal the occurrence_id meeting id")
-    _text(data, "title", MAX_TITLE)
+    _line(data, "title", MAX_TITLE)
     started = _instant(data, "started_at", whole_seconds=True)
     if started != occurrence_start:
         raise _error("started_at must equal the occurrence_id start")

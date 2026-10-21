@@ -74,6 +74,12 @@ The top-level key set is exact. A missing key and an unknown key are both
 rejected; optional structures are present-but-empty or explicitly `null`,
 never absent.
 
+Every string rejects DEL, the C1 range (U+0080–U+009F) and every C0 control
+except tab, line feed and carriage return. Single-line values (person ids,
+display names, `title`, project names, provenance model names) reject those
+three as well, and must not be `.` or `..`, because they become folder names
+and front matter.
+
 | Field | Type | Rules |
 |---|---|---|
 | `schema` | string | Exactly `teammem-meeting/v1`. |
