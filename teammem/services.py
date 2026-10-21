@@ -28,7 +28,8 @@ from .identity import IdentityMaps, _read
 from .meeting_bundles import occurrence_path_segment
 from .meeting_importer import (MeetingImportResult, import_meeting_inbox,
                                sync_source_cleanup_alerts)
-from .meeting_publish import PublishRefused, publish_meeting
+from .meeting_publish import (PublishRefused, _write_receipt, publish_meeting,
+                              revision_receipt_path)
 from .meeting_retention import RetentionResult, expire_meeting_audio
 from .meeting_store import list_meetings
 from .queries import report_context, week_label, week_monday
@@ -814,6 +815,25 @@ def meeting_receipt_path(cfg: Config, occurrence_id: str) -> Path:
     return cfg.meeting_receipts / f"{occurrence_path_segment(occurrence_id)}.json"
 
 
+def meeting_revision_receipt_path(cfg: Config, occurrence_id: str, revision: int) -> Path:
+    """One revision's own receipt, never replaced by a newer revision's."""
+    return revision_receipt_path(meeting_receipt_path(cfg, occurrence_id), revision)
+
+
+def _backfill_revision_receipt(cfg: Config, meeting: dict) -> None:
+    """A receipt published before per-revision receipts existed gets its
+    revision copy from the identical latest bytes, without republishing."""
+    latest = meeting_receipt_path(cfg, meeting["occurrence_id"])
+    own = meeting_revision_receipt_path(cfg, meeting["occurrence_id"],
+                                        meeting["current_revision"])
+    if own.exists():
+        return
+    try:
+        _write_receipt(own, latest.read_bytes())
+    except OSError:
+        pass                    # retried on the next run; the latest is unaffected
+
+
 def meeting_alert_path(cfg: Config, occurrence_id: str) -> Path:
     """The one operator-alert file for an occurrence, for retention warnings."""
     return cfg.meeting_alerts / f"{occurrence_path_segment(occurrence_id)}.json"
@@ -998,11 +1018,13 @@ def _execute_process_meetings(
         with (nullcontext() if dry_run else acquire_publication_lock(cfg.vault_dir)):
             # Refresh after acquiring: another publisher may have issued receipts
             # while this process imported or waited for the shared vault.
-            unpublished = [
-                meeting["occurrence_id"] for meeting in list_meetings(conn)
+            unpublished = []
+            for meeting in list_meetings(conn):
                 if not _receipt_is_current(
-                    meeting_receipt_path(cfg, meeting["occurrence_id"]), meeting)
-            ]
+                        meeting_receipt_path(cfg, meeting["occurrence_id"]), meeting):
+                    unpublished.append(meeting["occurrence_id"])
+                elif not dry_run:
+                    _backfill_revision_receipt(cfg, meeting)
             if dry_run:
                 return MeetingRunResult(imported=imported, pending=tuple(unpublished))
             for occurrence_id in unpublished:

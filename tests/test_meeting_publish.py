@@ -454,7 +454,11 @@ def test_a_crash_between_fsync_and_rename_leaves_no_receipt_at_all(bench, monkey
 
     assert caught.value.stage == "receipt"
     assert not receipt.exists()
-    assert list(receipt.parent.iterdir()) == []   # no staging file left behind
+    # The revision's own receipt is written first and is true on its own (the
+    # remote was verified); the latest pointer and every staging file are absent.
+    revision_dir = receipt.with_suffix("")
+    assert list(receipt.parent.iterdir()) == [revision_dir]
+    assert [p.suffix for p in revision_dir.iterdir()] == [".json"]
 
 
 def test_a_receipt_can_be_written_after_a_crashed_attempt(bench, monkeypatch):

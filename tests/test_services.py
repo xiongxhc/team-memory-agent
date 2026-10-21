@@ -1461,3 +1461,50 @@ def test_overlapping_meeting_runs_are_serialized_and_the_second_exits_cleanly(
     assert codes == [0]
     assert bench.receipt(payload["occurrence_id"]).exists()
     assert bench.run() == 0
+
+
+def test_each_published_revision_keeps_its_own_receipt(bench):
+    """A newer revision replaces the occurrence's latest receipt, which Meeting
+    Agent reads, but the older revision's own receipt survives beside it, so a
+    consumer still waiting on that revision can match it exactly."""
+    from teammem.services import meeting_revision_receipt_path
+
+    first = _payload()
+    bench.drop(first)
+    assert bench.run() == 0
+    occurrence_id = first["occurrence_id"]
+    first_bytes = bench.receipt(occurrence_id).read_bytes()
+    rev1 = meeting_revision_receipt_path(bench.cfg, occurrence_id, first["revision"])
+    assert rev1.read_bytes() == first_bytes
+
+    second = {**first, "revision": first["revision"] + 1,
+              "title": first["title"] + " (corrected)"}
+    bench.drop(second)
+    assert bench.run() == 0
+
+    latest = json.loads(bench.receipt(occurrence_id).read_text())
+    assert latest["revision"] == second["revision"]
+    rev2 = meeting_revision_receipt_path(bench.cfg, occurrence_id, second["revision"])
+    assert rev2.read_bytes() == bench.receipt(occurrence_id).read_bytes()
+    assert rev1.read_bytes() == first_bytes
+    assert json.loads(rev1.read_text())["revision"] == first["revision"]
+
+
+def test_a_receipt_published_before_per_revision_receipts_is_backfilled_without_republishing(
+    bench, monkeypatch
+):
+    from teammem.services import meeting_revision_receipt_path
+
+    payload = _payload()
+    bench.drop(payload)
+    assert bench.run() == 0
+    occurrence_id = payload["occurrence_id"]
+    revision_file = meeting_revision_receipt_path(bench.cfg, occurrence_id, payload["revision"])
+    revision_file.unlink()
+
+    calls = []
+    monkeypatch.setattr(services_module, "publish_meeting",
+                        lambda *a, **kw: calls.append(kw["occurrence_id"]))
+    assert bench.run() == 0
+    assert calls == []
+    assert revision_file.read_bytes() == bench.receipt(occurrence_id).read_bytes()

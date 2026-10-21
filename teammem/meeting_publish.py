@@ -106,6 +106,16 @@ def _refuse_on_findings(findings: list[dict]) -> None:
             tuple(sorted({f["invariant"] for f in findings})))
 
 
+def revision_receipt_path(receipt_path: Path, revision: int) -> Path:
+    """`<receipts>/<segment>/<revision>.json` beside `<receipts>/<segment>.json`.
+
+    The per-occurrence file is the latest publication and is replaced by a newer
+    revision; the per-revision file is never replaced by another revision, so a
+    consumer still waiting on an older revision can match it exactly.
+    """
+    return receipt_path.with_suffix("") / f"{revision}.json"
+
+
 def _write_receipt(path: Path, blob: bytes) -> None:
     """Stage beside the destination, fsync, rename. A crash before the rename
     leaves no receipt and no leftovers."""
@@ -215,7 +225,11 @@ def _publish_meeting(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Pat
         "markdown_url": blob_url(base, commit, rel),
     }
     try:
-        _write_receipt(receipt_path, receipt_bytes(receipt))
+        # The revision's own receipt first: the latest pointer never names a
+        # revision whose own receipt is missing.
+        blob = receipt_bytes(receipt)
+        _write_receipt(revision_receipt_path(receipt_path, meeting["revision"]), blob)
+        _write_receipt(receipt_path, blob)
     except OSError as error:
         raise PublishRefused(
             "receipt", f"the receipt could not be written: {error}") from error

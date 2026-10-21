@@ -421,6 +421,12 @@ at any step. A receipt therefore means the note is published: rendered locally
 and committed locally are not receipts, and a failed publication writes no receipt
 for that occurrence.
 
+Each published revision gets its own receipt at
+`<receipts>/<occurrence-segment>/<revision>.json`, which a newer revision never
+replaces, and the same bytes at `<receipts>/<occurrence-segment>.json`, which
+always names the latest published revision. The revision file is written first,
+so the latest file never names a revision whose own receipt is missing.
+
 One real run at a time processes meetings: it holds a lock beside the ledger
 (`ledger.db.meetings.lock` for `ledger.db`) from import through receipts. A run
 that finds the lock held, such as a manual run during a timer run, touches

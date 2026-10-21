@@ -163,7 +163,7 @@ def test_direct_publisher_holds_lock_through_push_and_receipt(tmp_path, monkeypa
             conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY,
             occurrence_id=OCCURRENCE, receipt_path=tmp_path / "receipt.json",
             web_base=WEB_BASE)
-        assert seen == ["push", "receipt"]
+        assert seen == ["push", "receipt", "receipt"]   # the revision receipt, then the latest
         assert _remote_ref(bare, branch) == output["vault_commit"]
     finally:
         conn.close()
