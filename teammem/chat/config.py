@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ..links import load_link_origins
 
 class ChatConfigError(ValueError):
     """Raised when the chat configuration is incomplete or unsafe."""
@@ -244,6 +245,11 @@ def load_chat_config(path: Path) -> ChatConfig:
     enabled = _boolean(document["enabled"], "enabled")
     sections = {name: _object(document[name], name) for name in _SECTIONS}
     retrieval = _validate_retrieval(sections["retrieval"])
+    paths = _validate_paths(sections['paths'])
+    try:
+        load_link_origins(paths['source_config_dir'])
+    except (OSError, ValueError) as exc:
+        raise ChatConfigError('cannot load link origin configuration') from exc
     if 'vault' in document and retrieval['max_snippets'] < 2:
         raise ChatConfigError('vault retrieval requires at least two snippets for vault and original evidence')
     return ChatConfig(
@@ -255,7 +261,7 @@ def load_chat_config(path: Path) -> ChatConfig:
         retrieval=retrieval,
         attachments=_validate_attachments(sections["attachments"]),
         access=_validate_access(sections["access"]),
-        paths=_validate_paths(sections["paths"]),
+        paths=paths,
         vault=None if 'vault' not in document else _validate_vault(_object(document['vault'], 'vault')),
         context=(MappingProxyType({"timezone": "UTC", "user_people": MappingProxyType({})})
                  if "context" not in document

@@ -225,3 +225,12 @@ def test_accepts_expanded_output_allowance_but_rejects_more(tmp_path):
     assert config.model['max_output_tokens'] == 3000
     with pytest.raises(ChatConfigError):
         load_chat_config(_write(tmp_path, lambda doc: doc['model'].update(max_output_tokens=3001)))
+
+
+def test_rejects_invalid_link_origins_before_startup(tmp_path):
+    (tmp_path / 'link-origins.yaml').write_text(
+        'origins:\n  https://old.example: https://user:secret@new.example\n'
+    )
+    path = _write(tmp_path, lambda doc: doc['paths'].update(source_config_dir=str(tmp_path)))
+    with pytest.raises(ChatConfigError, match='link'):
+        load_chat_config(path)

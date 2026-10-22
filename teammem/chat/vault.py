@@ -12,6 +12,7 @@ from urllib.parse import quote
 import yaml
 
 from ..identity import IdentityMaps
+from ..links import load_link_origins, rewrite_links
 from ..queries import week_label, week_monday
 from ..render import _fname, _project_fname
 from ..summarize import prepare_daily_journal
@@ -196,6 +197,7 @@ def _daily_evidence(
 ) -> list[tuple[tuple[int, int, int], Evidence]]:
     try:
         identities = IdentityMaps.load(source_config_dir)
+        origins = load_link_origins(source_config_dir)
     except (OSError, TypeError, ValueError):
         return []
     if person not in identities.slugs():
@@ -246,7 +248,8 @@ def _daily_evidence(
                 or generated is None or not _DATE.fullmatch(generated)):
             continue
         section = _daily_section(body, day)
-        if section is None or section != stored["text"].strip():
+        original = stored["text"].strip()
+        if section is None or section not in {original, rewrite_links(original, origins)}:
             continue
         score = _matches(
             section, text,

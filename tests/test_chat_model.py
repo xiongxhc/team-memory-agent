@@ -638,3 +638,22 @@ def test_vault_citation_and_dated_coverage_are_distinct_from_original_sources():
     assert 'source_kind' in str(transport.payloads[-1])
     assert evidence.coverage in str(transport.payloads[-1])
     assert used[0].projects == frozenset({'alpha','beta'})
+
+
+def test_rewrites_answer_and_citations_without_changing_evidence(tmp_path):
+    (tmp_path / 'link-origins.yaml').write_text(
+        'origins:\n  https://old.example: https://192.0.2.10\n'
+    )
+    config = {'model': CONFIG, 'paths': {'source_config_dir': tmp_path}}
+    original = 'https://old.example/team/repo/-/commit/abc?view=1#note_42'
+    evidence = Evidence('commit:abc', 'alpha', '2026-09-15', 'release', original)
+    transport = Transport(function(), completed(
+        f'Release: [commit]({original}) [E1]. External: https://other.example/page'
+    ))
+    text, used = answer(config, [Turn('user', 'alice', 'release?', frozenset())],
+                        lambda query: [evidence], transport)
+    expected = 'https://192.0.2.10/team/repo/-/commit/abc?view=1#note_42'
+    assert text.count(expected) == 2
+    assert 'https://old.example' not in text
+    assert 'https://other.example/page' in text
+    assert used == [evidence] and evidence.url == original

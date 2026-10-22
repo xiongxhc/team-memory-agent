@@ -33,6 +33,20 @@ when its exact text and synthesis input match the ledger and every contributing
 project remains authorized for detailed access. Hidden, count-only and
 unclassified evidence is never upgraded to prose through the vault.
 
+Operators can make source links reachable without changing stored evidence by
+placing `link-origins.yaml` in `paths.source_config_dir`:
+
+```yaml
+origins:
+  https://legacy.example: https://192.0.2.10
+```
+
+Only exact configured HTTP(S) origins are replaced in final answer text and
+citations; paths, queries, fragments, and unrelated hosts remain unchanged.
+Use the same mapping for the hub renderer. Verified daily journals may contain
+the original text or that exact presentation rewrite; synthesis hashes and
+project authorization checks still apply. Invalid mappings stop chat startup.
+
 Replies adapt to the question: simple updates stay brief; architecture explanations
 include the necessary components, interactions, boundaries, and evidence. There is
 no fixed word target. Short paragraphs, compact labels, and bullets keep longer

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from ..links import load_link_origins, rewrite_links
 from .state import Evidence
 from .retrieval import RetrievalTimeoutError
 
@@ -373,6 +374,8 @@ def answer(config, turns, search, transport, *, attachments=(), team_context=Non
            cancel_event=None, deadline=None):
     """Return final text and ALL supplied ledger evidence, for conservative grant rechecks."""
     model = _model_config(config)
+    paths = config.get('paths', {}) if isinstance(config, Mapping) else config.paths
+    origins = load_link_origins(paths['source_config_dir']) if paths.get('source_config_dir') else {}
     deadline = deadline or time.monotonic() + 90
     budget = _input_budget(model)
     overhead = _bytes(_policy(config)) + _bytes(_TOOL) + 256
@@ -539,5 +542,5 @@ def answer(config, turns, search, transport, *, attachments=(), team_context=Non
             text += "\n\nPartial file coverage: " + "; ".join(notes[:8])
             if len(notes) > 8:
                 text += f"; {len(notes)-8} further omissions."
-        return text, supplied
+        return rewrite_links(text, origins), supplied
     raise ModelError("The answer reached its request limit. Please narrow your question.")

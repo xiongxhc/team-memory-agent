@@ -311,3 +311,22 @@ def test_symlinks_path_escapes_and_unknown_files_are_never_searched(tmp_path):
         db, source, vault, {"alpha": "detail"}, {"alpha"},
         {"text": "sentinel", "project": "alpha"},
     ) == []
+
+
+def test_accepts_only_exact_origin_rewritten_daily_text(tmp_path):
+    original = 'Alice shipped release https://old.example/alpha/-/commit/abc#note_1'
+    db, source, vault = _daily(tmp_path, text=original)
+    (source / 'link-origins.yaml').write_text(
+        'origins:\n  https://old.example: https://192.0.2.10\n'
+    )
+    page = vault['root'] / 'Person/Alice Example/Week 2026-09-14-18.md'
+    page.write_text(page.read_text().replace('https://old.example', 'https://192.0.2.10'))
+    before = db.read_bytes()
+    found = _search(db, source, vault, {'alpha': 'detail'}, {'alpha'},
+                    {'text': 'release', 'person': 'alice'})
+    assert len(found) == 1
+    assert found[0].text == original.replace('https://old.example', 'https://192.0.2.10')
+    assert db.read_bytes() == before
+    page.write_text(page.read_text().replace('shipped release', 'invented release'))
+    assert not _search(db, source, vault, {'alpha': 'detail'}, {'alpha'},
+                       {'text': 'release', 'person': 'alice'})
