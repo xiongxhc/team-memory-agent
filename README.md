@@ -21,10 +21,13 @@ Projects/
 `Projects/README.md` is the current activity index. Each project README is a
 compact latest-week snapshot and complete history index; its weekly files hold
 project-filtered evidence grouped by contributor. Project history covers every
-event-bearing ledger week. Weeks outside the rendered Work Journal window do
-not link to a missing team report, and future-dated activity is explicitly
-flagged for timestamp review. Generated paths are deterministic and portable
-across supported operating systems.
+event-bearing ledger week. `Work Journal/` retains every saved weekly team report
+through the current week, alongside the recent activity window (four weeks by
+default). Older saved reports keep their narrative and provenance across renders;
+rendering does not synthesize reports for older raw-only weeks. Person, project,
+and area weeks link to team reports when available. Future-dated activity is
+explicitly flagged for timestamp review. Generated paths are deterministic and
+portable across supported operating systems.
 
 The privacy boundary is simple: MemberKit prepares a JSON bundle locally, the
 member reviews it, and nothing is transmitted until that member explicitly runs

@@ -373,9 +373,20 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     weeks = max(1, weeks)
     channel_names = channel_names or {}
     mondays = [week_monday(today) - timedelta(weeks=i) for i in range(weeks)]
+    # Keep saved reports after they leave the recent activity window. Raw-only
+    # older weeks remain in Person/Projects/Areas without inventing team reports.
+    report_mondays = {
+        date.fromisoformat(key.removeprefix("team|"))
+        for (key,) in conn.execute(
+            "SELECT key FROM summaries WHERE kind = 'weekly-team' AND key LIKE 'team|%'"
+        )
+    }
+    journal_mondays = sorted(
+        set(mondays) | {m for m in report_mondays if m <= mondays[0]}, reverse=True
+    )
     weekly_summaries = {
         m: get_summary(conn, "weekly-team", f"team|{m.isoformat()}")
-        for m in mondays
+        for m in journal_mondays
     }
     stored_flags = {
         m: _stored_effective_flags(summary)
@@ -399,8 +410,8 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         written.add(path)
         path.write_text(content)
 
-    week_of = {m: events_between(conn, *week_range(m)) for m in mondays}
-    # Person pages retain full history, while team reports use the render window.
+    week_of = {m: events_between(conn, *week_range(m)) for m in journal_mondays}
+    # Person pages retain full event history, including weeks without saved reports.
     min_ts = conn.execute("SELECT min(ts) FROM events").fetchone()[0]
     hist_mondays = list(mondays)
     if min_ts:
@@ -414,6 +425,10 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     hist_rows = [r for rows in hist_week_of.values() for r in rows]
     rendered_people = {
         r["person"] for r in hist_rows if not r["person"].startswith("_unmapped/")
+    }
+    rendered_projects = set(ids.project_slugs()) | set(ids.area_slugs()) | {
+        project for (project,) in conn.execute("SELECT DISTINCT project FROM events")
+        if project and project != "(no project)"
     }
     files = 0
 
@@ -447,7 +462,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         return out
 
     # ---- Work Journal: one report per rendered week -------------------------
-    for m in mondays:
+    for m in journal_mondays:
         rows, label = week_of[m], week_label(m)
         weekly_summary = weekly_summaries[m]
         report = weekly_summary.text if weekly_summary else None
@@ -513,7 +528,9 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         for proj, slug, share in (
             [] if coverage_state == "provisional" else f.get("concentration", [])
         ):
-            flags_md.append(f"- **Concentration**: {_project_link(proj, ids)} — {int(share * 100)}% by "
+            project = (_project_link(proj, ids) if proj in rendered_projects
+                       else _markdown_text(proj))
+            flags_md.append(f"- **Concentration**: {project} — {int(share * 100)}% by "
                       f"{_flag_person_link(slug)}\n")
         if provenance_incomplete:
             flags_md.append(
@@ -541,7 +558,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     # render, so window-scoped week files would silently delete older weeks
     # from the vault. README.md is the per-person index — the forge web UI
     # auto-renders it when the folder is opened.
-    all_rows = [r for rows in week_of.values() for r in rows]
+    all_rows = [r for m in mondays for r in week_of[m]]
 
     def _person_week_body(person: str, mine: list[dict]) -> list[str]:
         body = []
@@ -956,7 +973,8 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     (vault_dir / "README.md").write_text(
         f"# Team Vault\n\nGENERATED — do not edit Person/, Projects/, Areas/, or "
         f"Work Journal/ by hand; every render regenerates them from the ledger.\n\n"
-        f"- generated: {today.isoformat()}\n- weeks rendered: {weeks}\n"
+        f"- generated: {today.isoformat()}\n- recent weeks: {weeks}\n"
+        f"- journal weeks retained: {len(journal_mondays)}\n"
         f"- events in window: {len(all_rows)}\n"
         f"- current: [{label}](Work%20Journal/{quote(label)}.md)\n")
     return {"files": files + 1, "week_label": label}

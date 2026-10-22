@@ -1,7 +1,9 @@
 import json
+import re
 import subprocess
 from datetime import date
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -212,10 +214,11 @@ def _store_weekly_summary(
     text: str,
     coverage_state: str | None = None,
     effective_flags: dict | None = None,
+    monday: str = "2026-07-13",
 ) -> None:
     put_summary(conn, SummaryRecord(
         "weekly-team",
-        "team|2026-07-13",
+        f"team|{monday}",
         "weekly-hash",
         text,
         "fake",
@@ -229,6 +232,77 @@ def _store_weekly_summary(
             if effective_flags is not None else None
         ),
     ))
+
+
+@pytest.mark.parametrize("weeks", [1, 4])
+@pytest.mark.parametrize("with_events", [False, True])
+def test_saved_journal_history_survives_render_window(tmp_path, weeks, with_events):
+    conn = _seed(tmp_path)
+    if with_events:
+        insert_events(conn, [Event(
+            person="alex", ts="2026-05-05T09:00:00+04:00", source="gitlab",
+            kind="commit", summary="archived work", hash="archived-work",
+            project="project-alpha",
+        ), Event(
+            person="alex", ts="2026-05-05T10:00:00+04:00", source="memberkit",
+            kind="journal-highlight", summary="archived coordination", hash="archived-area",
+            project="coordination",
+        )])
+    narrative = "> Friday checkpoint — saved evidence cutoff.\n\n## Shipped\n- Saved report."
+    _store_weekly_summary(
+        conn, monday="2026-05-04", text=narrative,
+        coverage_state="friday-checkpoint",
+        effective_flags={"gaps": ["departed"],
+                         "concentration": [["retired-project", "departed", 0.9]]},
+    )
+    _store_weekly_summary(conn, monday="2026-09-07", text="future report")
+    stored = conn.execute("SELECT * FROM summaries ORDER BY kind, key").fetchall()
+    ids = IdentityMaps.load(CONFIG_DIR)
+    vault = tmp_path / "vault"
+
+    for today in (TODAY, date(2026, 8, 13)):
+        render_vault(conn, ids, vault, today, weeks=weeks)
+        report = (vault / "Work Journal" / "Week 2026-05-04-08.md").read_text()
+        assert narrative in report
+        assert "**Gap**: departed" in report
+        assert "**Concentration**: retired-project — 90% by departed" in report
+        assert ("archived work" in report) is with_events
+        assert not (vault / "Work Journal" / "Week 2026-09-07-11.md").exists()
+        assert not (vault / "Work Journal" / "Week 2026-05-11-15.md").exists()
+        assert len(list((vault / "Work Journal").glob("*.md"))) == weeks + 1
+        expected_events = (3 if weeks == 1 else 4) if today == TODAY else 0
+        assert f"- events in window: {expected_events}" in (vault / "README.md").read_text()
+        if with_events:
+            for relative in ("Person/Alex Rivera", "Projects/project-alpha", "Areas/coordination"):
+                page = (vault / relative / "Week 2026-05-04-08.md").read_text()
+                assert "../../Work%20Journal/Week%202026-05-04-08.md" in page
+        for page in vault.rglob("*.md"):
+            for target in re.findall(r"\]\(([^)]+)\)", page.read_text()):
+                if ":" not in target:
+                    assert (page.parent / unquote(target)).is_file(), (page, target)
+        assert verify_vault(conn, ids, vault, today, weeks=weeks) == {
+            "missing": [], "unexpected": [], "differing": [],
+        }
+        assert conn.execute("SELECT * FROM summaries ORDER BY kind, key").fetchall() == stored
+
+
+def test_invalid_archived_report_flags_preserve_managed_vault(tmp_path):
+    conn = _seed(tmp_path)
+    _store_weekly_summary(
+        conn, monday="2026-05-04", text="Saved report",
+        coverage_state="friday-checkpoint", effective_flags={},
+    )
+    conn.execute(
+        "UPDATE summaries SET effective_flags_json = 'invalid' WHERE key = 'team|2026-05-04'"
+    )
+    conn.commit()
+    vault = tmp_path / "vault"
+    before = _managed_vault_bytes(vault)
+
+    with pytest.raises(ValueError, match="invalid weekly report effective flags provenance"):
+        render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY)
+
+    assert {relative: (vault / relative).read_bytes() for relative in before} == before
 
 
 def test_person_page_shows_day_entries_with_detail_demoted(tmp_path):
