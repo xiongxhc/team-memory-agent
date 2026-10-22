@@ -13,11 +13,13 @@ import shutil
 import sqlite3
 import tempfile
 import unicodedata
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 from .identity import IdentityMaps
+from .links import rewrite_links, validate_link_origins
 from .queries import (by_key, events_between, flags, ref_url,
                       week_label, week_monday, week_range)
 from .store import get_summary, weekly_commit_counts
@@ -369,7 +371,9 @@ def _validate_flag_entries(
 
 def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                  today: date, weeks: int = 4,
-                 channel_names: dict | None = None) -> dict:
+                 channel_names: dict | None = None,
+                 link_origins: Mapping[str, str] | None = None) -> dict:
+    link_origins = validate_link_origins(link_origins if link_origins is not None else {})
     weeks = max(1, weeks)
     channel_names = channel_names or {}
     mondays = [week_monday(today) - timedelta(weeks=i) for i in range(weeks)]
@@ -408,7 +412,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         if path in written:
             raise ValueError(f"filename collision in vault render: {path}")
         written.add(path)
-        path.write_text(content)
+        path.write_text(rewrite_links(content, link_origins))
 
     week_of = {m: events_between(conn, *week_range(m)) for m in journal_mondays}
     # Person pages retain full event history, including weeks without saved reports.
@@ -970,7 +974,7 @@ def render_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
     _render_index("Areas", area_weeks)
 
     label = week_label(mondays[0])
-    (vault_dir / "README.md").write_text(
+    _write(vault_dir / "README.md",
         f"# Team Vault\n\nGENERATED — do not edit Person/, Projects/, Areas/, or "
         f"Work Journal/ by hand; every render regenerates them from the ledger.\n\n"
         f"- generated: {today.isoformat()}\n- recent weeks: {weeks}\n"
@@ -994,7 +998,8 @@ def _managed_files(root: Path) -> set[str]:
 
 def verify_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
                  today: date, weeks: int = 4,
-                 channel_names: dict | None = None) -> dict:
+                 channel_names: dict | None = None,
+                 link_origins: Mapping[str, str] | None = None) -> dict:
     """Re-render into a temp tree and diff managed paths against vault_dir.
     Never writes to vault_dir; detects hand-edits under managed paths and
     renderer nondeterminism."""
@@ -1004,7 +1009,7 @@ def verify_vault(conn: sqlite3.Connection, ids: IdentityMaps, vault_dir: Path,
         if docs_dir.is_dir():
             shutil.copytree(docs_dir, expected_dir / "Docs", symlinks=True)
         render_vault(conn, ids, expected_dir, today, weeks=weeks,
-                     channel_names=channel_names)
+                     channel_names=channel_names, link_origins=link_origins)
         expected, actual = _managed_files(expected_dir), _managed_files(vault_dir)
         return {
             "missing": sorted(expected - actual),

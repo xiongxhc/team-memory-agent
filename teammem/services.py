@@ -21,6 +21,7 @@ from .connectors.registry import get_connector
 from .docs_sync import sync_docs
 from .events import Event
 from .identity import IdentityMaps, _read
+from .links import load_link_origins
 from .queries import report_context, week_label, week_monday
 from .reclaim import reclaim, reclaim_channel_projects
 from .render import render_vault, verify_vault
@@ -299,6 +300,7 @@ def run_docs_sync(cfg: Config) -> int:
         _read(cfg.config_dir, "projects"),
         cfg.obsidian_projects,
         cfg.vault_dir,
+        link_origins=load_link_origins(cfg.config_dir),
     )
     print(
         f"docs-sync: {out['copied']} files updated"
@@ -328,6 +330,7 @@ def run_render(
             f" weeks={weeks})"
         )
         return 0
+    link_origins = load_link_origins(cfg.config_dir)
     connection = conn or open_db(cfg.db_path)
     names_file = cfg.config_dir / "channel_names.json"
     channel_names = json.loads(names_file.read_text()) if names_file.exists() else {}
@@ -335,6 +338,7 @@ def run_render(
         out = verify_vault(
             connection, ids, cfg.vault_dir, today,
             weeks=weeks, channel_names=channel_names,
+            link_origins=link_origins,
         )
         drift = [(label, path)
                  for label, paths in (("MISSING", out["missing"]),
@@ -357,6 +361,7 @@ def run_render(
         today,
         weeks=weeks,
         channel_names=channel_names,
+        link_origins=link_origins,
     )
     committed = commit_all(
         cfg.vault_dir,

@@ -6,7 +6,10 @@ Folder matching: an explicit `obsidian:` key in projects.yaml wins, else a
 case/punctuation-insensitive name match against the Obsidian folder name."""
 
 import re
+from collections.abc import Mapping
 from pathlib import Path
+
+from .links import rewrite_links, validate_link_origins
 
 # Source vaults may use capitalized (Architecture.md) or lowercase names; try
 # capitalized first, fall back to lowercase. Destinations are always lowercase —
@@ -35,7 +38,9 @@ def match_folders(projects: dict, obsidian_dir: Path) -> dict[str, Path]:
     return out
 
 
-def sync_docs(projects: dict, obsidian_dir: Path, vault_dir: Path) -> dict:
+def sync_docs(projects: dict, obsidian_dir: Path, vault_dir: Path,
+              *, link_origins: Mapping[str, str] | None = None) -> dict:
+    link_origins = validate_link_origins(link_origins if link_origins is not None else {})
     matched = match_folders(projects, obsidian_dir)
     copied = 0
     for slug, folder in sorted(matched.items()):
@@ -45,7 +50,7 @@ def sync_docs(projects: dict, obsidian_dir: Path, vault_dir: Path) -> dict:
                 src = folder / name.lower()
                 if not src.is_file():
                     continue
-            text = flatten_wikilinks(src.read_text())
+            text = rewrite_links(flatten_wikilinks(src.read_text()), link_origins)
             dst = vault_dir / "Docs" / slug / name.lower()
             if dst.is_file() and dst.read_text() == text:
                 continue

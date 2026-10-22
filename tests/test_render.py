@@ -305,6 +305,48 @@ def test_invalid_archived_report_flags_preserve_managed_vault(tmp_path):
     assert {relative: (vault / relative).read_bytes() for relative in before} == before
 
 
+def test_render_rewrites_reference_and_saved_report_links_without_changing_ledger(tmp_path):
+    conn = _seed(tmp_path)
+    old = "https://forge.old.example:8443"
+    new = "https://forge.example:9443"
+    url = f"{old}/group/project/-/commit/abc?view=1#diff"
+    conn.execute("UPDATE events SET refs = ?, summary = ? WHERE hash = 'a1'",
+                 (json.dumps({"url": url}), f"See {url}"))
+    conn.commit()
+    _store_weekly_summary(conn, monday="2026-05-04", text=f"## Shipped\n- [saved]({url})")
+    before = (tmp_path / "l.db").read_bytes()
+    ids = IdentityMaps.load(CONFIG_DIR)
+    vault = tmp_path / "vault"
+
+    render_vault(conn, ids, vault, TODAY, link_origins={old: new})
+
+    for relative in (
+        "Work Journal/Week 2026-05-04-08.md",
+        "Work Journal/Week 2026-07-13-17.md",
+        "Person/Alex Rivera/Week 2026-07-13-17.md",
+        "Projects/project-alpha/Week 2026-07-13-17.md",
+    ):
+        content = (vault / relative).read_text()
+        assert old not in content
+        assert url.replace(old, new) in content
+    assert verify_vault(conn, ids, vault, TODAY, link_origins={old: new}) == {
+        "missing": [], "unexpected": [], "differing": [],
+    }
+    assert (tmp_path / "l.db").read_bytes() == before
+
+
+def test_invalid_link_mapping_preserves_managed_vault(tmp_path):
+    conn = _seed(tmp_path)
+    vault = tmp_path / "vault"
+    before = _managed_vault_bytes(vault)
+
+    with pytest.raises(ValueError, match="link origins"):
+        render_vault(conn, IdentityMaps.load(CONFIG_DIR), vault, TODAY,
+                     link_origins={"https://old.example/path": "https://new.example"})
+
+    assert {relative: (vault / relative).read_bytes() for relative in before} == before
+
+
 def test_person_page_shows_day_entries_with_detail_demoted(tmp_path):
     conn = _seed(tmp_path)
     _seed_summaries(conn)

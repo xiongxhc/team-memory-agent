@@ -29,3 +29,23 @@ def test_sync_obsidian_override_and_idempotent(tmp_path):
     assert sync_docs(projects, src, vault)["copied"] == 1
     assert (vault / "Docs" / "smart-example" / "summary.md").exists()
     assert sync_docs(projects, src, vault) == {"projects": 1, "copied": 0}
+
+
+def test_sync_rewrites_published_links_without_changing_source_or_hash_provenance(tmp_path):
+    vault = tmp_path / "vault"
+    projects = {"projects": {"award": {}}}
+    src = _obsidian(tmp_path)
+    source = src / "Award" / "Architecture.md"
+    source.write_text(
+        "---\nsource_sha256: abc123\n---\n"
+        "See [[Award]] and [design](https://forge.old.example/repo?view=1#design).\n"
+    )
+    before = source.read_bytes()
+    origins = {"https://forge.old.example": "https://forge.example"}
+
+    assert sync_docs(projects, src, vault, link_origins=origins) == {"projects": 1, "copied": 1}
+    published = (vault / "Docs" / "award" / "architecture.md").read_text()
+    assert "https://forge.example/repo?view=1#design" in published
+    assert "source_sha256: abc123" in published
+    assert source.read_bytes() == before
+    assert sync_docs(projects, src, vault, link_origins=origins) == {"projects": 1, "copied": 0}

@@ -4,6 +4,8 @@ import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pytest
+
 import teammem.services as services_module
 from teammem.config import Config
 from teammem.events import Event
@@ -908,6 +910,67 @@ def test_render_service_verify_reports_clean_then_drift(tmp_path, capsys):
     assert run_render(cfg, ids, today=date(2026, 7, 16), verify=True) == 1
     out = capsys.readouterr().out
     assert "DIFFERS README.md" in out
+
+
+def test_render_service_loads_origin_mapping_for_render_and_verify(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "link-origins.yaml").write_text(
+        "origins:\n  https://forge.old.example: https://forge.example\n"
+    )
+    cfg = _cfg(tmp_path, TEAMMEM_CONFIG_DIR=str(config_dir))
+    _seed(cfg)
+    conn = open_db(cfg.db_path)
+    conn.execute("UPDATE events SET refs = ?",
+                 (json.dumps({"url": "https://forge.old.example/repo/commit/abc"}),))
+    conn.commit()
+    before = cfg.db_path.read_bytes()
+    ids = IdentityMaps.load(CONFIG_DIR)
+
+    assert run_render(cfg, ids, today=date(2026, 7, 16), conn=conn) == 0
+    page = cfg.vault_dir / "Work Journal" / "Week 2026-07-13-17.md"
+    assert "https://forge.example/repo/commit/abc" in page.read_text()
+    assert run_render(cfg, ids, today=date(2026, 7, 16), conn=conn, verify=True) == 0
+    assert cfg.db_path.read_bytes() == before
+
+
+def test_invalid_origin_config_fails_before_render_changes_vault(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "link-origins.yaml").write_text(
+        "origins:\n  https://old.example: https://new.example/path\n"
+    )
+    cfg = _cfg(tmp_path, TEAMMEM_CONFIG_DIR=str(config_dir))
+    _seed(cfg)
+    journal = cfg.vault_dir / "Work Journal" / "existing.md"
+    journal.parent.mkdir(parents=True)
+    journal.write_text("keep historical report")
+
+    with pytest.raises(ValueError, match="link origins"):
+        run_render(cfg, IdentityMaps.load(CONFIG_DIR), today=date(2026, 7, 16))
+
+    assert journal.read_text() == "keep historical report"
+    assert not (cfg.vault_dir / ".git").exists()
+
+
+def test_docs_sync_service_loads_presentation_mapping(tmp_path):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "projects.yaml").write_text("projects:\n  example: {}\n")
+    (config_dir / "link-origins.yaml").write_text(
+        "origins:\n  https://old.example: https://new.example\n"
+    )
+    source = tmp_path / "source"
+    (source / "Example").mkdir(parents=True)
+    (source / "Example" / "summary.md").write_text("[repo](https://old.example/repo)")
+    cfg = _cfg(tmp_path, TEAMMEM_CONFIG_DIR=str(config_dir),
+               TEAMMEM_OBSIDIAN_PROJECTS=str(source))
+
+    assert run_docs_sync(cfg) == 0
+
+    assert (cfg.vault_dir / "Docs" / "example" / "summary.md").read_text() == (
+        "[repo](https://new.example/repo)"
+    )
 
 
 def test_render_service_verify_rejects_push_and_dry_run(tmp_path, capsys):

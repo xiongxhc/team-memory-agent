@@ -113,6 +113,37 @@ endpoint, which remains `TEAMMEM_GITLAB_URL`. Reclaim updates only the
 `events.project` field; dry runs write nothing and repeated runs are
 idempotent.
 
+## Published link origins
+
+When stored evidence refers to a former service address, create the optional
+`link-origins.yaml` in `TEAMMEM_CONFIG_DIR` to publish links through a reachable
+address:
+
+```yaml
+origins:
+  https://forge.old.example: https://forge.example
+  http://forge.old.example:8080: https://forge.example
+```
+
+This mapping affects generated vault text and mirrored `Docs/` text only.
+Events, references, stored summaries, their hashes, and source documentation stay
+unchanged. The renderer applies the mapping after composing each page, including
+saved historical reports; `teammem render --verify` uses the same mapping.
+`teammem docs-sync` applies it while copying source documentation, without
+changing source files or embedded source-hash provenance. Run docs sync again to
+refresh existing mirrored files, then render and verify the vault.
+
+Both sides must be HTTP or HTTPS origins without credentials, paths, queries,
+or fragments; a trailing slash is allowed. Origin matching ignores scheme and
+hostname case but requires the configured explicit port, if any. Paths, queries,
+and fragments are preserved. Unlisted origins and lookalike hostnames remain
+unchanged. Map each old origin directly to its final destination: chains and
+cycles are rejected so repeated rendering is stable. Invalid configuration fails
+before managed vault cleanup. Without this file, links keep their stored values.
+
+This is independent of GitLab `reclaim_origins`, which controls attribution
+trust. No trusted origin is automatically used as a publication rewrite.
+
 ## Run and inspect locally
 
 Keep secrets in the protected environment file and paths in absolute form. Check
