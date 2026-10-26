@@ -323,6 +323,11 @@ sandbox, a credential-scrubbed environment, and a structured text envelope.
 Cache hits require the configured model, so a provider switch never silently
 returns a summary produced by the other model. Start a Codex trial with
 `TEAMMEM_LLM_CONCURRENCY=1` and raise it only after observing account capacity.
+Transient Codex HTTP 429 failures get at most two retries, with 60- and
+120-second delays plus up to five seconds of jitter. Exhausting that budget
+defers remaining calls through the same backend until a later run. Explicit
+quota limits, authentication failures, timeouts, and invalid output are not
+retried. CLI diagnostics prioritize the terminal error over startup warnings.
 
 For an operator-managed intraday trigger, use the capture mode:
 
@@ -342,7 +347,7 @@ Journal synthesis defaults to two concurrent LLM calls. Set
 `TEAMMEM_LLM_CONCURRENCY` to an integer from `1` through `8` (`1` restores serial
 calls). The runtime optimization preserves the complete ordered text of every
 person-day slice. It adds no ranking, event cap, truncation, cross-person
-batching, retry loop, compaction, or model change.
+batching, compaction, or model change.
 
 For historical late arrivals and mapping corrections, opt in after reviewing and
 repairing existing journals. Set `TEAMMEM_RECONCILE_FROM=YYYY-MM-DD` to the first

@@ -2,11 +2,15 @@
 LLM callable. Daily and weekly cache versions evolve independently."""
 
 import json
+import logging
 import os
+import random
 import re
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -147,10 +151,33 @@ def http_llm(model: str, api_key: str, max_tokens: int) -> LLM:
     return llm
 
 
+def _codex_error_message(stream: str) -> str | None:
+    """Prefer a terminal failure over startup-warning events in Codex NDJSON."""
+    selected, priority = None, 0
+    for line in stream.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        error = event.get("error") if kind == "turn.failed" else event
+        rank = 2 if kind == "turn.failed" else 1 if kind == "error" else 0
+        if rank and isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip() and rank >= priority:
+                if isinstance(error.get("code"), str):
+                    message = f"{error['code']}: {message}"
+                selected, priority = message, rank
+    return selected
+
+
 def _cli_failure_detail(stderr: str, stdout: str) -> str:
     """Return a compact, deterministic diagnostic from CLI output."""
     excerpts = []
     for label, stream in (("stderr", stderr), ("stdout", stdout)):
+        stream = _codex_error_message(stream) or stream
         text = re.sub(r"[\s\x00-\x1f\x7f]+", " ", stream).strip()
         if text:
             excerpts.append(f"{label}: {text[:140]}")
@@ -193,8 +220,14 @@ def codex_cli_llm(
     codex_bin: str = "codex",
 ) -> LLM:
     """Run one confined Codex synthesis call using the operator's login."""
+    rate_limit_exhausted = threading.Event()
+
+    def check_rate_limit() -> None:
+        if rate_limit_exhausted.is_set():
+            raise ValueError("codex cli rate limit retry budget exhausted; backend deferred for this batch")
 
     def llm(system: str, user: str) -> str:
+        check_rate_limit()
         with tempfile.TemporaryDirectory(prefix="teammem-codex-") as temporary:
             directory = Path(temporary)
             schema_path = directory / "text-schema.json"
@@ -230,18 +263,41 @@ def codex_cli_llm(
                 str(output_path),
                 "-",
             ]
-            try:
-                process = subprocess.run(
-                    command,
-                    input=user,
-                    capture_output=True,
-                    text=True,
-                    timeout=600,
-                    env=_scrubbed_llm_env(),
-                    cwd=temporary,
+            for attempt in range(3):
+                check_rate_limit()
+                output_path.unlink(missing_ok=True)
+                try:
+                    process = subprocess.run(
+                        command,
+                        input=user,
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                        env=_scrubbed_llm_env(),
+                        cwd=temporary,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    raise ValueError("codex cli timed out after 600s") from error
+                if process.returncode == 0:
+                    break
+                message = (_codex_error_message(process.stdout)
+                           or _codex_error_message(process.stderr)
+                           or process.stderr + "\n" + process.stdout).lower().replace("_", " ")
+                transient = bool(re.search(r"\b429\b", message)) and not any(
+                    marker in message for marker in
+                    ("quota", "usage limit", "billing", "credits", "account limit",
+                     "unauthorized", "forbidden")
+                ) and not re.search(r"\b(?:401|403)\b", message)
+                if not transient:
+                    break
+                if attempt == 2:
+                    rate_limit_exhausted.set()
+                    break
+                delay = 60 * 2 ** attempt + random.uniform(0, 5)
+                logging.getLogger(__name__).warning(
+                    "Codex rate limited; retry %s/2 in %.1f seconds", attempt + 1, delay,
                 )
-            except subprocess.TimeoutExpired as error:
-                raise ValueError("codex cli timed out after 600s") from error
+                time.sleep(delay)
             if process.returncode != 0:
                 detail = _cli_failure_detail(process.stderr, process.stdout)
                 raise ValueError(
