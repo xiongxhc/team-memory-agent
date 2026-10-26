@@ -945,3 +945,150 @@ def test_weekly_generation_guard_does_not_revalidate_legacy_cache_reads(tmp_path
     put_summary(conn, legacy)
     result = weekly_team_report(**kwargs, llm=lambda *_: pytest.fail('cache hit must not call model'))
     assert result == legacy
+
+
+def _codex_rate_error(message="exceeded retry limit, last status: 429 Too Many Requests"):
+    return "\n".join(json.dumps(row) for row in [
+        {"type": "thread.started", "thread_id": "test-thread"},
+        {"type": "item.completed", "item": {
+            "type": "error", "message": "Under-development features enabled: skip_host_skill_discovery"}},
+        {"type": "error", "message": message},
+        {"type": "turn.failed", "error": {"message": message}},
+    ])
+
+
+def test_codex_terminal_error_precedes_startup_warning():
+    detail = summarize_module._cli_failure_detail("", _codex_rate_error())
+    assert "429 Too Many Requests" in detail
+    assert "Under-development" not in detail
+    assert "thread.started" not in detail
+    assert len(detail) <= 300
+
+
+def test_codex_structured_quota_code_is_not_retried(monkeypatch):
+    calls = []
+    monkeypatch.setattr(summarize_module.time, "sleep", lambda _delay: pytest.fail("unexpected retry"))
+
+    def run(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=1, stderr="", stdout=json.dumps({
+            "type": "turn.failed", "error": {
+                "code": "insufficient_quota", "message": "429 Too Many Requests"}}))
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(ValueError, match="insufficient_quota"):
+        summarize_module.codex_cli_llm("same-model")("system", "user")
+    assert len(calls) == 1
+
+
+def test_codex_rate_limit_retries_with_backoff_then_succeeds(monkeypatch):
+    calls, waits = [], []
+    monkeypatch.setattr(summarize_module.time, "sleep", waits.append)
+    monkeypatch.setattr(summarize_module.random, "uniform", lambda _low, _high: 2.0)
+
+    def run(command, **kwargs):
+        calls.append(kwargs)
+        output = Path(command[command.index("--output-last-message") + 1])
+        assert not output.exists()
+        if len(calls) < 3:
+            output.write_text('{"text":"stale failed response"}')
+            return SimpleNamespace(returncode=1, stderr="", stdout=_codex_rate_error())
+        output.write_text('{"text":"- recovered"}')
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert summarize_module.codex_cli_llm("same-model")("system", "user") == "- recovered"
+    assert len(calls) == 3
+    assert waits == [62.0, 122.0]
+    assert all(call["input"] == "user" for call in calls)
+
+
+def test_codex_exhausted_rate_limit_defers_remaining_batch(monkeypatch):
+    calls, waits = [], []
+    monkeypatch.setattr(summarize_module.time, "sleep", waits.append)
+    monkeypatch.setattr(summarize_module.random, "uniform", lambda _low, _high: 0.0)
+
+    def run(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=1, stderr="", stdout=_codex_rate_error())
+
+    monkeypatch.setattr(subprocess, "run", run)
+    llm = summarize_module.codex_cli_llm("same-model")
+    with pytest.raises(ValueError, match="429 Too Many Requests"):
+        llm("system", "first journal")
+    for prompt in ("next journal", "historical reconciliation"):
+        with pytest.raises(ValueError, match="rate limit.*batch"):
+            llm("system", prompt)
+    assert len(calls) == 3
+    assert waits == [60.0, 120.0]
+
+
+@pytest.mark.parametrize("message", [
+    "401 Unauthorized", "403 Forbidden", "invalid model", "429 insufficient_quota",
+    "429 You exceeded your current quota, please check your plan and billing details",
+    "429 You have hit your usage limit",
+    "429 usage_limit_reached", "429 organization_usage_limit_exceeded",
+])
+def test_codex_nontransient_errors_are_not_retried(monkeypatch, message):
+    calls = []
+    monkeypatch.setattr(summarize_module.time, "sleep", lambda _delay: pytest.fail("unexpected retry"))
+
+    def run(*args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=1, stderr="", stdout=_codex_rate_error(message))
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(ValueError, match="codex cli failed"):
+        summarize_module.codex_cli_llm("same-model")("system", "user")
+    assert len(calls) == 1
+
+
+def test_codex_success_after_rate_limit_requires_fresh_output(monkeypatch):
+    calls = []
+    monkeypatch.setattr(summarize_module.time, "sleep", lambda _delay: None)
+
+    def run(command, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            Path(command[command.index("--output-last-message") + 1]).write_text('{"text":"stale"}')
+            return SimpleNamespace(returncode=1, stderr="", stdout=_codex_rate_error())
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(ValueError, match="invalid output"):
+        summarize_module.codex_cli_llm("same-model")("system", "user")
+    assert len(calls) == 2
+
+
+def test_codex_waiting_retry_stops_when_another_call_exhausts_backend(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, local
+
+    waiting, release, worker = Event(), Event(), local()
+    calls = []
+
+    def run(*args, **kwargs):
+        worker.prompt = kwargs["input"]
+        calls.append(worker.prompt)
+        return SimpleNamespace(returncode=1, stderr="", stdout=_codex_rate_error())
+
+    def sleep(_delay):
+        if worker.prompt == "waiting journal":
+            waiting.set()
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(summarize_module.time, "sleep", sleep)
+    llm = summarize_module.codex_cli_llm("same-model")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(llm, "system", "waiting journal")
+        assert waiting.wait(timeout=5)
+        second = pool.submit(llm, "system", "exhausting journal")
+        try:
+            with pytest.raises(ValueError, match="429 Too Many Requests"):
+                second.result(timeout=5)
+        finally:
+            release.set()
+        with pytest.raises(ValueError, match="rate limit.*batch"):
+            first.result(timeout=5)
+    assert calls == ["waiting journal"] + ["exhausting journal"] * 3
