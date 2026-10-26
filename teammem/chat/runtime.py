@@ -281,6 +281,7 @@ def build_service(config_path, *, client=None, transport=None, parser=None):
     )
     from .retrieval import search_evidence
     from .vault import search_vault
+    from .weekly import sample_person_weeks
     from .service import ChatService
     from .state import ChatState
     config = load_chat_config(config_path)
@@ -372,15 +373,22 @@ def build_service(config_path, *, client=None, transport=None, parser=None):
             if 'project' in structured:
                 raw_allowed &= frozenset({structured['project']})
             limit = current.retrieval['max_snippets']
-            # Keep original event evidence alongside the broader local summaries.
-            vault = search_vault(current.paths['ledger_db'], current.paths['source_config_dir'],
-                current.vault, policy, raw_allowed, structured, limit=min(3, limit - 1)) if current.vault and limit > 1 else []
-            records = search_evidence(current.paths['ledger_db'], policy, raw_allowed, structured, limit=limit)
+            def vault_search(bounds, count):
+                return search_vault(current.paths['ledger_db'], current.paths['source_config_dir'],
+                    current.vault, policy, raw_allowed, bounds, limit=count)
+            def record_search(bounds, count):
+                return search_evidence(current.paths['ledger_db'], policy, raw_allowed, bounds, limit=count)
+            candidates = sample_person_weeks(structured, limit,
+                vault_search if current.vault else None, record_search)
+            if candidates is None:
+                # Keep original event evidence alongside broader local summaries.
+                vault = vault_search(structured, min(3, limit - 1)) if current.vault and limit > 1 else []
+                records = record_search(structured, limit)
+                candidates = vault + records[:limit - len(vault)]
             # A grant or projection can change while local files are being read.
             refreshed = load_chat_config(config_path)
             refreshed_policy = project_policy_from_source_config(source_config(refreshed))
             permitted = strict_scope(refreshed_policy, authorize_current(refreshed,key,sender) & admitted)
-            candidates = vault + records[:limit - len(vault)]
             return [item for item in candidates if ({item.project} | item.projects).issubset(permitted)]
         return search
 

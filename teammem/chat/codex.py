@@ -12,6 +12,7 @@ import binascii
 import copy
 import json
 import os
+import random
 import re
 import selectors
 import shutil
@@ -23,7 +24,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from .model import ModelError, _check
+from .model import ModelError, ModelRateLimitError, _check
 
 
 _STREAM_LIMIT = 2_000_000
@@ -203,8 +204,33 @@ def _stage_images(messages, root):
     return inputs, images
 
 
-def _events(raw):
+def _transient_limit(message):
+    normalized = message.lower().replace("_", " ")
+    return (re.search(r"\b429\b", normalized) is not None
+            and re.search(r"\b(?:401|403)\b", normalized) is None
+            and not any(marker in normalized for marker in (
+                "quota", "usage limit", "billing", "credit", "account limit", "unauthorized", "forbidden")))
+
+
+def _wait_for_retry(deadline, cancel_event):
+    _check(deadline, cancel_event)
+    delay = 60 + random.uniform(0, 5)
+    until = time.monotonic() + delay
+    if until + 5 >= deadline:
+        raise ModelRateLimitError("The chat model is temporarily at its rate limit. Please try again later.")
+    while time.monotonic() < until:
+        _check(deadline, cancel_event)
+        remaining = until - time.monotonic()
+        if cancel_event is not None:
+            cancel_event.wait(max(0, remaining))
+        else:
+            time.sleep(max(0, remaining))
+    _check(deadline, cancel_event)
+
+
+def _events(raw, *, allow_rate_limit=False):
     usage = None
+    failures = []
     completed = False
     started = False
     try:
@@ -214,7 +240,10 @@ def _events(raw):
                 raise ValueError()
             kind = event.get("type")
             if kind in {"error", "turn.failed"}:
-                raise ValueError()
+                error = event.get("error") if kind == "turn.failed" else event
+                if not isinstance(error, dict) or not isinstance(error.get("message"), str):
+                    raise ValueError()
+                failures.append(str(error.get("code", "")) + " " + error["message"])
             if kind == "turn.started":
                 started = True
             if kind in {"item.started", "item.updated", "item.completed"}:
@@ -231,6 +260,10 @@ def _events(raw):
                     raise ValueError()
                 completed = True
                 usage = event.get("usage", {})
+        if failures:
+            if allow_rate_limit and not completed and all(_transient_limit(value) for value in failures):
+                raise ModelRateLimitError("The chat model is temporarily at its rate limit. Please try again later.")
+            raise ValueError()
         if not completed:
             raise ValueError()
     except (ValueError, TypeError, AttributeError, UnicodeError) as exc:
@@ -290,11 +323,21 @@ class CodexTransport:
             for path in images:
                 argv.extend(["--image", str(path)])
             argv.append("-")
-            code, stdout, _ = _run(argv, root=root, deadline=deadline, cancel_event=cancel_event,
-                                   prompt=prompt, output=output)
-            if code != 0:
-                raise ModelError("Codex could not complete this request. Please try again later.")
-            usage = _events(stdout)
+            for attempt in range(2):
+                _check(deadline, cancel_event)
+                output.unlink(missing_ok=True)
+                code, stdout, _ = _run(argv, root=root, deadline=deadline, cancel_event=cancel_event,
+                                       prompt=prompt, output=output)
+                try:
+                    usage = _events(stdout, allow_rate_limit=code != 0)
+                except ModelRateLimitError:
+                    if attempt:
+                        raise
+                    _wait_for_retry(deadline, cancel_event)
+                    continue
+                if code != 0:
+                    raise ModelError("Codex could not complete this request. Please try again later.")
+                break
             try:
                 if output.is_symlink() or not output.is_file() or output.stat().st_size > _FILE_LIMIT:
                     raise ValueError()

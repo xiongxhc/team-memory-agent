@@ -70,6 +70,57 @@ def _search(db, source, vault, policy, allowed, query, limit=3):
     )
 
 
+@pytest.mark.parametrize('timestamp,start,end,expected', [
+    ('2026-09-15T00:30:00+04:00','2026-09-15T00:00:00Z','2026-09-17T00:00:00Z',False),
+    ('2026-09-15T23:30:00-04:00','2026-09-14T00:00:00Z','2026-09-16T00:00:00Z',False),
+    ('2026-09-15T00:30:00','2026-09-15T01:00:00Z','2026-09-17T00:00:00Z',False),
+    ('2026-09-15Tbad','2026-09-14T00:00:00Z','2026-09-17T00:00:00Z',False),
+    ('2026-09-15T00:30:00','2026-09-15T00:00:00Z','2026-09-16T00:00:00Z',True),
+    ('2026-09-15T04:00:00+04:00','2026-09-15T00:00:00Z','2026-09-16T00:00:00Z',True),
+    ('2026-09-15T20:00:00-04:00','2026-09-15T00:00:00Z','2026-09-16T00:00:00Z',False),
+])
+def test_daily_journal_requires_every_source_in_requested_instant_range(tmp_path, timestamp, start, end, expected):
+    """A date-prefix journal must not pull an out-of-range source across offsets."""
+    db, source, vault = _daily(tmp_path, events=[
+        Event(person='alice',project='alpha',ts='2026-09-15T12:00:00Z',source='gitlab',
+              kind='commit',summary='in range',hash='inside'),
+        Event(person='alice',project='alpha',ts=timestamp if not timestamp.endswith('bad') else '2026-09-15T09:00:00Z',source='gitlab',
+              kind='commit',summary='boundary source',hash='boundary'),
+    ])
+    if timestamp.endswith('bad'):
+        # Model a malformed retained source while preserving a matching journal
+        # hash, so the timestamp admission check is what rejects the evidence.
+        conn = open_db(db)
+        conn.execute("UPDATE events SET ts=? WHERE hash='boundary'", (timestamp,))
+        prepared = prepare_daily_journal(conn,'alice','Alice Example','2026-09-15',[])
+        conn.execute("UPDATE summaries SET input_hash=? WHERE kind='daily-person' AND key=?",
+                     (prepared.input_hash,prepared.key))
+        conn.commit(); conn.close()
+    found = _search(db,source,vault,{'alpha':'detail'},{'alpha'},
+                    {'text':'','person':'alice','start':start,'end':end})
+    assert bool(found) is expected
+
+
+def test_week_sample_falls_back_to_only_in_range_raw_sources(tmp_path):
+    from teammem.chat.retrieval import search_evidence
+    from teammem.chat.weekly import sample_person_weeks
+    db, source, vault = _daily(tmp_path, events=[
+        Event(person='alice',project='alpha',ts='2026-09-15T00:30:00+04:00',source='gitlab',
+              kind='commit',summary='outside range',hash='outside'),
+        Event(person='alice',project='alpha',ts='2026-09-15T12:00:00Z',source='gitlab',
+              kind='commit',summary='inside range',hash='inside'),
+    ])
+    policy = {'alpha':'detail'}
+    allowed = frozenset({'alpha'})
+    found = sample_person_weeks(
+        {'text':'','person':'alice','start':'2026-09-15T00:00:00Z','end':'2026-10-15T00:00:00Z'},8,
+        lambda query,limit: search_vault(db,source,vault,policy,allowed,query,limit),
+        lambda query,limit: search_evidence(db,policy,allowed,query,limit),
+    )
+    assert len(found) == 1 and found[0].kind == 'source'
+    assert 'inside range' in found[0].text and 'outside range' not in found[0].text
+
+
 def test_returns_only_a_hash_verified_local_daily_section(tmp_path):
     """Skipping ledger and rendered-text checks could serve a stale synthesis."""
     db, source, vault = _daily(tmp_path)

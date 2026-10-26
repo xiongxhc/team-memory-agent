@@ -68,6 +68,126 @@ class Client:
         return None
 
 
+def test_person_month_search_samples_all_six_weeks_with_exact_scope(tmp_path):
+    path = directory_configured(tmp_path)
+    conn = open_db(tmp_path/'ledger_db')
+    days = ['2026-09-26', '2026-09-28', '2026-10-05', '2026-10-12', '2026-10-19', '2026-10-26']
+    for day in days:
+        for index in range(10):
+            conn.execute("INSERT INTO events (person,project,ts,source,kind,summary,hash) VALUES (?,?,?,?,?,?,?)",
+                         ('sam','alpha',day+'T08:00:00+04:00','test','note',day+' work',day+str(index)))
+    for person, project, ts in [('alex','alpha','2026-10-26T11:00:00+04:00'),
+                                ('sam','hidden','2026-10-26T11:00:00+04:00'),
+                                ('sam','alpha','2026-09-25T23:59:59+04:00'),
+                                ('sam','alpha','2026-10-26T12:00:00+04:00')]:
+        conn.execute("INSERT INTO events (person,project,ts,source,kind,summary,hash) VALUES (?,?,?,?,?,?,?)",
+                     (person,project,ts,'test','note','excluded',person+project+ts))
+    conn.commit(); conn.close()
+    service, store, _ = build_service(path, client=Client(), transport=Transport())
+    event = NormalizedEvent('tenant','cli_exampleapp123','m1','dmchat','ou_requester123','p2p','','',frozenset(),'status','text',())
+    key = session_key(event)
+    admitted = service.authorize(service.config, key, event.sender)
+    found = service.search_factory(key, event.sender, admitted)({
+        'text':'', 'person':'Sam', 'project':'Alpha',
+        'start':'2026-09-26T00:00:00+04:00', 'end':'2026-10-26T12:00:00+04:00',
+    })
+    assert {item.timestamp[:10] for item in found} == set(days)
+    assert len(found) <= 8
+    assert all(item.person == 'sam' and item.project == 'alpha' for item in found)
+    assert all('excluded' not in item.text for item in found)
+    assert all('bounded weekly sample' in item.text.lower() for item in found)
+    store.close(); service.state.close()
+
+
+def test_week_sampling_uses_verified_journal_and_scoped_raw_fallback(tmp_path):
+    from datetime import date
+    from teammem.chat.retrieval import search_evidence
+    from teammem.chat.vault import search_vault
+    from teammem.chat.weekly import sample_person_weeks
+    from teammem.identity import IdentityMaps
+    from teammem.render import render_vault
+    from teammem.store import SummaryRecord, put_summary
+    from teammem.summarize import prepare_daily_journal
+
+    directory_configured(tmp_path)
+    source = tmp_path/'source_config_dir'
+    conn = open_db(tmp_path/'ledger_db')
+    for day, project in [('2026-09-28','alpha'), ('2026-10-05','alpha'),
+                         ('2026-10-05','secret'), ('2026-10-19','secret'),
+                         ('2026-10-26','alpha')]:
+        conn.execute("INSERT INTO events (person,project,ts,source,kind,summary,hash) VALUES (?,?,?,?,?,?,?)",
+                     ('sam',project,day+'T08:00:00+04:00','test','note',project+' source',day+project))
+    for day in ['2026-09-28','2026-10-05','2026-10-19']:
+        prepared = prepare_daily_journal(conn, 'sam', 'Sam Lee', day, [])
+        put_summary(conn, SummaryRecord('daily-person',prepared.key,prepared.input_hash,
+                                       'verified journal '+day,'test','2026-10-26T08:00:00Z'))
+    conn.commit()
+    root = tmp_path/'vault'
+    render_vault(conn, IdentityMaps.load(source), root, date(2026,10,26))
+    conn.close()
+    vault = {'root':root,'web_url':'https://git.example/team/vault','ref':'main'}
+    policy = {'alpha':'detail','secret':'detail'}
+    allowed = frozenset({'alpha'})
+    calls = []
+    def journals(query, limit):
+        calls.append('vault')
+        return search_vault(tmp_path/'ledger_db',source,vault,policy,allowed,query,limit)
+    def records(query, limit):
+        calls.append('raw')
+        return search_evidence(tmp_path/'ledger_db',policy,allowed,query,limit)
+    found = sample_person_weeks({'text':'','person':'sam','start':'2026-09-26T00:00:00+04:00',
+                                'end':'2026-10-26T12:00:00+04:00'},8,journals,records)
+    assert len(calls) <= 12
+    assert len(found) == 3  # No evidence in three weeks, not a fabricated zero-work report.
+    assert found[0].id == 'vault:person:sam:2026-09-28:0'
+    assert found[0].url.endswith('#2026-09-28')
+    assert found[0].projects == frozenset({'alpha'})
+    assert 'verified journal 2026-09-28' in found[0].text
+    assert [e.timestamp[:10] for e in found[1:]] == ['2026-10-05','2026-10-26']
+    assert all('verified journal 2026-10-05' not in e.text and 'secret' not in e.text for e in found)
+
+
+@pytest.mark.parametrize('changes', [
+    {'text':'release'}, {'person':None,'project':'alpha'},
+    {'end':'2026-10-03T00:00:00+04:00'}, {'end':'2026-11-01T00:00:00+04:00'},
+    {'end':None},
+])
+def test_week_sampling_leaves_ordinary_queries_unchanged(changes):
+    from teammem.chat.weekly import sample_person_weeks
+    query = {'text':'','person':'sam','start':'2026-09-26T00:00:00+04:00',
+             'end':'2026-10-26T12:00:00+04:00'}
+    query.update(changes)
+    def unexpected(*args):
+        pytest.fail('Ordinary query must use the existing search path')
+    assert sample_person_weeks(query,8,unexpected,unexpected) is None
+
+
+def test_week_sampling_offset_bounds_limits_and_elapsed_budget(monkeypatch):
+    from datetime import datetime
+    from teammem.chat import weekly
+    from teammem.chat.retrieval import RetrievalTimeoutError
+    from teammem.chat.state import Evidence
+    calls = []
+    def records(query, limit):
+        calls.append(query)
+        return [Evidence(query['start'],'alpha',query['start'],'source',None,person='sam')]
+    query = {'text':'','person':'sam','project':'alpha','start':'2026-09-26T15:00:00+04:00',
+             'end':'2026-10-26T08:00:00Z'}
+    found = weekly.sample_person_weeks(query,3,None,records)
+    assert len(found) == 3 and len(calls) == 6
+    assert calls[0]['start'] == query['start']
+    assert calls[0]['end'] == '2026-09-28T00:00:00+04:00'
+    assert calls[-1]['start'] == '2026-10-26T00:00:00+04:00'
+    assert datetime.fromisoformat(calls[-1]['end']) == datetime.fromisoformat(query['end'])
+    assert all(q['person']=='sam' and q['project']=='alpha' for q in calls)
+    clock = iter([0,0,9])
+    monkeypatch.setattr(weekly.time,'monotonic',lambda: next(clock))
+    calls.clear()
+    with pytest.raises(RetrievalTimeoutError):
+        weekly.sample_person_weeks(query,8,None,records)
+    assert len(calls) == 1  # Timed-out partial evidence must not become a successful answer.
+
+
 def test_real_composition_casual_dm_and_restart_dedup(tmp_path):
     path = configured(tmp_path)
     client = Client()
