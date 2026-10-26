@@ -657,3 +657,17 @@ def test_rewrites_answer_and_citations_without_changing_evidence(tmp_path):
     assert 'https://old.example' not in text
     assert 'https://other.example/page' in text
     assert used == [evidence] and evidence.url == original
+
+
+def test_search_and_answer_share_retry_capable_deadline(monkeypatch):
+    now, deadlines = [100.0], []
+    monkeypatch.setattr(chat_model.time, 'monotonic', lambda: now[0])
+    evidence = Evidence('e1', 'alpha', '2026-09-15', 'Released', None)
+    responses = iter([function(), completed('Released [E1].')])
+    def transport(payload, *, deadline, cancel_event):
+        deadlines.append(deadline)
+        now[0] += 65
+        return next(responses)
+    text, used = answer(CONFIG, [], lambda _: [evidence], transport)
+    assert 'Released [E1]' in text and used == [evidence]
+    assert deadlines == [280, 280]

@@ -24,6 +24,14 @@ Set `retrieval.max_snippets` to at least two to retain room for both sources.
 The operator must keep `web_url` and `ref` aligned with the published checkout;
 branch links can change after a subsequent render.
 
+Broad person activity searches with explicit dates spanning more than seven and
+up to 35 days sample each intersecting calendar week before taking a second
+excerpt from any week. The existing eight-snippet limit still applies. Verified
+daily journals are used only when all their source event times fit the requested
+week; otherwise retrieval uses precisely dated, permitted source records. These
+are explicitly labelled representative excerpts, not complete weekly accounts.
+Shorter, longer, and keyword searches keep their existing retrieval behavior.
+
 Vault citations are labelled **Team Vault** and link to the published Markdown.
 Event citations are labelled **Original source** and retain their Feishu/GitLab
 links. Journals and documentation are dated snapshots, not live-status proof.
@@ -163,9 +171,18 @@ Choose one explicit `model.provider`:
 - `openai_responses`: requires `OPENAI_API_KEY` in the dedicated env file and uses
   streaming Responses requests with `store=false`.
 
-Both routes use the privately configured model, a shared 90-second model deadline,
-at most three requests and two read-only retrieval rounds. There is no provider or
-model fallback. Codex requests the configured output-token budget and separately
+Both routes use the privately configured model, a shared 180-second model deadline,
+at most three logical requests and two read-only retrieval rounds. There is no provider or
+model fallback. Each Codex request can retry once after a transient terminal HTTP
+429, waiting 60–65 seconds within that same deadline. The wait is cancellable and
+requires at least five seconds left for the retry. This means at most six CLI
+attempts across the three logical requests, still bounded by the turn deadline.
+Authentication, explicit quota/billing/usage exhaustion, invalid output, and native
+tool activity are never retried. Failed output is discarded before retrying. An
+exhausted rate-limit retry or insufficient remaining time produces a safe temporary
+rate-limit notice, without provider diagnostics. Independent messages retain their
+own retry budget; no persistent rate-limit latch blocks later messages.
+Codex requests the configured output-token budget and separately
 enforces a UTF-8 cap on model answer text of four times that setting (at most
 12,000 bytes), before the application appends citation links.
 This is a response-size bound, not an exact token count or a reasoning-token cap.

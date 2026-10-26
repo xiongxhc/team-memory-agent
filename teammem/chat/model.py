@@ -22,6 +22,13 @@ class ModelError(RuntimeError):
     """A safe, user-facing failure without provider bodies or credentials."""
 
 
+class ModelRateLimitError(ModelError):
+    """A transient provider rate limit exhausted the bounded retry budget."""
+
+
+_TURN_SECONDS = 180
+
+
 _POLICY = """You are a helpful conversational team assistant. Answer naturally in the user's language,
 including Chinese or English; casual conversation does not require team search or a TeamMem mention.
 Application-owned TeamMem directory context may be supplied after the conversation as structured data.
@@ -376,7 +383,7 @@ def answer(config, turns, search, transport, *, attachments=(), team_context=Non
     model = _model_config(config)
     paths = config.get('paths', {}) if isinstance(config, Mapping) else config.paths
     origins = load_link_origins(paths['source_config_dir']) if paths.get('source_config_dir') else {}
-    deadline = deadline or time.monotonic() + 90
+    deadline = deadline or time.monotonic() + _TURN_SECONDS
     budget = _input_budget(model)
     overhead = _bytes(_policy(config)) + _bytes(_TOOL) + 256
     available = budget - overhead

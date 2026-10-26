@@ -309,3 +309,165 @@ def test_expanded_output_allowance_still_rejects_oversized_utf8_answer(tmp_path)
     request = payload(); request['max_output_tokens'] = 3000
     with pytest.raises(ModelError, match='invalid or oversized answer'):
         CodexTransport(cli)(request, deadline=time.monotonic()+5)
+
+
+def rate_failure(message='exceeded retry limit, last status: 429 Too Many Requests', *, extra=()):
+    from teammem.chat.codex import _CODE_MODE_DISABLED
+    return b'\n'.join(json.dumps(event).encode() for event in [
+        {'type': 'item.completed', 'item': {'type': 'error', 'message': _CODE_MODE_DISABLED}},
+        {'type': 'thread.started', 'thread_id': 'synthetic'},
+        {'type': 'error', 'message': message},
+        {'type': 'turn.failed', 'error': {'message': message}}, *extra,
+    ])
+
+
+@pytest.fixture
+def retry_clock(monkeypatch):
+    import teammem.chat.codex as codex
+    now, waits = [100.0], []
+    monkeypatch.setattr(codex.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(codex.random, 'uniform', lambda *_: 2.0)
+    def sleep(delay):
+        waits.append(delay)
+        now[0] += delay
+    monkeypatch.setattr(codex.time, 'sleep', sleep)
+    return now, waits
+
+
+def test_transient_rate_limit_retries_once_with_fresh_output_and_same_deadline(tmp_path, monkeypatch, retry_clock):
+    import teammem.chat.codex as codex
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(kwargs)
+        output = kwargs['output']
+        assert not output.exists()
+        if len(calls) == 1:
+            output.write_text('stale secret')
+            return 1, rate_failure(), b'secret provider diagnostics'
+        output.write_text(json.dumps({'action': 'answer', 'query': '', 'text': 'Recovered'}))
+        return 0, b'{"type":"turn.completed"}', b''
+    monkeypatch.setattr(codex, '_run', run)
+    transport = CodexTransport(fake_cli(tmp_path, ''))
+    result = transport(payload(), deadline=280)
+    assert result['output'][0]['content'][0]['text'] == 'Recovered'
+    assert len(calls) == 2 and {call['deadline'] for call in calls} == {280}
+    assert calls[0]['prompt'] == calls[1]['prompt']
+    assert sum(retry_clock[1]) == pytest.approx(62)
+    assert len(transport.usage_events) == 1
+
+
+def test_exhausted_rate_limit_is_safe_and_does_not_latch_next_message(tmp_path, monkeypatch, retry_clock):
+    import teammem.chat.codex as codex
+    from teammem.chat.model import ModelRateLimitError
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(1)
+        return 1, rate_failure('429 Too Many Requests secret-token'), b'secret-token'
+    monkeypatch.setattr(codex, '_run', run)
+    transport = CodexTransport(fake_cli(tmp_path, ''))
+    for _ in range(2):
+        with pytest.raises(ModelRateLimitError) as error:
+            transport(payload(), deadline=retry_clock[0][0] + 180)
+        assert 'secret-token' not in str(error.value)
+    assert len(calls) == 4
+
+
+@pytest.mark.parametrize('message', ['401 Unauthorized', '403 Forbidden', 'invalid model',
+    '429 insufficient_quota', '429 billing limit', '429 usage_limit_reached',
+    '429 organization_usage_limit_exceeded', '429 credits exhausted'])
+def test_nontransient_failures_do_not_retry(tmp_path, monkeypatch, retry_clock, message):
+    import teammem.chat.codex as codex
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(1)
+        return 1, rate_failure(message), b''
+    monkeypatch.setattr(codex, '_run', run)
+    with pytest.raises(ModelError):
+        CodexTransport(fake_cli(tmp_path, ''))(payload(), deadline=280)
+    assert len(calls) == 1 and retry_clock[1] == []
+
+
+@pytest.mark.parametrize('extra', [
+    [{'type':'item.started','item':{'type':'command_execution','command':'secret'}}],
+    [{'type':'item.completed','item':{'type':'error','message':'unknown secret warning'}}],
+    [{'type':'turn.completed'}],
+])
+def test_rate_limit_does_not_override_invalid_or_native_stream(tmp_path, monkeypatch, retry_clock, extra):
+    import teammem.chat.codex as codex
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(1)
+        return 1, rate_failure(extra=extra), b''
+    monkeypatch.setattr(codex, '_run', run)
+    with pytest.raises(ModelError) as error:
+        CodexTransport(fake_cli(tmp_path, ''))(payload(), deadline=280)
+    assert 'secret' not in str(error.value)
+    assert len(calls) == 1 and retry_clock[1] == []
+
+
+def test_rate_limit_insufficient_deadline_does_not_wait_or_retry(tmp_path, monkeypatch, retry_clock):
+    import teammem.chat.codex as codex
+    from teammem.chat.model import ModelRateLimitError
+    calls = []
+    monkeypatch.setattr(codex, '_run', lambda *a, **k: (calls.append(1) or 1, rate_failure(), b''))
+    with pytest.raises(ModelRateLimitError):
+        CodexTransport(fake_cli(tmp_path, ''))(payload(), deadline=165)
+    assert len(calls) == 1 and retry_clock[1] == []
+
+
+def test_cancel_during_backoff_prevents_retry(tmp_path, monkeypatch, retry_clock):
+    import teammem.chat.codex as codex
+    calls = []
+    cancel = threading.Event()
+    monkeypatch.setattr(codex, '_run', lambda *a, **k: (calls.append(1) or 1, rate_failure(), b''))
+    def cancelled_wait(delay):
+        cancel.set()
+        return True
+    monkeypatch.setattr(cancel, 'wait', cancelled_wait)
+    with pytest.raises(ModelError, match='cancelled'):
+        CodexTransport(fake_cli(tmp_path, ''))(payload(), deadline=280, cancel_event=cancel)
+    assert len(calls) == 1
+
+
+def test_deadline_expiring_during_backoff_prevents_retry(tmp_path, monkeypatch, retry_clock):
+    import teammem.chat.codex as codex
+    calls = []
+    monkeypatch.setattr(codex, '_run', lambda *a, **k: (calls.append(1) or 1, rate_failure(), b''))
+    monkeypatch.setattr(codex.time, 'sleep', lambda _: retry_clock[0].__setitem__(0, 281))
+    with pytest.raises(ModelError, match='too long'):
+        CodexTransport(fake_cli(tmp_path, ''))(payload(), deadline=280)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('code, stream', [
+    (1, rate_failure() + b'\n{malformed secret'),
+    (0, b'{"type":"turn.completed"}'),
+    (1, rate_failure(extra=[{'type':'error', 'code':'insufficient_quota', 'message':'429 Too Many Requests'}])),
+])
+def test_invalid_output_and_structured_hard_limit_never_retry(tmp_path, monkeypatch, retry_clock, code, stream):
+    import teammem.chat.codex as codex
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(1)
+        kwargs['output'].write_text('invalid secret output')
+        return code, stream, b'secret'
+    monkeypatch.setattr(codex, '_run', run)
+    with pytest.raises(ModelError) as error:
+        CodexTransport(fake_cli(tmp_path, ''))(payload(), deadline=280)
+    assert 'secret' not in str(error.value)
+    assert len(calls) == 1 and retry_clock[1] == []
+
+
+def test_successful_retry_requires_fresh_structured_output(tmp_path, monkeypatch, retry_clock):
+    import teammem.chat.codex as codex
+    calls = []
+    def run(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            kwargs['output'].write_text(json.dumps({'action':'answer', 'query':'', 'text':'Stale'}))
+            return 1, rate_failure(), b''
+        return 0, b'{"type":"turn.completed"}', b''
+    monkeypatch.setattr(codex, '_run', run)
+    with pytest.raises(ModelError, match='invalid structured output'):
+        CodexTransport(fake_cli(tmp_path, ''))(payload(), deadline=280)
+    assert len(calls) == 2

@@ -16,7 +16,7 @@ from ..links import load_link_origins, rewrite_links
 from ..queries import week_label, week_monday
 from ..render import _fname, _project_fname
 from ..summarize import prepare_daily_journal
-from .retrieval import _query, _rank, _tokens, open_ledger_readonly
+from .retrieval import _instant, _query, _rank, _tokens, open_ledger_readonly
 from .state import Evidence
 
 
@@ -211,6 +211,8 @@ def _daily_evidence(
         (len(prefix), prefix, _MAX_DAILIES),
     ).fetchall()
     ranked: list[tuple[tuple[int, int, int], Evidence]] = []
+    start_instant = _instant(start) if start is not None else None
+    end_instant = _instant(end) if end is not None else None
     for stored in rows:
         if time.monotonic() >= budget.deadline:
             break
@@ -220,17 +222,28 @@ def _daily_evidence(
         if not _DATE.fullmatch(day) or not _day_in_range(day, start, end):
             continue
         footprint = conn.execute(
-            "SELECT DISTINCT project FROM events "
+            "SELECT DISTINCT project, ts FROM events "
             "WHERE person = ? AND substr(ts, 1, 10) = ? ORDER BY project",
             (person, day),
         ).fetchall()
         dependencies = frozenset(row["project"] for row in footprint
                                  if row["project"] is not None)
-        if (not footprint or len(dependencies) != len(footprint)
+        if (not footprint or any(row['project'] is None for row in footprint)
                 or any(value not in allowed_projects
                        or project_policy.get(value) != "detail"
                        for value in dependencies)
                 or (project is not None and dependencies != {project})):
+            continue
+        # Date-prefix journals can contain sources with different offsets. Every
+        # contributing instant must fit the requested interval, not just its day
+        # label. Legacy naive timestamps follow retrieval's UTC interpretation.
+        try:
+            instants = [_instant(row['ts']) for row in footprint]
+        except (AttributeError, TypeError, ValueError, OverflowError, OSError):
+            continue
+        if any((start_instant is not None and instant < start_instant)
+               or (end_instant is not None and instant >= end_instant)
+               for instant in instants):
             continue
         prepared = prepare_daily_journal(conn, person, display_name, day, [])
         if prepared is None or prepared.input_hash != stored["input_hash"]:

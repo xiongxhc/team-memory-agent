@@ -697,3 +697,22 @@ def test_cancel_before_processing_starts_still_removes_reaction(tmp_path):
     asyncio.run(run())
 
     assert removed == [("m1", "reaction-1")]
+
+
+def test_rate_limit_has_safe_specific_durable_notice(tmp_path):
+    import time
+    from teammem.chat.model import ModelRateLimitError
+    sent, deadlines = [], []
+    config = {"feishu": {"tenant_key": "tenant", "app_id": "app", "expected_bot_open_id": "ou_bot"}, "access": {"default": "deny", "users": {"alice": []}, "groups": {}, "group_admins": {}}}
+    def model(*args, **kwargs):
+        deadlines.append(kwargs['deadline'] - time.monotonic())
+        raise ModelRateLimitError('secret provider body')
+    service = ChatService(ChatState(tmp_path / 'chat.db'), config, model,
+        lambda *a, **k: sent.append(a[3]) or 'reply')
+    asyncio.run(service.handle(_event()))
+    asyncio.run(service.handle(_event()))
+    assert len(sent) == 1 and len(deadlines) == 1
+    assert 175 < deadlines[0] <= 180
+    assert 'rate limit' in sent[0].lower() and 'later' in sent[0].lower()
+    assert 'secret' not in sent[0]
+    assert service.state.pending_replies() == []

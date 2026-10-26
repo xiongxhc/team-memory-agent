@@ -12,7 +12,7 @@ from .attachments import AttachmentAdmissionError
 from .context import has_policy_dependencies, public_team_context
 from .document_worker import DocumentError
 from .feishu import FeishuError, NormalizedEvent, is_own_bot_mention, session_key
-from .model import ModelError
+from .model import ModelError, ModelRateLimitError, _TURN_SECONDS
 from .state import ChatState, Turn
 
 
@@ -195,7 +195,7 @@ class ChatService:
                 model_kwargs = {
                     "attachments": attachments,
                     "cancel_event": cancelled,
-                    "deadline": time.monotonic() + 90,
+                    "deadline": time.monotonic() + _TURN_SECONDS,
                 }
                 if team_context is not None:
                     model_kwargs["team_context"] = public_team_context(team_context)
@@ -245,6 +245,8 @@ class ChatService:
             return "The attachment could not be accepted. Please check its format and size, then try again."
         if isinstance(error, FeishuError):
             return "Feishu could not complete that request. Please try again."
+        if isinstance(error, ModelRateLimitError):
+            return "The chat model is temporarily at its rate limit. Please try again later."
         if isinstance(error, ModelError):
             return "The chat model could not complete that request. Please try again."
         return "I could not complete that request. Please try again."
